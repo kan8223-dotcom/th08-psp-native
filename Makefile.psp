@@ -1,0 +1,43 @@
+export PATH := /usr/local/pspdev/bin:$(PATH)
+export PSPDEV := /usr/local/pspdev
+
+TARGET := TH08PSP
+OBJS := \
+	psp/main.o \
+	psp/platform.o \
+	psp/fileio.o \
+	psp/video.o
+
+PSP_EBOOT_TITLE := Touhou 8 PSP SC Bootstrap
+PSP_FW_VERSION := 660
+BUILD_PRX := 0
+EXTRA_TARGETS := EBOOT.PBP
+EXTRA_CLEAN := TH08PSP.map
+
+TH08_UPSTREAM_COMMIT := a940881f97024c99ff387d2cb4c6650fb2bad97f
+TH08_ORACLE_COMMIT := 50077aca0ed17d3bb7fee9f69a336636e2474639
+TH07_BACKEND_COMMIT := c11c4368bc969f98b731f46fb79067f3528511e7
+TH08_PSP_BUILD_ID ?= bootstrap-20260831-a940881f
+
+CXXFLAGS := -std=gnu++17 -O2 -G0 -march=allegrex -mtune=allegrex \
+	-Wall -Wextra -Wconversion -Wshadow \
+	-fno-exceptions -fno-rtti -fno-pic -MMD -MP \
+	-DPSP -DTH08_PSP_PORT=1 -DTH08_PSP_SC_ONLY=1 \
+	-DTH08_UPSTREAM_COMMIT=\"$(TH08_UPSTREAM_COMMIT)\" \
+	-DTH08_ORACLE_COMMIT=\"$(TH08_ORACLE_COMMIT)\" \
+	-DTH07_BACKEND_COMMIT=\"$(TH07_BACKEND_COMMIT)\" \
+	-DTH08_PSP_BUILD_ID=\"$(TH08_PSP_BUILD_ID)\" \
+	-Ipsp
+
+LDFLAGS := -Wl,-Map,TH08PSP.map
+LIBS := -lpspgu -lpsppower -lm -lstdc++ -lsupc++
+
+PSPSDK := $(shell psp-config --pspsdk-path)
+include $(PSPSDK)/lib/build.mak
+
+# The SDK's generic user-mode defaults add networking even when no network API
+# is used. Keep this bootstrap's import surface limited to its actual platform,
+# file, controller, display, GE, and power dependencies.
+LIBS := $(filter-out -lpspnet -lpspnet_apctl,$(LIBS))
+
+-include $(OBJS:.o=.d)

@@ -33,3 +33,13 @@ reccmp-build.yml
 *.idb
 *.i64
 *.pyc
+
+# Native PSP bootstrap products.
+*.o
+*.d
+*.elf
+*.prx
+*.PBP
+/PARAM.SFO
+/TH08PSP.map
+/.build-profile-*
