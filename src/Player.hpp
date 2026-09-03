@@ -102,6 +102,11 @@ struct Player;
 struct PlayerOptionState;
 typedef i32 (__fastcall *PlayerOptionCallback)(Player *, PlayerOptionState *);
 
+// Stable diagnostic identity for option callbacks.  It returns a table-based
+// ID rather than exposing a code pointer, so PC/PSP replay hashes remain
+// comparable across address spaces.
+i32 PlayerOptionCallbackStableId(PlayerOptionCallback callback);
+
 enum PlayerOptionLifecycleState
 {
     PLAYER_OPTION_INACTIVE,
@@ -541,6 +546,45 @@ C_ASSERT(offsetof(Player, unconsumedDwordE2B20) == 0xE2B20);
 C_ASSERT(offsetof(Player, extremeGaugeEffect) == 0xE2B24);
 C_ASSERT(offsetof(Player, deathbombEffect) == 0xE2B28);
 C_ASSERT(offsetof(Player, damageAccumulatorThreshold) == 0xE2B2C);
+
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+// Replays only the immediately preceding duplicate cancel query in
+// BulletManager::RemoveAllBullets. A hit repeats the original item-type and
+// hitAccumulator side effects; any identity/owner mismatch requires the
+// untouched second canonical call.
+void PspArmNextBulletCancelDuplicateCollision();
+ZunBool PspReplayLastBulletCancelCollision(
+    Player *player, Float3 *position, Float3 *size, i32 expectedResult);
+#endif
+
+#if defined(PSP) && \
+    ((defined(TH08_PSP_BULLET_COLLISION_GATE_AUDIT) && \
+      TH08_PSP_BULLET_COLLISION_GATE_AUDIT) || \
+     (defined(TH08_PSP_BULLET_COLLISION_GATE) && \
+      TH08_PSP_BULLET_COLLISION_GATE))
+// Immutable view captured after Player/Enemy/Item updates and immediately
+// before BulletManager's live traversal.  It is diagnostic state only and
+// never changes Player's reconstructed ABI or replay-visible bytes.
+struct PspPlayerBulletCollisionAuditSnapshot
+{
+    Float3 hurtboxBoundsMin;
+    Float3 hurtboxBoundsMax;
+    Float3 grazeBoundsMin;
+    Float3 grazeBoundsMax;
+    u32 sidecarOwnerValid;
+    u32 sidecarClaimsEmpty;
+    u32 authoritativeEmpty;
+    u32 knownEmpty;
+    u32 authoritativeActiveCount;
+};
+
+PspPlayerBulletCollisionAuditSnapshot
+PspCapturePlayerBulletCollisionAuditSnapshot(Player *player);
+ZunBool PspPlayerBulletCollisionAuditBoundsMatch(
+    const Player *player,
+    const PspPlayerBulletCollisionAuditSnapshot *snapshot);
+#endif
 
 DIFFABLE_EXTERN(Player, g_Player);
 

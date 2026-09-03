@@ -17,6 +17,10 @@
 #include "TitleScreen.hpp"
 #include "i18n.hpp"
 #include "utils.hpp"
+#if defined(PSP)
+#include "boot_checkpoint.hpp"
+#include "render_cadence.hpp"
+#endif
 #include <winbase.h>
 #include <d3dx8.h>
 #include <direct.h>
@@ -67,7 +71,17 @@ ZunBool Supervisor::IsColorCompositingDisabled()
 // FUNCTION: th08 0x438a71
 ZunBool Supervisor::IsHUDRedrawEnabled()
 {
+#if defined(PSP)
+    // PSP alternates two physical backbuffers and the renderer clears the HUD
+    // frame bands before drawing.  TH08's desktop default draws the static
+    // front.anm tiles only when they change because D3DSWAPEFFECT_COPY
+    // preserves them; on PSP that leaves the newly-cleared right scoreboard
+    // black.  Redraw the identical HUD sprites, as the stable TH07 backend
+    // does.  This changes presentation only, never gameplay state.
+    return TRUE;
+#else
     return this->cfg.opts.redrawHUDEveryFrame;
+#endif
 }
 
 ChainCallbackResult Supervisor::OnUpdate(Supervisor *s)
@@ -382,6 +396,17 @@ ChainCallbackResult Supervisor::OnDraw2(Supervisor *s)
     i32 color2;
     IDirect3DSurface8 *surface;
 
+#if defined(PSP)
+    // Surface 8 is the frozen frame shown while the next scene loads.  Drain
+    // its request before drawing any loading UI or the old contents of surface
+    // 8; capturing at Present time otherwise feeds the startup/title image
+    // back into the transition surface itself.  OnDraw2 runs at draw priority
+    // zero, before the new BACK frame exists, so capture the last displayed
+    // FRONT frame rather than the alternating n-2 BACK contents.
+    if (s->loadingVmsHaveBeenSetup != 0)
+        g_AnmManager->TakePendingSurfaceCapture(true);
+#endif
+
     if (s->loadingVmsHaveBeenSetup >= 2)
     {
         s->loadingVmsHaveBeenSetup++;
@@ -422,7 +447,9 @@ ChainCallbackResult Supervisor::OnDraw2(Supervisor *s)
     else
     {
 #ifdef TH08_MODERN_PORT
-        surface = g_AnmManager->surfaces[8];
+        surface = g_AnmManager->surfaces[8] != NULL
+                      ? g_AnmManager->surfaces[8]
+                      : g_AnmManager->surfacesBis[8];
 #else
         __asm
         {
@@ -572,7 +599,22 @@ int Supervisor::AddedCallback(Supervisor *s)
     }
 
     g_AnmManager->SetupVertexBuffer();
+#if defined(PSP)
+    TH08_PSP_BOOT_CHECKPOINT("text_buffer", "before_create", 0);
+#endif
     TextHelper::CreateTextBuffer();
+#if defined(PSP)
+    // A missing/incomplete local font or a failed persistent text-work
+    // allocation is a startup failure, not a valid textless game mode.  Keep
+    // the original void CreateTextBuffer ABI, but stop before launching the
+    // asynchronous startup thread when the PSP owner was not established.
+    if (!TextHelper::IsTextBufferReady())
+    {
+        TH08_PSP_BOOT_CHECKPOINT("text_buffer", "after_create", 0);
+        return ZUN_ERROR;
+    }
+    TH08_PSP_BOOT_CHECKPOINT("text_buffer", "after_create", 1);
+#endif
 
     Float3 position(500.0, 440.0f, 0.0f);
 
@@ -615,6 +657,12 @@ ZunResult Supervisor::LoadDat()
 #pragma var_order(frameIndex, framesInWindow, lastTime, samples, sampleCount, currentTime, deltaTime, fps, elapsedSeconds, averageIndex, average)
 i32 Supervisor::CheckFps()
 {
+#if defined(PSP)
+    // PPSSPP and real PSP both expose the display cadence through the backend.
+    // The original PC probe presents up to 1800 frames and can falsely reject
+    // the fixed 60 Hz PSP path while the renderer is still starting.
+    return ZUN_SUCCESS;
+#else
     i32 frameIndex;
     i32 framesInWindow;
     DWORD lastTime;
@@ -702,6 +750,7 @@ i32 Supervisor::CheckFps()
     }
 
     return ZUN_SUCCESS;
+#endif
 
 }
 
@@ -1061,7 +1110,15 @@ void Supervisor::CalculateFps(ZunBool shouldDraw)
 
     if ((i8)g_GameManager.skipCurrentFrame == 0)
     {
+#if defined(PSP)
+        // DrawFpsCounter runs only on actual presentations.  Count the exact
+        // number of canonical 60 Hz simulation ticks covered by this draw so
+        // intentional 30/20 Hz rendering is never recorded as game slowdown.
+        g_SupervisorFpsFrameCount +=
+            shouldDraw ? psp::CurrentDrawSimulationTicks() : 1U;
+#else
         g_SupervisorFpsFrameCount += (u8)g_Supervisor.cfg.frameskipConfig + 1;
+#endif
 
         if (g_Supervisor.fpsPerformanceFrequency == 0)
         {
@@ -1138,7 +1195,15 @@ calculateFps:
         fpsCounterPos.x = 512.0f;
         fpsCounterPos.y = 464.0f;
         fpsCounterPos.z = 0.0f;
+#if defined(PSP)
+        {
+            PspAsciiRenderOwnerScope fpsOwner(
+                PspAsciiRenderOwner::FpsCounter);
+            g_AsciiManager.AddString(&fpsCounterPos, g_SupervisorFpsBuffer);
+        }
+#else
         g_AsciiManager.AddString(&fpsCounterPos, g_SupervisorFpsBuffer);
+#endif
 
         if (g_GameManager.flags.isReplay && g_GameManager.flags.replayInputEnabled)
         {
@@ -1151,7 +1216,17 @@ calculateFps:
             else
                 g_AsciiManager.color.d3dColor = 0xffffffd0;
 
-            g_AsciiManager.AddString(&debugCounterPos, g_SupervisorFpsDebugBuffer);
+#if defined(PSP)
+            {
+                PspAsciiRenderOwnerScope replayFpsOwner(
+                    PspAsciiRenderOwner::ReplayFpsDiagnostic);
+                g_AsciiManager.AddString(&debugCounterPos,
+                                         g_SupervisorFpsDebugBuffer);
+            }
+#else
+            g_AsciiManager.AddString(&debugCounterPos,
+                                     g_SupervisorFpsDebugBuffer);
+#endif
             g_AsciiManager.color.d3dColor = 0xffffffff;
         }
     }

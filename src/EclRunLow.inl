@@ -332,12 +332,24 @@ static EclRawInstruction *__fastcall CompareOperands(
         break;
     case 30: ++*WriteInt(enemy, instruction, 0); break;
     case 31: --*WriteInt(enemy, instruction, 0); break;
-    case 32: *WriteFloat(enemy, instruction, 0) = sinf(((instruction->operandFlags & (1U << 1))
-        ? enemy->ResolveFloat(*reinterpret_cast<f32 *>(&RawInt(instruction, 1)))
-        : *reinterpret_cast<f32 *>(&RawInt(instruction, 1)))); break;
-    case 33: *WriteFloat(enemy, instruction, 0) = cosf(((instruction->operandFlags & (1U << 1))
-        ? enemy->ResolveFloat(*reinterpret_cast<f32 *>(&RawInt(instruction, 1)))
-        : *reinterpret_cast<f32 *>(&RawInt(instruction, 1)))); break;
+    case 32: *WriteFloat(enemy, instruction, 0) =
+#ifdef TH08_MODERN_PORT
+        X87CompatibleSin(
+#else
+        sinf(
+#endif
+            ((instruction->operandFlags & (1U << 1))
+                ? enemy->ResolveFloat(*reinterpret_cast<f32 *>(&RawInt(instruction, 1)))
+                : *reinterpret_cast<f32 *>(&RawInt(instruction, 1)))); break;
+    case 33: *WriteFloat(enemy, instruction, 0) =
+#ifdef TH08_MODERN_PORT
+        X87CompatibleCos(
+#else
+        cosf(
+#endif
+            ((instruction->operandFlags & (1U << 1))
+                ? enemy->ResolveFloat(*reinterpret_cast<f32 *>(&RawInt(instruction, 1)))
+                : *reinterpret_cast<f32 *>(&RawInt(instruction, 1)))); break;
     case 34:
         *WriteFloat(enemy, instruction, 0) = VectorAngle((((instruction->operandFlags & (1U << 4))
             ? enemy->ResolveFloat(*reinterpret_cast<f32 *>(&RawInt(instruction, 4)))
@@ -368,8 +380,15 @@ static EclRawInstruction *__fastcall CompareOperands(
     case 38:
         angle = AddNormalizeAngle(((instruction->operandFlags & (1U << 2)) ? enemy->ResolveFloat(*reinterpret_cast<f32 *>(&RawInt(instruction, 2))) : *reinterpret_cast<f32 *>(&RawInt(instruction, 2))), 0.0f);
         magnitude = ((instruction->operandFlags & (1U << 3)) ? enemy->ResolveFloat(*reinterpret_cast<f32 *>(&RawInt(instruction, 3))) : *reinterpret_cast<f32 *>(&RawInt(instruction, 3)));
+#ifdef TH08_MODERN_PORT
+        *WriteFloat(enemy, instruction, 0) =
+            X87CompatibleCosMul(angle, magnitude);
+        *WriteFloat(enemy, instruction, 1) =
+            X87CompatibleSinMul(angle, magnitude);
+#else
         *WriteFloat(enemy, instruction, 0) = cosf(angle) * magnitude;
         *WriteFloat(enemy, instruction, 1) = sinf(angle) * magnitude;
+#endif
         break;
 
     case 39:

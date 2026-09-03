@@ -251,6 +251,13 @@ struct GuiImpl
     AnmVm difficultyVm;
 
     GuiImpl();
+#if defined(PSP)
+    // PSP keeps the original ZUN_NEW/ZUN_DELETE call sites and object
+    // lifetime, but obtains this large stage-lifetime object from the
+    // early-reserved Main-RAM render arena before falling back to global new.
+    void *operator new(size_t size);
+    void operator delete(void *memory) noexcept;
+#endif
     void StartMessage(i32 messageIndex);
     i32 RunMsg();
     ZunResult DrawDialogue();

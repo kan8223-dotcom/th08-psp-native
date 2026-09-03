@@ -4,6 +4,7 @@
 #include "EnemyManager.hpp"
 #include "Gui.hpp"
 #include "ReplayManager.hpp"
+#include "ReplaySyncAudit.hpp"
 #include "ResultScreen.hpp"
 #include "i18n.hpp"
 
@@ -34,6 +35,57 @@ struct ReplayUserDataHeader
 C_ASSERT(sizeof(ReplayUserDataHeader) == 0xc);
 
 char *AppendFormat(char *buffer, const char *format, ...);
+
+#if defined(PSP)
+// The PC executable gives both streams 0xd2f00 bytes.  Input really can use
+// that full logical capacity; FPS samples cannot.  One FPS byte is advanced
+// per 30 input frames while two adjacent bytes are written, so 0x4000 bytes
+// covers all 431,982 input records representable by the original input block.
+constexpr size_t kReplayInputCapacity = 0xd2f00U;
+constexpr size_t kReplayFpsCapacity = 0x4000U;
+constexpr size_t kReplaySaveFinalizationHeadroom = sizeof(u16);
+constexpr size_t kReplayInputHeaderBytes = offsetof(StageReplayData, inputStream);
+constexpr size_t kReplayInputRecordBytes = sizeof(u16);
+constexpr size_t kReplayMaxInputRecords =
+    (kReplayInputCapacity - kReplayInputHeaderBytes) / kReplayInputRecordBytes;
+constexpr size_t kReplayRequiredFpsBytes = (kReplayMaxInputRecords + 29U) / 30U + 1U;
+constexpr size_t kReplayMaxSerializedPayload =
+    (TH08_REPLAY_DATA_SIZE - TH08_REPLAY_HEADER_SIZE) +
+    MAX_STAGES *
+        (kReplayInputCapacity + kReplaySaveFinalizationHeadroom + kReplayFpsCapacity);
+static_assert(kReplayRequiredFpsBytes <= kReplayFpsCapacity,
+              "PSP FPS replay buffer must cover the original input capacity");
+
+StageReplayData *gPreparedReplayInput = NULL;
+u8 *gPreparedReplayFps = NULL;
+size_t gReplayInputCapacities[MAX_STAGES]{};
+size_t gReplayFpsCapacities[MAX_STAGES]{};
+
+void ResetReplayStageMemoryState(i32 stage)
+{
+    if (stage < 0 || stage >= MAX_STAGES)
+        return;
+    gReplayInputCapacities[stage] = 0;
+    gReplayFpsCapacities[stage] = 0;
+}
+
+void ReleaseRecordedStageBuffers(ReplayData *replayData, i32 stage)
+{
+    if (replayData == NULL || stage < 0 || stage >= MAX_STAGES)
+        return;
+    if (TH08_REPLAY_STAGE_DATA(replayData, stage) != NULL)
+    {
+        g_ZunMemory.Free(TH08_REPLAY_STAGE_DATA(replayData, stage));
+        TH08_REPLAY_STAGE_DATA(replayData, stage) = NULL;
+    }
+    if (TH08_REPLAY_FPS_DATA(replayData, stage) != NULL)
+    {
+        g_ZunMemory.Free(TH08_REPLAY_FPS_DATA(replayData, stage));
+        TH08_REPLAY_FPS_DATA(replayData, stage) = NULL;
+    }
+    ResetReplayStageMemoryState(stage);
+}
+#endif
 } // namespace
 
 #pragma var_order(decodedReplay, i, replayData, obfuscateOffset, obfuscateCursor, checksum, checksumCursor)
@@ -230,6 +282,12 @@ ZunResult ReplayManager::RegisterChain(i32 replayMode, const char *replayPath)
 
             if (g_Chain.AddToCalcChain(replayManager->calcChain, CHAIN_PRIO_CALC_REPLAYMANAGER_RECORD_HIGH_PRIO))
             {
+#if defined(PSP)
+                // AddToCalcChain links the element even when its added
+                // callback reports failure.  Tear the partial recorder down
+                // now so setup can leave through one clean error path.
+                g_Chain.Cut(replayManager->calcChain);
+#endif
                 return ZUN_ERROR;
             }
 
@@ -248,6 +306,13 @@ ZunResult ReplayManager::RegisterChain(i32 replayMode, const char *replayPath)
 
             if (g_Chain.AddToCalcChain(replayManager->calcChain, CHAIN_PRIO_CALC_REPLAYMANAGER_PLAYBACK_HIGH_PRIO))
             {
+#if defined(PSP)
+                // Match the recorder failure path. AddToCalcChain publishes
+                // the element even when BeginPlaybackStage reports an error;
+                // cutting it here invokes DeleteReplayManager and prevents a
+                // half-initialized playback owner from surviving setup.
+                g_Chain.Cut(replayManager->calcChain);
+#endif
                 return ZUN_ERROR;
             }
 
@@ -278,11 +343,9 @@ ZunResult ReplayManager::RegisterChain(i32 replayMode, const char *replayPath)
         switch (replayMode)
         {
         case REPLAY_MANAGER_RECORD:
-            BeginRecordingStage(g_ReplayManager);
-            break;
+            return BeginRecordingStage(g_ReplayManager);
         case REPLAY_MANAGER_PLAYBACK:
-            BeginPlaybackStage(g_ReplayManager);
-            break;
+            return BeginPlaybackStage(g_ReplayManager);
         }
     }
 
@@ -361,6 +424,9 @@ ChainCallbackResult ReplayManager::RecordInputAndFps(ReplayManager *replayManage
 
 ChainCallbackResult ReplayManager::ControlPlaybackFrameAdvance(ReplayManager *replayManager)
 {
+#if defined(TH08_REPLAY_SYNC_AUDIT)
+    ReplaySyncAudit::EndFrame();
+#endif
     if (!g_GameManager.flags.replayInputEnabled)
     {
         return CHAIN_CALLBACK_RESULT_CONTINUE;
@@ -408,6 +474,11 @@ ChainCallbackResult ReplayManager::PlaybackInputAndFps(ReplayManager *replayMana
     g_GuiMessageInputPrevious = g_GuiMessageInputCurrent;
     g_GuiMessageInputCurrent = *(u16 *)replayManager->replayInputCursor;
     replayManager->replayInputCursor += sizeof(u16);
+#if defined(TH08_REPLAY_SYNC_AUDIT)
+    ReplaySyncAudit::BeginFrame(static_cast<u32>(replayManager->frameCounter),
+                                g_GuiMessageInputCurrent,
+                                ReplaySyncAudit::INPUT_RECORD_NORMAL);
+#endif
 
     g_IsEighthFrameOfHeldInput = 0;
     if (g_GuiMessageInputPrevious == g_GuiMessageInputCurrent)
@@ -465,6 +536,11 @@ ChainCallbackResult ReplayManager::PlaybackExtendedInputAndFps(ReplayManager *re
     g_GuiMessageInputPrevious = g_GuiMessageInputCurrent;
     g_GuiMessageInputCurrent = replayManager->extendedInputCursor->input;
     replayManager->extendedInputCursor++;
+#if defined(TH08_REPLAY_SYNC_AUDIT)
+    ReplaySyncAudit::BeginFrame(static_cast<u32>(replayManager->frameCounter),
+                                g_GuiMessageInputCurrent,
+                                ReplaySyncAudit::INPUT_RECORD_EXTENDED);
+#endif
 
     g_IsEighthFrameOfHeldInput = 0;
     if (g_GuiMessageInputPrevious == g_GuiMessageInputCurrent)
@@ -498,6 +574,40 @@ ChainCallbackResult ReplayManager::PlaybackExtendedInputAndFps(ReplayManager *re
     replayManager->frameCounter++;
     return CHAIN_CALLBACK_RESULT_CONTINUE;
 }
+
+#if defined(PSP)
+ZunResult ReplayManager::PrepareRecordingStageBuffers()
+{
+    if (g_GameManager.flags.isReplay)
+        return ZUN_SUCCESS;
+    if (gPreparedReplayInput != NULL && gPreparedReplayFps != NULL)
+        return ZUN_SUCCESS;
+
+    ReleasePreparedRecordingStageBuffers();
+    StageReplayData *input = static_cast<StageReplayData *>(
+        g_ZunMemory.Alloc(kReplayInputCapacity, "PSP replay input reserve"));
+    u8 *fps = static_cast<u8 *>(
+        g_ZunMemory.Alloc(kReplayFpsCapacity, "PSP replay FPS reserve"));
+    if (input == NULL || fps == NULL)
+    {
+        g_ZunMemory.Free(input);
+        g_ZunMemory.Free(fps);
+        return ZUN_ERROR;
+    }
+
+    gPreparedReplayInput = input;
+    gPreparedReplayFps = fps;
+    return ZUN_SUCCESS;
+}
+
+void ReplayManager::ReleasePreparedRecordingStageBuffers()
+{
+    g_ZunMemory.Free(gPreparedReplayInput);
+    g_ZunMemory.Free(gPreparedReplayFps);
+    gPreparedReplayInput = NULL;
+    gPreparedReplayFps = NULL;
+}
+#endif
 
 #pragma var_order(stageData, stage, stageFpsData, previousStage)
 ZunResult ReplayManager::BeginRecordingStage(ReplayManager *replayManager)
@@ -550,6 +660,9 @@ ZunResult ReplayManager::BeginRecordingStage(ReplayManager *replayManager)
         {
             TH08_REPLAY_STAGE_DATA(replayManager->replayData, stage) = NULL;
             TH08_REPLAY_FPS_DATA(replayManager->replayData, stage) = NULL;
+#if defined(PSP)
+            ResetReplayStageMemoryState(stage);
+#endif
         }
     }
     else
@@ -570,6 +683,40 @@ ZunResult ReplayManager::BeginRecordingStage(ReplayManager *replayManager)
     }
 
     stage = g_GameManager.currentStage;
+#if defined(PSP)
+    if (stage < 0 || stage >= MAX_STAGES)
+    {
+        ReleasePreparedRecordingStageBuffers();
+        return ZUN_ERROR;
+    }
+    ReleaseRecordedStageBuffers(replayManager->replayData, stage);
+
+    stageData = gPreparedReplayInput;
+    stageFpsData = gPreparedReplayFps;
+    gPreparedReplayInput = NULL;
+    gPreparedReplayFps = NULL;
+    if (stageData == NULL || stageFpsData == NULL)
+    {
+        g_ZunMemory.Free(stageData);
+        g_ZunMemory.Free(stageFpsData);
+        stageData = static_cast<StageReplayData *>(
+            g_ZunMemory.Alloc(kReplayInputCapacity, "PSP replay input fallback"));
+        stageFpsData = static_cast<u8 *>(
+            g_ZunMemory.Alloc(kReplayFpsCapacity, "PSP replay FPS fallback"));
+    }
+    if (stageData == NULL || stageFpsData == NULL)
+    {
+        g_ZunMemory.Free(stageData);
+        g_ZunMemory.Free(stageFpsData);
+        ResetReplayStageMemoryState(stage);
+        return ZUN_ERROR;
+    }
+
+    TH08_REPLAY_STAGE_DATA(replayManager->replayData, stage) = stageData;
+    TH08_REPLAY_FPS_DATA(replayManager->replayData, stage) = stageFpsData;
+    gReplayInputCapacities[stage] = kReplayInputCapacity;
+    gReplayFpsCapacities[stage] = kReplayFpsCapacity;
+#else
     if (TH08_REPLAY_STAGE_DATA(replayManager->replayData, stage) != NULL)
     {
         g_ZunMemory.Free(TH08_REPLAY_STAGE_DATA(replayManager->replayData, stage));
@@ -586,6 +733,10 @@ ZunResult ReplayManager::BeginRecordingStage(ReplayManager *replayManager)
 
     stageData = TH08_REPLAY_STAGE_DATA(replayManager->replayData, stage);
     stageFpsData = TH08_REPLAY_FPS_DATA(replayManager->replayData, stage);
+#endif
+
+    if (stageData == NULL || stageFpsData == NULL)
+        return ZUN_ERROR;
 
     stageData->graze = g_GameManager.globals->graze;
     stageData->bombs = (u8)g_GameManager.GetBombsRemaining();
@@ -605,6 +756,12 @@ ZunResult ReplayManager::BeginRecordingStage(ReplayManager *replayManager)
     replayManager->replayInputCursor = stageData->inputStream;
     replayManager->extendedInputCursor = reinterpret_cast<ReplayInputSync *>(replayManager->replayInputCursor);
     replayManager->replayFpsSampleCursor = stageFpsData;
+#if defined(PSP)
+    // A very short aborted stage may have no 30-frame FPS sample.  Give both
+    // streams a valid empty end instead of inheriting a stale stage pointer.
+    replayManager->replayInputEnds[stage] = replayManager->replayInputCursor;
+    replayManager->replayFpsSampleEnds[stage] = replayManager->replayFpsSampleCursor;
+#endif
     *reinterpret_cast<u16 *>(replayManager->replayInputCursor) = 0;
     replayManager->extendedInputCursor->eventFlags = 0;
     replayManager->extendedInputCursor->rngSeed = g_Rng.GetSeed();
@@ -722,6 +879,14 @@ ZunResult ReplayManager::DeleteReplayManager(ReplayManager *replayManager)
         replayManager->frameSyncChain = NULL;
     }
 
+#if defined(PSP)
+    ReleasePreparedRecordingStageBuffers();
+    if (!replayManager->IsDemo() && replayManager->replayData != NULL)
+    {
+        for (i32 stage = 0; stage < MAX_STAGES; ++stage)
+            ReleaseRecordedStageBuffers(replayManager->replayData, stage);
+    }
+#endif
     g_ZunMemory.Free(g_ReplayManager->replayData);
 
     if (replayManager->replayFileData != NULL)
@@ -747,12 +912,114 @@ void ReplayManager::StopRecording()
 
     if (mgr != NULL)
     {
+#if defined(PSP)
+        stage = g_GameManager.currentStage;
+        if (mgr->replayData == NULL || stage < 0 || stage >= MAX_STAGES)
+            return;
+
+        u8 *const inputBase =
+            reinterpret_cast<u8 *>(TH08_REPLAY_STAGE_DATA(mgr->replayData, stage));
+        if (inputBase == NULL || mgr->replayInputCursor == NULL)
+            return;
+
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(inputBase);
+        const uintptr_t cursor = reinterpret_cast<uintptr_t>(mgr->replayInputCursor);
+        const size_t capacity = gReplayInputCapacities[stage];
+        constexpr size_t kFinalRecordBytes = sizeof(u16) + 6U;
+        if (cursor < begin || cursor - begin > capacity ||
+            kFinalRecordBytes > capacity - static_cast<size_t>(cursor - begin))
+        {
+            utils::DebugPrint("error: PSP replay terminator exceeds stage %d input capacity\r\n",
+                              stage + 1);
+            return;
+        }
+#endif
         mgr->replayInputCursor += sizeof(u16);
         *(u16 *)mgr->replayInputCursor = 0;
+#if !defined(PSP)
         stage = g_GameManager.currentStage;
+#endif
         mgr->replayInputEnds[stage] = mgr->replayInputCursor + 6;
     }
 }
+
+#if defined(PSP)
+void ReplayManager::CompactRecordedStage(i32 stage)
+{
+    ReplayManager *mgr = g_ReplayManager;
+    if (mgr == NULL || mgr->IsDemo() || mgr->replayData == NULL ||
+        stage < 0 || stage >= MAX_STAGES)
+    {
+        return;
+    }
+
+    StageReplayData *inputBase = TH08_REPLAY_STAGE_DATA(mgr->replayData, stage);
+    u8 *fpsBase = TH08_REPLAY_FPS_DATA(mgr->replayData, stage);
+    if (inputBase == NULL || fpsBase == NULL || mgr->replayInputEnds[stage] == NULL ||
+        mgr->replayFpsSampleEnds[stage] == NULL)
+    {
+        return;
+    }
+
+    const uintptr_t inputBegin = reinterpret_cast<uintptr_t>(inputBase);
+    const uintptr_t inputEnd = reinterpret_cast<uintptr_t>(mgr->replayInputEnds[stage]);
+    const uintptr_t fpsBegin = reinterpret_cast<uintptr_t>(fpsBase);
+    const uintptr_t fpsEnd = reinterpret_cast<uintptr_t>(mgr->replayFpsSampleEnds[stage]);
+    const size_t inputCapacity = gReplayInputCapacities[stage];
+    const size_t fpsCapacity = gReplayFpsCapacities[stage];
+    const uintptr_t inputCursorAddress = reinterpret_cast<uintptr_t>(mgr->replayInputCursor);
+    const uintptr_t extendedCursorAddress = reinterpret_cast<uintptr_t>(mgr->extendedInputCursor);
+    const uintptr_t fpsCursorAddress = reinterpret_cast<uintptr_t>(mgr->replayFpsSampleCursor);
+    if (inputEnd < inputBegin + kReplayInputHeaderBytes + 8U ||
+        inputEnd - inputBegin > inputCapacity || fpsEnd < fpsBegin ||
+        fpsEnd - fpsBegin > fpsCapacity || inputCursorAddress < inputBegin ||
+        inputCursorAddress > inputEnd || extendedCursorAddress < inputBegin ||
+        extendedCursorAddress > inputEnd || fpsCursorAddress < fpsBegin ||
+        fpsCursorAddress > fpsEnd)
+    {
+        return;
+    }
+
+    const size_t inputUsed = static_cast<size_t>(inputEnd - inputBegin);
+    const size_t fpsUsed = static_cast<size_t>(fpsEnd - fpsBegin);
+    const uintptr_t inputCursorOffset = inputCursorAddress - inputBegin;
+    const uintptr_t extendedCursorOffset = extendedCursorAddress - inputBegin;
+    const uintptr_t fpsCursorOffset = fpsCursorAddress - fpsBegin;
+
+    // GameManager finalizes at stage teardown and SaveReplay finalizes once
+    // more, exactly like the original call sequence.  Keep the second u16 of
+    // physical headroom outside the first serialized span so compaction does
+    // not turn that later terminator into a two-byte out-of-bounds read.
+    const size_t compactInputCapacity = inputUsed + kReplaySaveFinalizationHeadroom;
+    StageReplayData *shrunkInput = static_cast<StageReplayData *>(
+        th08_psp_tracked_realloc(inputBase, compactInputCapacity, "PSP replay input compact"));
+    if (shrunkInput != NULL)
+    {
+        TH08_REPLAY_STAGE_DATA(mgr->replayData, stage) = shrunkInput;
+        mgr->replayInputEnds[stage] = reinterpret_cast<u8 *>(shrunkInput) + inputUsed;
+        mgr->replayInputCursor = reinterpret_cast<u8 *>(shrunkInput) + inputCursorOffset;
+        mgr->extendedInputCursor = reinterpret_cast<ReplayInputSync *>(
+            reinterpret_cast<u8 *>(shrunkInput) + extendedCursorOffset);
+        gReplayInputCapacities[stage] = compactInputCapacity;
+    }
+
+    u8 *shrunkFps = static_cast<u8 *>(
+        th08_psp_tracked_realloc(fpsBase, fpsUsed, "PSP replay FPS compact"));
+    if (shrunkFps != NULL)
+    {
+        TH08_REPLAY_FPS_DATA(mgr->replayData, stage) = shrunkFps;
+        mgr->replayFpsSampleEnds[stage] = shrunkFps + fpsUsed;
+        mgr->replayFpsSampleCursor = shrunkFps + fpsCursorOffset;
+        gReplayFpsCapacities[stage] = fpsUsed;
+    }
+
+    utils::DebugPrint(
+        "info : PSP replay compact stage %d input %lu/%lu fps %lu/%lu\r\n",
+        stage + 1, static_cast<unsigned long>(inputUsed),
+        static_cast<unsigned long>(kReplayInputCapacity), static_cast<unsigned long>(fpsUsed),
+        static_cast<unsigned long>(kReplayFpsCapacity));
+}
+#endif
 
 #pragma var_order(i, mgr, infoCursor, bytesWritten, compressedData, slowDownRate, compressedSize, stageSize,          \
                   tempBuffer, replayCopy, infoBuffer, file, infoHeader, currentOffset, localTime, currentTime,      \
@@ -780,6 +1047,11 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
     HANDLE file;
     DWORD bytesWritten;
     i32 i;
+#if defined(PSP)
+    size_t replayInputSizes[MAX_STAGES]{};
+    size_t replayFpsSizes[MAX_STAGES]{};
+    size_t serializedPayloadSize;
+#endif
 
     if (g_ReplayManager != NULL)
     {
@@ -802,6 +1074,87 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
             {
                 utils::DebugPrint("info : Replay File write %s\r\n", replayPath);
 
+#if defined(PSP)
+    // The desktop routine reserves an unconditional 4 MiB before it even
+    // knows the replay size.  First finalize and validate every discontiguous
+    // source span, then reserve only the exact wire payload.  This does not
+    // change the byte order presented to the original LZSS encoder.
+    replayCopy = *mgr->replayData;
+    ReplayManager::StopRecording();
+
+    i = g_GameManager.stageAtStart;
+    if (i < 0 || i >= MAX_STAGES || TH08_REPLAY_STAGE_DATA(mgr->replayData, i) == NULL)
+    {
+        utils::DebugPrint("error: PSP replay save has no current stage %d\r\n", i);
+        goto release_stage_data;
+    }
+    TH08_REPLAY_STAGE_DATA(mgr->replayData, i)->score = g_GameManager.globals->score;
+
+    serializedPayloadSize = TH08_REPLAY_DATA_SIZE - TH08_REPLAY_HEADER_SIZE;
+    for (i = 0; i < MAX_STAGES; ++i)
+    {
+        u8 *const input = reinterpret_cast<u8 *>(TH08_REPLAY_STAGE_DATA(mgr->replayData, i));
+        if (input != NULL)
+        {
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(input);
+            const uintptr_t end = reinterpret_cast<uintptr_t>(mgr->replayInputEnds[i]);
+            if (mgr->replayInputEnds[i] == NULL || end < begin ||
+                end - begin > gReplayInputCapacities[i])
+            {
+                utils::DebugPrint("error: PSP replay input span invalid at stage %d\r\n", i + 1);
+                goto release_stage_data;
+            }
+            replayInputSizes[i] = static_cast<size_t>(end - begin);
+            if (replayInputSizes[i] > kReplayMaxSerializedPayload - serializedPayloadSize)
+            {
+                utils::DebugPrint("error: PSP replay input size overflow at stage %d\r\n", i + 1);
+                goto release_stage_data;
+            }
+            serializedPayloadSize += replayInputSizes[i];
+        }
+    }
+    for (i = 0; i < MAX_STAGES; ++i)
+    {
+        u8 *const fps = TH08_REPLAY_FPS_DATA(mgr->replayData, i);
+        if (fps != NULL)
+        {
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(fps);
+            const uintptr_t end = reinterpret_cast<uintptr_t>(mgr->replayFpsSampleEnds[i]);
+            if (mgr->replayFpsSampleEnds[i] == NULL || end < begin ||
+                end - begin > gReplayFpsCapacities[i])
+            {
+                utils::DebugPrint("error: PSP replay FPS span invalid at stage %d\r\n", i + 1);
+                goto release_stage_data;
+            }
+            replayFpsSizes[i] = static_cast<size_t>(end - begin);
+            if (replayFpsSizes[i] > kReplayMaxSerializedPayload - serializedPayloadSize)
+            {
+                utils::DebugPrint("error: PSP replay FPS size overflow at stage %d\r\n", i + 1);
+                goto release_stage_data;
+            }
+            serializedPayloadSize += replayFpsSizes[i];
+        }
+    }
+    if (serializedPayloadSize > kReplayMaxSerializedPayload)
+    {
+        utils::DebugPrint("error: PSP replay payload exceeds logical stream capacities\r\n");
+        goto release_stage_data;
+    }
+
+    tempBuffer = static_cast<u8 *>(
+        g_ZunMemory.Alloc(serializedPayloadSize, "PSP replay exact serialize"));
+    if (tempBuffer == NULL)
+    {
+        utils::DebugPrint("error: PSP replay exact payload allocation failed (%lu bytes)\r\n",
+                          static_cast<unsigned long>(serializedPayloadSize));
+        goto release_stage_data;
+    }
+    currentOffset = TH08_REPLAY_DATA_SIZE;
+    utils::DebugPrint("info : PSP replay serialize scratch %lu bytes (saved %lu vs 4 MiB)\r\n",
+                      static_cast<unsigned long>(serializedPayloadSize),
+                      static_cast<unsigned long>(
+                          serializedPayloadSize < 0x400000U ? 0x400000U - serializedPayloadSize : 0U));
+#else
     tempBuffer = (u8 *)g_ZunMemory.Alloc(0x400000, "rep tmp");
     replayCopy = *mgr->replayData;
 
@@ -812,12 +1165,17 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
 
     currentOffset = TH08_REPLAY_HEADER_SIZE;
     currentOffset += TH08_REPLAY_DATA_SIZE - TH08_REPLAY_HEADER_SIZE;
+#endif
 
     for (i = 0; i < MAX_STAGES; i++)
     {
         if (TH08_REPLAY_STAGE_DATA(mgr->replayData, i) != NULL)
         {
+#if defined(PSP)
+            stageSize = static_cast<i32>(replayInputSizes[i]);
+#else
             stageSize = mgr->replayInputEnds[i] - (u8 *)TH08_REPLAY_STAGE_DATA(mgr->replayData, i);
+#endif
             memcpy(tempBuffer + currentOffset - TH08_REPLAY_HEADER_SIZE,
                    TH08_REPLAY_STAGE_DATA(mgr->replayData, i), stageSize);
 #ifdef TH08_PORTABLE_NATIVE_LAYOUT
@@ -826,6 +1184,15 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
             replayCopy.header.stageReplayData[i] = (StageReplayData *)currentOffset;
 #endif
             currentOffset += stageSize;
+#if defined(PSP)
+            // The source is never consulted again after serialization and the
+            // common exit path already discarded it.  Releasing it here keeps
+            // completed-stage storage from overlapping the LZSS output peak.
+            g_ZunMemory.Free(TH08_REPLAY_STAGE_DATA(mgr->replayData, i));
+            TH08_REPLAY_STAGE_DATA(mgr->replayData, i) = NULL;
+            mgr->replayInputEnds[i] = NULL;
+            gReplayInputCapacities[i] = 0;
+#endif
         }
     }
 
@@ -833,7 +1200,11 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
     {
         if (TH08_REPLAY_FPS_DATA(mgr->replayData, i) != NULL)
         {
+#if defined(PSP)
+            stageSize = static_cast<i32>(replayFpsSizes[i]);
+#else
             stageSize = mgr->replayFpsSampleEnds[i] - TH08_REPLAY_FPS_DATA(mgr->replayData, i);
+#endif
             memcpy(tempBuffer + currentOffset - TH08_REPLAY_HEADER_SIZE,
                    TH08_REPLAY_FPS_DATA(mgr->replayData, i), stageSize);
 #ifdef TH08_PORTABLE_NATIVE_LAYOUT
@@ -842,6 +1213,12 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
             replayCopy.header.stageFpsData[i] = (u8 *)currentOffset;
 #endif
             currentOffset += stageSize;
+#if defined(PSP)
+            g_ZunMemory.Free(TH08_REPLAY_FPS_DATA(mgr->replayData, i));
+            TH08_REPLAY_FPS_DATA(mgr->replayData, i) = NULL;
+            mgr->replayFpsSampleEnds[i] = NULL;
+            gReplayFpsCapacities[i] = 0;
+#endif
         }
     }
 
@@ -915,6 +1292,14 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
     replayCopy.slowDownRate2 = replayCopy.slowDownRate + 1.12f;
     replayCopy.unconsumedConstant30 = 30;
 
+#if defined(PSP)
+    if (static_cast<size_t>(currentOffset - TH08_REPLAY_HEADER_SIZE) != serializedPayloadSize)
+    {
+        utils::DebugPrint("error: PSP replay serialized size changed during assembly\r\n");
+        g_ZunMemory.Free(tempBuffer);
+        goto release_stage_data;
+    }
+#endif
     memcpy(tempBuffer, &replayCopy.randomPayloadByte, TH08_REPLAY_DATA_SIZE - TH08_REPLAY_HEADER_SIZE);
 
     utils::DebugPrint("info : original size %d\r\n", currentOffset);
@@ -922,6 +1307,14 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
     replayCopy.header.decompressedSize = currentOffset - TH08_REPLAY_HEADER_SIZE;
     compressedData = Lzss::Encode(tempBuffer, replayCopy.header.decompressedSize, &replayCopy.header.compressedSize);
     g_ZunMemory.Free(tempBuffer);
+#if defined(PSP)
+    if (compressedData == NULL)
+    {
+        utils::DebugPrint("error: PSP replay LZSS output allocation failed (input %d bytes)\r\n",
+                          replayCopy.header.decompressedSize);
+        goto release_stage_data;
+    }
+#endif
     compressedSize = replayCopy.header.compressedSize;
 
     checksumCursor = &replayCopy.header.obfuscationKey;
@@ -963,6 +1356,9 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
 
     if (file == INVALID_HANDLE_VALUE)
     {
+#if defined(PSP)
+        GlobalFree(compressedData);
+#endif
         goto release_stage_data;
     }
 
@@ -980,6 +1376,9 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
 release_stage_data:
     for (i = 0; i < MAX_STAGES; i++)
     {
+#if defined(PSP)
+        ReleaseRecordedStageBuffers(g_ReplayManager->replayData, i);
+#else
         if (TH08_REPLAY_STAGE_DATA(g_ReplayManager->replayData, i) != NULL)
         {
             g_ZunMemory.Free(TH08_REPLAY_STAGE_DATA(g_ReplayManager->replayData, i));
@@ -989,6 +1388,7 @@ release_stage_data:
         {
             g_ZunMemory.Free(TH08_REPLAY_FPS_DATA(g_ReplayManager->replayData, i));
         }
+#endif
     }
         }
 

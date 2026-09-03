@@ -19,7 +19,9 @@ constexpr int kFrameBytes = kBufferWidth * kScreenHeight * 2;
 constexpr int kSecondFrameOffset = kFrameBytes;
 constexpr int kDepthOffset = kFrameBytes * 2;
 
-alignas(16) std::uint32_t gDisplayList[256 * 1024]{};
+// The fallback screen emits only a few dozen GU commands.  A 64 KiB list is
+// ample and avoids reserving another full MiB in the gameplay image.
+alignas(16) std::uint32_t gDisplayList[16 * 1024]{};
 bool gVideoInitialized = false;
 
 struct ColorVertex
@@ -126,6 +128,49 @@ void RenderBootstrapStatus(const DataDiscovery &data,
                          postProbeMemory.cpuClockMhz, postProbeMemory.busClockMhz);
     pspDebugScreenPrintf("\nThis build does not contain the playable engine yet.\n");
     pspDebugScreenPrintf("UNTESTED ON HARDWARE\n");
+    pspDebugScreenPrintf("Press CIRCLE or START to exit. HOME is supported.\n");
+}
+
+void RenderEngineFailureStatus(const char *phase, const char *state, int result,
+                               const MemorySnapshot &memory)
+{
+    if (!gVideoInitialized)
+    {
+        return;
+    }
+
+    sceGuStart(GU_DIRECT, gDisplayList);
+    sceGuClearColor(0xFF100808U);
+    sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+    DrawRectangle(0, 0, kScreenWidth, 30, 0xFF501010U);
+    DrawRectangle(12, 62, 468, 66, 0xFF4050D0U);
+    DrawRectangle(12, 226, 468, 230, 0xFF302018U);
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceDisplayWaitVblankStart();
+    sceGuSwapBuffers();
+
+    const std::uintptr_t uncachedEdram =
+        reinterpret_cast<std::uintptr_t>(sceGeEdramGetAddr()) | 0x40000000U;
+    pspDebugScreenInitEx(reinterpret_cast<void *>(uncachedEdram),
+                         PSP_DISPLAY_PIXEL_FORMAT_565, 0);
+    pspDebugScreenEnableBackColor(0);
+    pspDebugScreenSetTextColor(0x00FFFFFFU);
+    pspDebugScreenSetXY(2, 1);
+    pspDebugScreenPrintf("TH08 PSP STARTUP FAILED\n");
+    pspDebugScreenPrintf("Build: %s\n", TH08_PSP_BUILD_ID);
+    pspDebugScreenPrintf("\nLast checkpoint:\n");
+    pspDebugScreenPrintf("  phase: %.55s\n", phase != nullptr ? phase : "<null>");
+    pspDebugScreenPrintf("  state: %.55s\n", state != nullptr ? state : "<null>");
+    pspDebugScreenPrintf("  result: %d (0x%08x)\n", result,
+                         static_cast<unsigned int>(result));
+    pspDebugScreenPrintf("\nKernel free: %lu KiB\n",
+                         ToKiB(memory.totalFreeBytes));
+    pspDebugScreenPrintf("Largest kernel block: %lu KiB\n",
+                         ToKiB(memory.largestFreeBlockBytes));
+    pspDebugScreenPrintf("GE eDRAM visible: %lu KiB\n",
+                         ToKiB(memory.edramBytes));
+    pspDebugScreenPrintf("\nSee TH08PSP-BOOT.LOG for the flushed trace.\n");
     pspDebugScreenPrintf("Press CIRCLE or START to exit. HOME is supported.\n");
 }
 

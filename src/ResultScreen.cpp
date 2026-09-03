@@ -7,6 +7,9 @@
 #include "ScreenEffect.hpp"
 #include "SoundPlayer.hpp"
 #include "pbg/Lzss.hpp"
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+#include "stage_pool_arena.hpp"
+#endif
 
 #include "i18n.hpp"
 
@@ -84,6 +87,20 @@
 namespace th08
 {
 
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+void *ResultScreen::operator new(size_t size)
+{
+    void *memory = psp::StagePoolArenaAcquireIdleTransient(size, "ResultSysInf");
+    return memory != NULL ? memory : ::operator new(size);
+}
+
+void ResultScreen::operator delete(void *memory) noexcept
+{
+    if (!psp::StagePoolArenaFreeIdleTransient(memory))
+        ::operator delete(memory);
+}
+#endif
+
 DIFFABLE_STATIC_ASSIGN(i32, g_ResultStageNumbers[]) = {1, 2, 3, 4, 4, 5, 6, 6, 1, 1, 1};
 
 DIFFABLE_STATIC_ASSIGN(const char *, g_ResultsStageList[]) = {
@@ -150,14 +167,77 @@ void ResultScreen::WriteScore(ResultScreen *result)
     u8 *bytes;
     u8 xorValue;
     u8 byteValue;
+    size_t scoreCapacity;
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+    bool scoreWorkspaceBorrowed = false;
+    u8 *scoreWorkspaceTemporary = NULL;
+    size_t scoreWorkspaceTemporaryCapacity = 0;
+#endif
 
     currentOffset = 0;
 
-    scoreData = (u8 *)g_ZunMemory.Alloc(0x640000);
+#if defined(PSP)
+    // The PC executable reserves 6.25 MiB although the serialized format is
+    // bounded by a few hundred KiB.  That single allocation exhausts the PSP
+    // heap when leaving character select.  Size the buffer from every bounded
+    // chapter plus a small guard margin instead.
+#ifdef TH08_PORTABLE_NATIVE_LAYOUT
+    scoreCapacity = TH08_SCORE_DAT_WIRE_SIZE;
+#else
+    scoreCapacity = sizeof(ScoreDat);
+#endif
+    scoreCapacity += sizeof(result->fileHeader) +
+                     MAX_DIFFICULTIES * SHOT_ALL * 10u * sizeof(Hscr) +
+                     (SHOT_ALL + 1u) * sizeof(Clrd) +
+                     SPELLCARD_COUNT_SPELLCARDS * sizeof(Catk) +
+                     SHOT_ALL * sizeof(Pscr) + sizeof(Lsnm) + sizeof(Flsp) +
+                     sizeof(Plst) + sizeof(Vrsm) + 4096u;
+#else
+    scoreCapacity = 0x640000;
+#endif
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+    // Serialization, compression and encryption are mutually exclusive with
+    // gameplay. Borrow one contiguous idle-stage workspace and reuse its
+    // temporary half for both compression and encryption. This preserves the
+    // exact score bytes while eliminating three large malloc/free cycles.
+    const size_t alignedScoreCapacity = (scoreCapacity + 63u) & ~size_t(63u);
+    const size_t temporaryCapacity = scoreCapacity * 2u;
+    const size_t workspaceCapacity = alignedScoreCapacity + temporaryCapacity;
+    scoreData = static_cast<u8 *>(th08::psp::StagePoolArenaAcquireIdleTransient(
+        workspaceCapacity, "score save workspace"));
+    if (scoreData != NULL)
+    {
+        scoreWorkspaceBorrowed = true;
+        scoreWorkspaceTemporary = scoreData + alignedScoreCapacity;
+        scoreWorkspaceTemporaryCapacity = temporaryCapacity;
+    }
+    else
+#endif
+    {
+        scoreData = (u8 *)g_ZunMemory.Alloc(scoreCapacity);
+    }
+    if (scoreData == NULL)
+    {
+#if defined(PSP)
+        fprintf(stderr, "TH08PSP SCORE_SAVE allocation_failed capacity=%lu\n",
+                static_cast<unsigned long>(scoreCapacity));
+#endif
+        return;
+    }
 
 #define COPY(data, size)                                                                                               \
-    memcpy(scoreData + currentOffset, data, size);                                                                     \
-    currentOffset += size;
+    do                                                                                                                 \
+    {                                                                                                                  \
+        const size_t copySize = (size);                                                                                \
+        if (currentOffset < 0 || static_cast<size_t>(currentOffset) > scoreCapacity ||                                 \
+            copySize > scoreCapacity - static_cast<size_t>(currentOffset))                                             \
+        {                                                                                                              \
+            g_ZunMemory.Free(scoreData);                                                                               \
+            return;                                                                                                    \
+        }                                                                                                              \
+        memcpy(scoreData + currentOffset, data, copySize);                                                             \
+        currentOffset += static_cast<i32>(copySize);                                                                   \
+    } while (0)
 
 #ifdef TH08_PORTABLE_NATIVE_LAYOUT
     COPY(result->scoreDat, TH08_SCORE_DAT_WIRE_SIZE);
@@ -268,15 +348,40 @@ void ResultScreen::WriteScore(ResultScreen *result)
     header->decompressedFileSize = currentOffset;
 
 #ifdef TH08_PORTABLE_NATIVE_LAYOUT
-    compressedData = Lzss::Encode(TH08_SCORE_DAT_WIRE_PAYLOAD(header), header->decompressedFileSizeMinusHeader,
-                                  (i32 *)&header->compressedFileSize);
+    compressedData = Lzss::Encode(
+        TH08_SCORE_DAT_WIRE_PAYLOAD(header), header->decompressedFileSizeMinusHeader,
+        (i32 *)&header->compressedFileSize
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+        , scoreWorkspaceBorrowed ? scoreWorkspaceTemporary : NULL,
+        scoreWorkspaceBorrowed ? static_cast<i32>(scoreWorkspaceTemporaryCapacity) : 0
+#endif
+    );
+    if (compressedData == NULL)
+    {
+        g_ZunMemory.Free(scoreData);
+        return;
+    }
     memcpy(TH08_SCORE_DAT_WIRE_PAYLOAD(header), compressedData, header->compressedFileSize);
 #else
-    compressedData = Lzss::Encode(scoreData + sizeof(ScoreDat), header->decompressedFileSizeMinusHeader,
-                                  (i32 *)&header->compressedFileSize);
+    compressedData = Lzss::Encode(
+        scoreData + sizeof(ScoreDat), header->decompressedFileSizeMinusHeader,
+        (i32 *)&header->compressedFileSize
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+        , scoreWorkspaceBorrowed ? scoreWorkspaceTemporary : NULL,
+        scoreWorkspaceBorrowed ? static_cast<i32>(scoreWorkspaceTemporaryCapacity) : 0
+#endif
+    );
+    if (compressedData == NULL)
+    {
+        g_ZunMemory.Free(scoreData);
+        return;
+    }
     memcpy(scoreData + sizeof(ScoreDat), compressedData, header->compressedFileSize);
 #endif
-    GlobalFree(compressedData);
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+    if (!scoreWorkspaceBorrowed)
+#endif
+        GlobalFree(compressedData);
 
 #ifdef TH08_PORTABLE_NATIVE_LAYOUT
     currentOffset = header->compressedFileSize + TH08_SCORE_DAT_WIRE_SIZE;
@@ -319,13 +424,35 @@ void ResultScreen::WriteScore(ResultScreen *result)
         byteIdx--;
     }
 
-    encryptedData = (u8 *)FileSystem::Encrypt(scoreData, currentOffset, SCORE_DAT_XOR_VALUE,
-                                              SCORE_DAT_XOR_VALUE_INCREMENT, SCORE_DAT_CHUNK_SIZE, SCORE_DAT_MAX_BYTES);
+    encryptedData = (u8 *)FileSystem::Encrypt(
+        scoreData, currentOffset, SCORE_DAT_XOR_VALUE,
+        SCORE_DAT_XOR_VALUE_INCREMENT, SCORE_DAT_CHUNK_SIZE, SCORE_DAT_MAX_BYTES
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+        , scoreWorkspaceBorrowed ? scoreWorkspaceTemporary : NULL,
+        scoreWorkspaceBorrowed ? static_cast<i32>(scoreWorkspaceTemporaryCapacity) : 0
+#endif
+    );
+
+    if (encryptedData == NULL)
+    {
+        g_ZunMemory.Free(scoreData);
+        return;
+    }
 
     FileSystem::WriteDataToFile("score.dat", encryptedData, currentOffset);
 
+#if defined(PSP)
+    fprintf(stderr, "TH08PSP SCORE_SAVE written=%ld capacity=%lu\n",
+            static_cast<long>(currentOffset), static_cast<unsigned long>(scoreCapacity));
+#endif
+
     g_ZunMemory.Free(scoreData);
-    g_ZunMemory.Free(encryptedData);
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+    if (!scoreWorkspaceBorrowed && encryptedData != scoreData)
+#else
+    if (encryptedData != scoreData)
+#endif
+        g_ZunMemory.Free(encryptedData);
 
 #undef COPY
 }
@@ -2313,6 +2440,8 @@ i32 ResultScreen::DrawFinalStats()
 
 ZunResult ResultScreen::RegisterChain(u32 registrationMode)
 {
+    // On PSP, ResultScreen's class-specific new/delete preserve this exact
+    // expression and registry lifetime while borrowing idle stage storage.
     ResultScreen *resultScreen = ZUN_NEW(ResultScreen, "ResultSysInf");
 
     g_ScreenEffectCounter = 0;
@@ -3201,7 +3330,7 @@ i32 ResultScreen::MoveCursorHorizontally(ResultScreen *resultScreen, i32 length)
 // FUNCTION: th08 0x45a3fd
 void AnmManager::ReplaceSurface(i32 destIndex, i32 srcIndex)
 {
-    if (this->surfaces[srcIndex] != NULL)
+    if (this->surfaces[srcIndex] != NULL || this->surfacesBis[srcIndex] != NULL)
     {
         this->ReleaseSurface(destIndex);
 

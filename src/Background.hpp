@@ -151,6 +151,7 @@ C_ASSERT(offsetof(Background, stageEffect) == 0xAE8);
 C_ASSERT(offsetof(Background, skyFog) == 0xAEC);
 C_ASSERT(offsetof(Background, spellBackgroundState) == 0xB24);
 C_ASSERT(offsetof(Background, spellVmCount) == 0xB30);
+C_ASSERT(offsetof(Background, spellVmScriptBase) == 0xB34);
 C_ASSERT(offsetof(Background, spellVms) == 0xB38);
 C_ASSERT(offsetof(Background, spellBackgroundDrawCallback) == 0x625C);
 C_ASSERT(offsetof(Background, pendingStageScriptLabel) == 0x6260);

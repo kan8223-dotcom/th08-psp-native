@@ -1,5 +1,11 @@
 #include "th_pch.h"
 
+#if defined(PSP)
+#include "render_math.hpp"
+#include "enemy_active_bitmap_audit.hpp"
+#include "perf_attribution.hpp"
+#endif
+
 #include "EnemyManager.hpp"
 #include "AnmManager.hpp"
 #include "AsciiManager.hpp"
@@ -12,6 +18,14 @@
 #include "GameManager.hpp"
 #include "Player.hpp"
 #include "ReplayManager.hpp"
+
+#if defined(PSP)
+#include "ecl_child_memory.hpp"
+#endif
+
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+#include "stage_pool_arena.hpp"
+#endif
 
 #ifdef TH08_MODERN_LINUX
 #include "modern/linux/render_audit.hpp"
@@ -130,14 +144,23 @@ void Enemy::UpdateMovement()
 #pragma var_order(i, enemy, this)
 void EnemyManager::Initialize()
 {
-    Enemy *enemy = &this->enemies[0];
+    Enemy *enemy;
     i32 i;
 
-#ifdef TH08_PORTABLE_NATIVE_LAYOUT
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    Enemy *const enemyPool = this->enemies;
+    if (enemyPool == NULL)
+        return;
+    memset(static_cast<void *>(this), 0, sizeof(*this));
+    this->enemies = enemyPool;
+    memset(static_cast<void *>(this->enemies), 0,
+           sizeof(Enemy) * th08::psp::kEnemyPoolStorageCount);
+#elif defined(TH08_PORTABLE_NATIVE_LAYOUT)
     memset(this, 0, sizeof(*this));
 #else
     memset(this, 0, 0x9DCF10);
 #endif
+    TH08_PSP_ENEMY_BITMAP_RESET(this);
     for (i = 0; (u32)i < 4; i++)
         this->timelineEventSlots[i] = -1;
 
@@ -146,6 +169,13 @@ void EnemyManager::Initialize()
     memset(enemy, 0, sizeof(*enemy));
 #else
     memset(enemy, 0, 0x53D0);
+#endif
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    // Draw generation overwrites every other field before submission. Keep
+    // all 194 shared vertices at the original XYZRHW value even before the
+    // first opcode-157 strip initialization.
+    for (i = 0; i < 194; ++i)
+        this->sharedTrailVertices[i].w = 1.0f;
 #endif
     for (i = 0; i < 2; i++)
         enemy->secondaryVms[i].scriptIndex = -1;
@@ -205,7 +235,9 @@ void EnemyManager::Initialize()
 // FUNCTION: th08 0x42a210
 EnemyManager::EnemyManager()
 {
+#if !defined(TH08_PSP_STAGE_POOL_ARENA)
     this->Initialize();
+#endif
 }
 
 // FUNCTION: th08 0x42a280
@@ -293,9 +325,16 @@ void Enemy::DetachEnemyChain(i32 awardRewards)
 
                 for (dropLocals.i = 0; dropLocals.i < dropLocals.itemCount; dropLocals.i++)
                 {
-                    position.FromAngleMagnitude(
-                        g_Rng.GetRandomF32SignedInRange(ZUN_PI),
-                        g_Rng.GetRandomF32InRange((f32)dropLocals.itemCount * 2.0f));
+                    // Retail 1.00d consumes the magnitude RNG value before the
+                    // angle RNG value here.  Keeping both calls in one argument
+                    // list made that order compiler-dependent (x86 chose
+                    // magnitude first, Allegrex chose angle first), which
+                    // desynchronized replay item scatter despite an identical
+                    // seed and generation count.
+                    f32 magnitude = g_Rng.GetRandomF32InRange(
+                        (f32)dropLocals.itemCount * 2.0f);
+                    f32 angle = g_Rng.GetRandomF32SignedInRange(ZUN_PI);
+                    position.FromAngleMagnitude(angle, magnitude);
                     position.z = 0.0f;
                     position += enemy->worldPosition;
                     g_ItemManager.SpawnItem(&position, ITEM_TIME, ITEM_STATE_TIME_RISING);
@@ -328,9 +367,11 @@ void Enemy::DetachEnemyChain(i32 awardRewards)
 
             for (j = 0; j < 2 * this->linkedChildCount; j++)
             {
-                position.FromAngleMagnitude(
-                    g_Rng.GetRandomF32SignedInRange(ZUN_PI),
-                    g_Rng.GetRandomF32InRange(128.0f));
+                // Match the same magnitude-before-angle evaluation order used
+                // by the retail parent-chain scatter loop.
+                f32 magnitude = g_Rng.GetRandomF32InRange(128.0f);
+                f32 angle = g_Rng.GetRandomF32SignedInRange(ZUN_PI);
+                position.FromAngleMagnitude(angle, magnitude);
                 position.z = 0.0f;
                 position += this->worldPosition;
                 g_ItemManager.SpawnItem(&position, ITEM_TIME, ITEM_STATE_AUTOCOLLECT);
@@ -467,7 +508,11 @@ i32 Enemy::HandleLifeCallback()
             {
                 if (this->childEclBlocks[work] != NULL)
                 {
+#if defined(PSP)
+                    psp::EnemyChildEclFree(this->childEclBlocks[work]);
+#else
                     g_ZunMemory.Free(this->childEclBlocks[work]);
+#endif
                     this->childEclBlocks[work] = NULL;
                 }
             }
@@ -668,7 +713,11 @@ i32 Enemy::HandleTimerCallback()
     {
         if (this->childEclBlocks[selectedOrK] != NULL)
         {
+#if defined(PSP)
+            psp::EnemyChildEclFree(this->childEclBlocks[selectedOrK]);
+#else
             g_ZunMemory.Free(this->childEclBlocks[selectedOrK]);
+#endif
             this->childEclBlocks[selectedOrK] = NULL;
         }
     }
@@ -698,7 +747,11 @@ void Enemy::ReleaseChildEclBlocks()
     {
         if (this->childEclBlocks[i] != NULL)
         {
+#if defined(PSP)
+            psp::EnemyChildEclFree(this->childEclBlocks[i]);
+#else
             g_ZunMemory.Free(this->childEclBlocks[i]);
+#endif
             this->childEclBlocks[i] = NULL;
         }
     }
@@ -748,6 +801,9 @@ void Enemy::Despawn()
     this->ReleaseChildEclBlocks();
     if (g_Player.optionHomingTarget == this)
         g_Player.optionHomingTarget = NULL;
+    // Some death modes intentionally keep the slot active.  Synchronize from
+    // the authoritative flag instead of assuming every Despawn clears it.
+    TH08_PSP_ENEMY_BITMAP_SYNC(&g_EnemyManager, this);
 }
 
 // FUNCTION: th08 0x42bea0
@@ -920,6 +976,10 @@ ZunResult EnemyManager::RegisterChain()
     EnemyManager *enemyManager = &g_EnemyManager;
     i32 result = 0;
 
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    if (!th08::psp::StagePoolArenaIsBound())
+        return ZUN_ERROR;
+#endif
     enemyManager->Initialize();
 
     g_EnemyManagerCalcChain.SetCallback((ChainCallback)EnemyManager::OnUpdateCallback);
@@ -988,6 +1048,10 @@ void Enemy::UpdateEffects()
 // FUNCTION: th08 0x42e120
 ChainCallbackResult EnemyManager::OnDrawHighPrio(EnemyManager *enemyManager)
 {
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+    th08::psp::PerfAttributionScope perfScope(
+        th08::psp::PerfAttributionPhase::EnemyDraw);
+#endif
     return enemyManager->OnDrawImpl(0, 2);
 }
 
@@ -1121,7 +1185,11 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
                         uvStep = uvSpan / ((vertexCount + 1) / 2 - 1);
                         uv = enemy->vm.loadedSprite->uvEnd.x +
                              enemy->vm.uvScrollPos.x;
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+                        vertices = this->sharedTrailVertices;
+#else
                         vertices = enemy->trailVertices;
+#endif
 
                         for (k = 0; k < enemy->trailHistoryLength;
                              k += enemy->trailSampleStride, uv -= uvStep)
@@ -1159,8 +1227,12 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
                             }
 
                             previousAngle = angle;
+#if defined(PSP)
+                            th08::psp::RenderSinCos(angle, &sinAngle, &cosAngle);
+#else
                             sinAngle = sinf(angle);
                             cosAngle = cosf(angle);
+#endif
                             halfCenter = 0.0f;
 #ifdef TH08_MODERN_PORT
                             halfWidth = portableSavedScale.y *
@@ -1191,6 +1263,9 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
                             vertices[0].pos = enemy->trailSamples[k].position;
                             vertices[0].pos.x += cosAngle * halfCenter - sinAngle * halfWidth + 32.0f;
                             vertices[0].pos.y += sinAngle * halfCenter + cosAngle * halfWidth + 16.0f;
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+                            vertices[0].w = 1.0f;
+#endif
                             vertices[0].textureUV.x = uv;
                             vertices[0].textureUV.y =
                                 enemy->vm.loadedSprite->uvStart.y +
@@ -1200,6 +1275,9 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
                             vertices[0].pos = enemy->trailSamples[k].position;
                             vertices[0].pos.x += cosAngle * halfCenter + sinAngle * halfWidth + 32.0f;
                             vertices[0].pos.y += sinAngle * halfCenter - cosAngle * halfWidth + 16.0f;
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+                            vertices[0].w = 1.0f;
+#endif
                             vertices[0].textureUV.x = uv;
                             vertices[0].textureUV.y =
                                 enemy->vm.loadedSprite->uvEnd.y +
@@ -1208,9 +1286,22 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
                         }
 
                         if (vertexCount > 2)
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+                            // PSP DrawPrimitiveUP copies every source vertex
+                            // into device-owned pspDrawVertices before
+                            // glDrawArrays; its allocation-failure path instead
+                            // consumes the source synchronously. Neither path
+                            // retains this pointer after return. Enemy draw
+                            // callbacks are serial and non-reentrant, so this
+                            // manager scratch can then be reused safely.
+                            g_AnmManager->DrawVertices(
+                                &enemy->vm,
+                                this->sharedTrailVertices, vertexCount);
+#else
                             g_AnmManager->DrawVertices(
                                 &enemy->vm,
                                 enemy->trailVertices, vertexCount);
+#endif
                     }
                 }
 
@@ -1289,6 +1380,10 @@ f32 __stdcall InterpolateWrappedAngle(f32 angle1, f32 angle2, f32 factor)
 // FUNCTION: th08 0x42eb90
 ChainCallbackResult EnemyManager::OnDrawLowPrio(EnemyManager *enemyManager)
 {
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+    th08::psp::PerfAttributionScope perfScope(
+        th08::psp::PerfAttributionPhase::EnemyDraw);
+#endif
     ChainCallbackResult result;
 
     if (g_GameManager.flags.deathbombFreezeActive)
@@ -1451,6 +1546,7 @@ ZunResult EnemyManager::DeletedCallback(EnemyManager *enemyManager)
     g_AsciiManager.SetBossMarkerPosition(1, &markerPosition);
     g_AsciiManager.SetBossMarkerPosition(2, &markerPosition);
     g_AsciiManager.SetBossMarkerPosition(3, &markerPosition);
+    TH08_PSP_ENEMY_BITMAP_TEARDOWN(enemyManager);
     return ZUN_SUCCESS;
 }
 

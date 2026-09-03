@@ -18,6 +18,7 @@ struct MemorySnapshot
 void PlatformInitialize();
 bool PlatformRunning();
 bool PlatformSuspended();
+bool PlatformSelectButtonDown();
 void PlatformRequestExit();
 MemorySnapshot CaptureMemorySnapshot();
 } // namespace th08::psp

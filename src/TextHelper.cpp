@@ -4,10 +4,28 @@
 #include "TextHelper.hpp"
 #include "dxutil.hpp"
 #include "i18n.hpp"
+#if defined(PSP)
+#include "modern/linux/d3d8_internal.hpp"
+#include "render_perf_telemetry.hpp"
+#include "render_resource_arena.hpp"
+#endif
 
 namespace th08
 {
 DIFFABLE_STATIC(IDirect3DSurface8 *, g_TextBufferSurface)
+#if defined(PSP)
+// The portable GDI shim allocates one extra scanline for the top-down DIB, so
+// this 1024x64 A1R5G5B5 buffer owns 133,120 bytes. Keep it for the complete
+// TextHelper lifetime instead of repeatedly asking a fragmented stage heap for
+// the same contiguous block.
+static TextHelper g_PspTextWorkBuffer;
+
+static i32 PspTextRasterHeight(i32 fontHeight)
+{
+    const i32 requested = fontHeight * 2 + 8;
+    return requested < 64 ? requested : 64;
+}
+#endif
 
 DIFFABLE_STATIC_ARRAY_ASSIGN(FormatInfo, 7, g_FormatInfoArray) = {
     {D3DFMT_X8R8G8B8, 32, 0x00000000, 0x00FF0000, 0x0000FF00, 0x000000FF},
@@ -59,6 +77,19 @@ bool TextHelper::ReleaseBuffer()
 
 bool TextHelper::AllocateBufferWithFallback(i32 width, i32 height, D3DFORMAT format)
 {
+#if defined(PSP)
+    if (this->hdc != NULL && this->buffer != NULL && this->width == width &&
+        this->height == height && this->format == format)
+    {
+        // CreateDIBSection receives -(height + 1), so the PSP shim owns one
+        // physical guard row beyond biSizeImage. Reset that row as well to
+        // reproduce a freshly value-initialized GdiBitmap on every use.
+        memset(this->buffer, 0,
+               static_cast<size_t>(this->imageWidthInBytes) *
+                   static_cast<size_t>(this->height + 1));
+        return true;
+    }
+#endif
     if (TryAllocateBuffer(width, height, format))
     {
         return true;
@@ -330,6 +361,11 @@ bool TextHelper::CopyTextToSurface(IDirect3DSurface8 *outSurface)
             srcBuf += srcWidthBytes;
             dstBuf += dstWidthBytes;
         }
+#if defined(PSP)
+        th08::psp::RenderPerfNoteTextBytes(
+            static_cast<std::uint32_t>(srcWidthBytes) *
+            static_cast<std::uint32_t>(GetHeight()));
+#endif
     }
     outSurface->UnlockRect();
     return true;
@@ -339,11 +375,46 @@ bool TextHelper::CopyTextToSurface(IDirect3DSurface8 *outSurface)
 
 void TextHelper::CreateTextBuffer()
 {
+#if defined(PSP)
+    if (!th08_psp_gdi_text_initialize())
+    {
+        g_GameErrorContext.Fatal("PSP shared Japanese font initialization failed.\r\n");
+        return;
+    }
+    // The GDI DIB is already the complete 1024x64 A1R5G5B5 filter source.
+    // Keep only that owner and let the PSP area-average path read it directly;
+    // a second 131,072-byte IDirect3DSurface8 copy carried identical pixels.
+    // The DIB remains Main RAM in the render arena (not eDRAM/ME memory), and
+    // destination atlas geometry, filtering and glyph rasterization stay exact.
+    th08::psp::RenderResourceAllocationScope textWorkScope(
+        "PSP text work buffer");
+    if (!g_PspTextWorkBuffer.TryAllocateBuffer(
+            1024, TEXT_BUFFER_HEIGHT, D3DFMT_A1R5G5B5))
+    {
+        g_GameErrorContext.Fatal("PSP persistent text work buffer allocation failed.\r\n");
+        th08_psp_gdi_text_shutdown();
+    }
+#else
     g_Supervisor.d3dDevice->CreateImageSurface(1024, TEXT_BUFFER_HEIGHT, D3DFMT_A1R5G5B5, &g_TextBufferSurface);
+#endif
 }
+
+#if defined(PSP)
+bool TextHelper::IsTextBufferReady()
+{
+    return g_PspTextWorkBuffer.IsAllocated();
+}
+#endif
 
 void TextHelper::ReleaseTextBuffer()
 {
+#if defined(PSP)
+    // No dynamic GdiFont may remain selected here. Release the DC/bitmap
+    // consumer first, then close the shared face and finally its SDL_ttf
+    // owner. Shutdown refuses to close a still-borrowed face.
+    g_PspTextWorkBuffer.ReleaseBuffer();
+    th08_psp_gdi_text_shutdown();
+#endif
     SAFE_RELEASE(g_TextBufferSurface);
 }
 
@@ -364,12 +435,40 @@ void TextHelper::RenderTextToTextureBold(i32 xPos, i32 yPos, i32 spriteWidth, i3
     font =
         CreateFontA(fontHeight * 2 - 2, 0, 0, 0, FW_SEMIBOLD, false, false, false, SHIFTJIS_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_ROMAN | FIXED_PITCH, TH_FONT_NAME);
+#if defined(PSP)
+    TextHelper &textHelper = g_PspTextWorkBuffer;
+    if (font == NULL || !textHelper.IsAllocated())
+    {
+        if (font != NULL)
+            DeleteObject(font);
+        return;
+    }
+#else
     TextHelper textHelper;
+#endif
+#if defined(PSP)
+    memset(&textSurfaceDesc, 0, sizeof(textSurfaceDesc));
+    textSurfaceDesc.Width = 1024;
+    textSurfaceDesc.Height = TEXT_BUFFER_HEIGHT;
+    textSurfaceDesc.Format = D3DFMT_A1R5G5B5;
+    const i32 rasterHeight = PspTextRasterHeight(fontHeight);
+    if (!textHelper.AllocateBufferWithFallback(
+            textSurfaceDesc.Width, textSurfaceDesc.Height, textSurfaceDesc.Format))
+    {
+        DeleteObject(font);
+        return;
+    }
+#else
     g_TextBufferSurface->GetDesc(&textSurfaceDesc);
     textHelper.AllocateBufferWithFallback(textSurfaceDesc.Width, textSurfaceDesc.Height, textSurfaceDesc.Format);
+#endif
     hdc = textHelper.GetHDC();
     h = SelectObject(hdc, font);
+#if defined(PSP)
+    textHelper.InvertAlpha(0, 0, spriteWidth * 2, rasterHeight, FALSE);
+#else
     textHelper.InvertAlpha(0, 0, spriteWidth * 2, fontHeight * 2 + 6, FALSE);
+#endif
     SetBkMode(hdc, TRANSPARENT);
 
     // Render outline.
@@ -394,8 +493,15 @@ void TextHelper::RenderTextToTextureBold(i32 xPos, i32 yPos, i32 spriteWidth, i3
     TextOutA(hdc, xPos * 2 + 2, 2, string, strlen(string));
 
     SelectObject(hdc, h);
+#if defined(PSP)
+    textHelper.InvertAlpha(0, 0, spriteWidth * 2, rasterHeight,
+                           outlineType == 0xffffffff);
+#else
     textHelper.InvertAlpha(0, 0, spriteWidth * 2, fontHeight * 2 + 6, outlineType == 0xffffffff);
+#endif
+#if !defined(PSP)
     textHelper.CopyTextToSurface(g_TextBufferSurface);
+#endif
     SelectObject(hdc, h);
     DeleteObject(font);
     destRect.left = 0;
@@ -405,13 +511,28 @@ void TextHelper::RenderTextToTextureBold(i32 xPos, i32 yPos, i32 spriteWidth, i3
     srcRect.left = 0;
     srcRect.top = 0;
     srcRect.right = spriteWidth * 2;
+#if defined(PSP)
+    srcRect.bottom = rasterHeight;
+#else
     srcRect.bottom = fontHeight * 2;
+#endif
     if (srcRect.right > 1024)
     {
         srcRect.right = 1024;
     }
     outTexture->GetSurfaceLevel(0, &destSurface);
+#if defined(PSP)
+    th08::psp::RenderPerfNoteTextBytes(
+        static_cast<std::uint32_t>(srcRect.right - srcRect.left) *
+        static_cast<std::uint32_t>(srcRect.bottom - srcRect.top) * sizeof(WORD));
+    th08_linux_surface_area_average_from_memory(
+        destSurface, &destRect, textHelper.GetBuffer(),
+        static_cast<UINT>(textHelper.GetWidth()),
+        static_cast<UINT>(textHelper.GetHeight()),
+        textHelper.GetImageWidthInBytes(), textHelper.GetFormat(), &srcRect, 0);
+#else
     D3DXLoadSurfaceFromSurface(destSurface, NULL, &destRect, g_TextBufferSurface, NULL, &srcRect, 4, 0);
+#endif
     SAFE_RELEASE(destSurface);
     return;
 }
@@ -432,12 +553,40 @@ void TextHelper::RenderTextToTexture(i32 xPos, i32 yPos, i32 spriteWidth, i32 sp
 
     font = CreateFontA(fontHeight * 2, 0, 0, 0, FW_NORMAL, false, false, false, SHIFTJIS_CHARSET, OUT_DEFAULT_PRECIS,
                        CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_ROMAN | FIXED_PITCH, TH_FONT_NAME);
+#if defined(PSP)
+    TextHelper &textHelper = g_PspTextWorkBuffer;
+    if (font == NULL || !textHelper.IsAllocated())
+    {
+        if (font != NULL)
+            DeleteObject(font);
+        return;
+    }
+#else
     TextHelper textHelper;
+#endif
+#if defined(PSP)
+    memset(&textSurfaceDesc, 0, sizeof(textSurfaceDesc));
+    textSurfaceDesc.Width = 1024;
+    textSurfaceDesc.Height = TEXT_BUFFER_HEIGHT;
+    textSurfaceDesc.Format = D3DFMT_A1R5G5B5;
+    const i32 rasterHeight = PspTextRasterHeight(fontHeight);
+    if (!textHelper.AllocateBufferWithFallback(
+            textSurfaceDesc.Width, textSurfaceDesc.Height, textSurfaceDesc.Format))
+    {
+        DeleteObject(font);
+        return;
+    }
+#else
     g_TextBufferSurface->GetDesc(&textSurfaceDesc);
     textHelper.AllocateBufferWithFallback(textSurfaceDesc.Width, textSurfaceDesc.Height, textSurfaceDesc.Format);
+#endif
     hdc = textHelper.GetHDC();
     h = SelectObject(hdc, font);
+#if defined(PSP)
+    textHelper.InvertAlpha(0, 0, textSurfaceDesc.Width, rasterHeight, FALSE);
+#else
     textHelper.InvertAlpha(0, 0, textSurfaceDesc.Width, fontHeight * 2 + 6, FALSE);
+#endif
     SetBkMode(hdc, TRANSPARENT);
 
     // Render outline.
@@ -462,8 +611,15 @@ void TextHelper::RenderTextToTexture(i32 xPos, i32 yPos, i32 spriteWidth, i32 sp
     TextOutA(hdc, xPos * 2 + 2, 2, string, strlen(string));
 
     SelectObject(hdc, h);
+#if defined(PSP)
+    textHelper.InvertAlpha(0, 0, textSurfaceDesc.Width, rasterHeight,
+                           outlineType == 0xffffffff);
+#else
     textHelper.InvertAlpha(0, 0, textSurfaceDesc.Width, fontHeight * 2 + 6, outlineType == 0xffffffff);
+#endif
+#if !defined(PSP)
     textHelper.CopyTextToSurface(g_TextBufferSurface);
+#endif
     SelectObject(hdc, h);
     DeleteObject(font);
     destRect.left = 0;
@@ -473,13 +629,28 @@ void TextHelper::RenderTextToTexture(i32 xPos, i32 yPos, i32 spriteWidth, i32 sp
     srcRect.left = 0;
     srcRect.top = 0;
     srcRect.right = spriteWidth * 2;
+#if defined(PSP)
+    srcRect.bottom = rasterHeight;
+#else
     srcRect.bottom = fontHeight * 2;
+#endif
     if (srcRect.right > 1024)
     {
         srcRect.right = 1024;
     }
     outTexture->GetSurfaceLevel(0, &destSurface);
+#if defined(PSP)
+    th08::psp::RenderPerfNoteTextBytes(
+        static_cast<std::uint32_t>(srcRect.right - srcRect.left) *
+        static_cast<std::uint32_t>(srcRect.bottom - srcRect.top) * sizeof(WORD));
+    th08_linux_surface_area_average_from_memory(
+        destSurface, &destRect, textHelper.GetBuffer(),
+        static_cast<UINT>(textHelper.GetWidth()),
+        static_cast<UINT>(textHelper.GetHeight()),
+        textHelper.GetImageWidthInBytes(), textHelper.GetFormat(), &srcRect, 0);
+#else
     D3DXLoadSurfaceFromSurface(destSurface, NULL, &destRect, g_TextBufferSurface, NULL, &srcRect, 4, 0);
+#endif
     SAFE_RELEASE(destSurface);
     return;
 }

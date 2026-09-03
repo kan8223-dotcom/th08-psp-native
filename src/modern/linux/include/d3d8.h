@@ -85,6 +85,9 @@ class IDirect3DDevice8
     virtual HRESULT SetStreamSource(UINT, IDirect3DVertexBuffer8 *, UINT) = 0;
     virtual HRESULT DrawPrimitive(D3DPRIMITIVETYPE, UINT, UINT) = 0;
     virtual HRESULT DrawPrimitiveUP(D3DPRIMITIVETYPE, UINT, const void *, UINT) = 0;
+    virtual HRESULT DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE, UINT, UINT, UINT,
+                                           const void *, D3DFORMAT,
+                                           const void *, UINT) = 0;
     virtual HRESULT GetDeviceCaps(D3DCAPS8 *) = 0;
     virtual HRESULT ResourceManagerDiscardBytes(DWORD) = 0;
 

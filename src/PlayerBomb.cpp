@@ -219,8 +219,19 @@ void __fastcall UpdateFantasyOrbBomb(Player *player)
             workItem->angle = AddNormalizeAngle(
                 workItem->angle, (i & 1) ? 0.052359879016876221f : -0.052359879016876221f);
             previousPosition = workItem->position;
+#ifdef TH08_MODERN_PORT
+            // The original EXE is intentionally unusual here: these two
+            // PlayerBomb functions call sin for X and cos for Y.  The
+            // reconstruction's matching relocation table swapped the call
+            // targets while leaving the portable source expressions reversed.
+            workItem->position.x = X87CompatibleSinMulAdd(
+                workItem->angle, workItem->motionStep, workItem->pathPoints[0].x);
+            workItem->position.y = X87CompatibleCosMulAdd(
+                workItem->angle, workItem->motionStep, workItem->pathPoints[0].y);
+#else
             workItem->position.x = cosf(workItem->angle) * workItem->motionStep + workItem->pathPoints[0].x;
             workItem->position.y = sinf(workItem->angle) * workItem->motionStep + workItem->pathPoints[0].y;
+#endif
             workItem->motionStep += 3.2f;
             workItem->motion = workItem->position - previousPosition;
         }
@@ -325,7 +336,11 @@ void __fastcall UpdateFantasyOrbBomb(Player *player)
 // FUNCTION: th08 0x40c7b0
 f32 VectorAngle(f32 y, f32 x)
 {
+#ifdef TH08_MODERN_PORT
+    return X87CompatibleAtan2(y, x);
+#else
     return (f32)atan2(y, x);
+#endif
 }
 
 // FUNCTION: th08 0x40c7d0
@@ -366,6 +381,18 @@ void __fastcall DrawFantasyOrbBomb(Player *player)
 DIFFABLE_STATIC_ARRAY_ASSIGN(u32, 7, g_PlayerDreamSealColors) = {
     0x8FFFFFFF, 0x8F0000FF, 0x8FFF00FF, 0x8FFF0000, 0x8FFFFF00, 0x8F00FF00, 0x8F00FFFF,
 };
+
+// This callback initializes primary slots 0..15, then selects only slot 16
+// once and slot 17 thereafter through secondaryWorkCursor.  Keep the complete
+// 128-slot reset in BeginBombSpell authoritative; the PSP candidate changes
+// only the upper bounds of the two scans below, never the work for a visited
+// slot.
+#if defined(PSP) && defined(TH08_PSP_FANTASY_SEAL_WORK_BOUNDS) && \
+    TH08_PSP_FANTASY_SEAL_WORK_BOUNDS
+#define TH08_FANTASY_SEAL_CALLBACK2_SCAN_LIMIT(items) 18U
+#else
+#define TH08_FANTASY_SEAL_CALLBACK2_SCAN_LIMIT(items) ARRAY_SIZE(items)
+#endif
 
 // FUNCTION: th08 0x40c910
 #pragma var_order(i, bomb, workItem, angle, previousPosition)
@@ -413,8 +440,15 @@ void __fastcall UpdateFantasySealBlinkDeathbomb(Player *player)
             workItem->angle = AddNormalizeAngle(
                 workItem->angle, (i & 1) ? 0.052359879016876221f : -0.052359879016876221f);
             previousPosition = workItem->position;
+#ifdef TH08_MODERN_PORT
+            workItem->position.x = X87CompatibleSinMulAdd(
+                workItem->angle, workItem->motionStep, workItem->pathPoints[0].x);
+            workItem->position.y = X87CompatibleCosMulAdd(
+                workItem->angle, workItem->motionStep, workItem->pathPoints[0].y);
+#else
             workItem->position.x = cosf(workItem->angle) * workItem->motionStep + workItem->pathPoints[0].x;
             workItem->position.y = sinf(workItem->angle) * workItem->motionStep + workItem->pathPoints[0].y;
+#endif
             if (bomb->timer < 40)
             {
                 if (i & 1)
@@ -486,7 +520,9 @@ void __fastcall UpdateFantasySealBlinkDeathbomb(Player *player)
     }
 
     workItem = &bomb->workItems[16];
-    for (i = 16; i < ARRAY_SIZE(bomb->workItems); i++, workItem++)
+    for (i = 16;
+         i < TH08_FANTASY_SEAL_CALLBACK2_SCAN_LIMIT(bomb->workItems);
+         i++, workItem++)
     {
         if (!workItem->state)
             continue;
@@ -510,7 +546,10 @@ void __fastcall DrawFantasySealBlinkDeathbomb(Player *player)
     SetBombBackgroundTint(player, 0x802020d0);
     i = 0;
     workItem = player->bombState.workItems;
-    for (; i < 128; i++, workItem++)
+    for (;
+         i < TH08_FANTASY_SEAL_CALLBACK2_SCAN_LIMIT(
+                 player->bombState.workItems);
+         i++, workItem++)
     {
         if (workItem->state == PLAYER_BOMB_WORK_ITEM_INACTIVE)
             continue;
@@ -522,6 +561,8 @@ void __fastcall DrawFantasySealBlinkDeathbomb(Player *player)
         g_AnmManager->DrawNoRotation(vm);
     }
 }
+
+#undef TH08_FANTASY_SEAL_CALLBACK2_SCAN_LIMIT
 
 // FUNCTION: th08 0x40d100
 #pragma var_order(bomb, effect, i)
@@ -1436,8 +1477,13 @@ void __fastcall UpdateKillingDollBomb(Player *player)
                 workItem->motionStep = g_Rng.GetRandomF32InRange(0.1f) + 0.03f;
                 workItem->auxiliaryMotion.x = g_Rng.GetRandomU16InRange(1)
                     ? 0.15707963705062866f : -0.15707963705062866f;
+#ifdef TH08_MODERN_PORT
+                workItem->motion.x = X87CompatibleCosMul(workItem->angle, 24.0f);
+                workItem->motion.y = X87CompatibleSinMul(workItem->angle, 24.0f);
+#else
                 workItem->motion.x = cosf(workItem->angle) * 24.0f;
                 workItem->motion.y = sinf(workItem->angle) * 24.0f;
+#endif
                 workItem->position = player->position + workItem->motion;
                 workItem->timer = 0;
                 workItem->motion.z = 0.0f;
@@ -1468,8 +1514,13 @@ void __fastcall UpdateKillingDollBomb(Player *player)
                 workItem->speed = 14.0f;
             }
             workItem->speed += workItem->motionStep;
+#ifdef TH08_MODERN_PORT
+            workItem->motion.x = X87CompatibleCosMul(workItem->angle, workItem->speed);
+            workItem->motion.y = X87CompatibleSinMul(workItem->angle, workItem->speed);
+#else
             workItem->motion.x = cosf(workItem->angle) * workItem->speed;
             workItem->motion.y = sinf(workItem->angle) * workItem->speed;
+#endif
         }
         else
         {
@@ -1560,8 +1611,13 @@ void __fastcall UpdateNightMistPhantomKillerDeathbomb(Player *player)
             workItem->motionStep = g_Rng.GetRandomF32InRange(0.1f) + 0.03f;
             workItem->auxiliaryMotion.x = g_Rng.GetRandomU16InRange(1)
                 ? 0.15707963705062866f : -0.15707963705062866f;
+#ifdef TH08_MODERN_PORT
+            workItem->motion.x = X87CompatibleCosMul(workItem->angle, 24.0f);
+            workItem->motion.y = X87CompatibleSinMul(workItem->angle, 24.0f);
+#else
             workItem->motion.x = cosf(workItem->angle) * 24.0f;
             workItem->motion.y = sinf(workItem->angle) * 24.0f;
+#endif
             workItem->position = player->position + workItem->motion;
             workItem->timer = 0;
             workItem->motion.z = 0.0f;
@@ -1593,8 +1649,13 @@ void __fastcall UpdateNightMistPhantomKillerDeathbomb(Player *player)
                     46, reinterpret_cast<D3DXVECTOR3 *>(&workItem->position), 1, -1);
             }
             workItem->speed += workItem->motionStep;
+#ifdef TH08_MODERN_PORT
+            workItem->motion.x = X87CompatibleCosMul(workItem->angle, workItem->speed);
+            workItem->motion.y = X87CompatibleSinMul(workItem->angle, workItem->speed);
+#else
             workItem->motion.x = cosf(workItem->angle) * workItem->speed;
             workItem->motion.y = sinf(workItem->angle) * workItem->speed;
+#endif
         }
         else
         {

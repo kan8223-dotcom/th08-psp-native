@@ -7,6 +7,10 @@
 #include "GameManager.hpp"
 #include "ReplayManager.hpp"
 
+#if defined(PSP)
+#include "enemy_active_bitmap_audit.hpp"
+#endif
+
 namespace th08
 {
 
@@ -37,11 +41,16 @@ Enemy *EnemyManager::SpawnEnemy1(i32 eclSubroutineId, const D3DXVECTOR3 *positio
         if (life >= 0)
             enemy->life = life;
         enemy->position = *reinterpret_cast<const Float3 *>(position);
+        // RunEcl may recursively spawn another enemy.  Reserve this slot in
+        // the shadow bitmap before entering any ECL callback, exactly as the
+        // TH07 PSP active-enemy sidecar did.  M0 never consumes this bit.
+        TH08_PSP_ENEMY_BITMAP_TRACK(this, i);
         g_EclManager.CallEclSub(
             &enemy->mainEclContextStorage, (i16)eclSubroutineId);
         if (g_EclManager.RunEcl(enemy) == ZUN_ERROR)
         {
             reinterpret_cast<EnemyFlag1Bits *>(&enemy->flags1)->active = 0;
+            TH08_PSP_ENEMY_BITMAP_UNTRACK(this, i);
             i = 480;
         }
         else
@@ -88,6 +97,7 @@ Enemy *EnemyManager::SpawnEnemy2(i32 eclSubroutineId, const D3DXVECTOR3 *positio
         if (life >= 0)
             enemy->life = life;
         enemy->position = *reinterpret_cast<const Float3 *>(position);
+        TH08_PSP_ENEMY_BITMAP_TRACK(this, i);
         g_EclManager.CallEclSub(
             &enemy->mainEclContextStorage, (i16)eclSubroutineId);
         *reinterpret_cast<EnemyContextCopy *>(
@@ -96,6 +106,7 @@ Enemy *EnemyManager::SpawnEnemy2(i32 eclSubroutineId, const D3DXVECTOR3 *positio
         if (g_EclManager.RunEcl(enemy) == ZUN_ERROR)
         {
             reinterpret_cast<EnemyFlag1Bits *>(&enemy->flags1)->active = 0;
+            TH08_PSP_ENEMY_BITMAP_UNTRACK(this, i);
             i = 480;
         }
         else

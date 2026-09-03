@@ -1,0 +1,158 @@
+diff --git a/glDrawArrays.c b/glDrawArrays.c
+index 577c012..11a5d92 100644
+--- a/glDrawArrays.c
++++ b/glDrawArrays.c
+@@ -1,4 +1,75 @@
++#include <stdint.h>
++#include <string.h>
++
+ #include "pspgl_internal.h"
++#include "pspgl_buffers.h"
++#include "pspgl_dlist.h"
++
++const char __pspgl_th08_native_submit_marker[] =
++	"pspGL TH08 native submit v3 indexed-no-copy sprite-copy upstream "
++	"de4260adf56d06516ec46018d404ca77e0b61748 base ge4-v1";
++
++
++int __pspgl_th08_draw_native_sprite_pairs_copy(
++	const void *vertices, unsigned vertex_bytes);
++
++
++/* TH08-private packed GE_SPRITES path for one immediate popup batch.
++ *
++ * Unlike the indexed path, the caller's staging range may be reused as soon
++ * as this function returns.  Copy it into a PSPGL stream buffer, pin that
++ * buffer to PSPGL's current display list, and retain normal PSPGL ownership
++ * of draw/texture/state lifetimes.  This removes the public client-array state
++ * setup and generic vertex-format inspection without starting a raw GU list.
++ */
++int __pspgl_th08_draw_native_sprite_pairs_copy(
++	const void *vertices, unsigned vertex_bytes)
++{
++	const unsigned vertex_stride = 24;
++	const unsigned vertex_format =
++		GE_TEXTURE_32BITF | GE_COLOR_8888 | GE_VERTEX_32BITF |
++		GE_TRANSFORM_3D;
++	uintptr_t begin = (uintptr_t)vertices;
++	uintptr_t end;
++	unsigned vertex_count;
++	struct pspgl_buffer *vbuf;
++	void *copy;
++
++	/* Reject everything before allocating, copying, or emitting GE state.
++	 * CMD_PRIM carries a 16-bit count and GE_SPRITES consumes vertex pairs. */
++	if (pspgl_curctx == NULL || pspgl_curctx->draw == NULL ||
++	    pspgl_curctx->draw->draw == NULL ||
++	    *pspgl_curctx->draw->draw == NULL || __pspgl_actuallist != NULL)
++		return 0;
++	if (vertices == NULL || vertex_bytes == 0 ||
++	    (begin & (sizeof(float) - 1)) != 0)
++		return 0;
++	end = begin + (uintptr_t)vertex_bytes;
++	if (end < begin || (vertex_bytes % vertex_stride) != 0)
++		return 0;
++
++	vertex_count = vertex_bytes / vertex_stride;
++	if (vertex_count == 0 || vertex_count > 0xffffu ||
++	    (vertex_count % 2u) != 0)
++		return 0;
++
++	vbuf = __pspgl_buffer_new(vertex_bytes, GL_STREAM_DRAW_ARB);
++	if (vbuf == NULL)
++		return 0;
++	copy = __pspgl_buffer_map(vbuf, GL_WRITE_ONLY_ARB);
++	if (copy == NULL) {
++		__pspgl_buffer_free(vbuf);
++		return 0;
++	}
++	memcpy(copy, vertices, vertex_bytes);
++	__pspgl_buffer_unmap(vbuf, GL_WRITE_ONLY_ARB);
++
++	__pspgl_context_render_prim(pspgl_curctx, GE_SPRITES, vertex_count,
++				    vertex_format, vbuf->base, NULL);
++	__pspgl_dlist_pin_buffer(vbuf, BF_PINNED_RD);
++	__pspgl_buffer_free(vbuf);
++	return 1;
++}
+ 
+ 
+ void glDrawArrays (GLenum mode, GLint first, GLsizei count)
+diff --git a/glDrawElements.c b/glDrawElements.c
+index c173776..a0695fe 100644
+--- a/glDrawElements.c
++++ b/glDrawElements.c
+@@ -1,5 +1,73 @@
++#include <stdint.h>
++#include <psputils.h>
++
+ #include "pspgl_internal.h"
+ 
++int __pspgl_th08_draw_native_indexed_triangles(
++	const void *vertices, unsigned vertex_bytes,
++	const unsigned short *indices, unsigned index_bytes,
++	unsigned index_count);
++
++static int th08_native_range_valid(const void *address, unsigned bytes,
++				   unsigned alignment)
++{
++	uintptr_t begin = (uintptr_t)address;
++	uintptr_t end;
++
++	if (address == NULL || bytes == 0 || (begin & (alignment - 1)) != 0)
++		return 0;
++	end = begin + (uintptr_t)bytes;
++	return end >= begin;
++}
++
++/* TH08-private no-copy submit path for an application-owned packed stream.
++ *
++ * The caller has already validated that every immutable u16 index is below
++ * vertex_bytes / 24.  Repeating that min/max scan here would recreate the
++ * generic glDrawElements toll this entry point exists to remove.  Both ranges
++ * must remain immutable until the swap/present fence has completed.
++ */
++int __pspgl_th08_draw_native_indexed_triangles(
++	const void *vertices, unsigned vertex_bytes,
++	const unsigned short *indices, unsigned index_bytes,
++	unsigned index_count)
++{
++	const unsigned vertex_stride = 24;
++	const unsigned vertex_format =
++		GE_TEXTURE_32BITF | GE_COLOR_8888 | GE_VERTEX_32BITF |
++		GE_TRANSFORM_3D | GE_VINDEX_16BIT;
++	unsigned vertex_count;
++
++	/* Reject everything before touching the caller ranges or emitting GE
++	 * state.  CMD_PRIM carries a 16-bit count. */
++	if (pspgl_curctx == NULL || pspgl_curctx->draw == NULL ||
++	    pspgl_curctx->draw->draw == NULL ||
++	    *pspgl_curctx->draw->draw == NULL || __pspgl_actuallist != NULL)
++		return 0;
++	if (!th08_native_range_valid(vertices, vertex_bytes, sizeof(float)) ||
++	    !th08_native_range_valid(indices, index_bytes,
++				     sizeof(*indices)))
++		return 0;
++	if ((vertex_bytes % vertex_stride) != 0 ||
++	    index_count == 0 || index_count > 0xffffu ||
++	    (index_count % 3u) != 0 ||
++	    index_bytes != index_count * (unsigned)sizeof(*indices))
++		return 0;
++
++	vertex_count = vertex_bytes / vertex_stride;
++	if (vertex_count == 0 || vertex_count > 0x10000u)
++		return 0;
++
++	/* These are caller-owned Main RAM ranges, not PSPGL buffer objects.  Their
++	 * append-only frame lifetime is what keeps them valid after this returns. */
++	sceKernelDcacheWritebackRange(vertices, vertex_bytes);
++	sceKernelDcacheWritebackRange(indices, index_bytes);
++
++	__pspgl_context_render_prim(pspgl_curctx, GE_TRIANGLES, index_count,
++				    vertex_format, vertices, indices);
++	return 1;
++}
++
+ 
+ void glDrawElements (GLenum mode, GLsizei count, GLenum type, const GLvoid *indices)
+ {

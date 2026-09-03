@@ -1,0 +1,140 @@
+diff --git a/pspgl_buffers.c b/pspgl_buffers.c
+index 97807e8..40accce 100644
+--- a/pspgl_buffers.c
++++ b/pspgl_buffers.c
+@@ -177,12 +177,71 @@ static void evict_vidmem(size_t need)
+ 	}
+ }
+ 
++/* TH08 stream arena: application-installed, frame-parity storage for the
++ * GL_STREAM_DRAW_ARB copies made by the client-array and native copy paths.
++ * Without it every such draw takes a memalign() block that lives until its
++ * display list completes; with the GE allowed to run one frame behind the CPU
++ * (triple buffering) that doubled the live set and starved the heap.  The
++ * application recycles a half only after the frame that used it has been
++ * fenced, exactly like its Bullet direct-GE arena.  Overflow falls back to
++ * memalign(). */
++static unsigned char *th08_stream_half[2];
++static size_t th08_stream_half_bytes;
++static size_t th08_stream_cursor;
++static unsigned th08_stream_parity;
++static unsigned long th08_stream_alloc_count;
++static unsigned long th08_stream_overflow_count;
++static size_t th08_stream_peak_bytes;
++
++const char __pspgl_th08_stream_arena_marker[] =
++	"pspGL TH08 stream arena v1 frame-parity GL_STREAM_DRAW upstream de4260adf56d06516ec46018d404ca77e0b61748 base native-submit-v3";
++
++int __pspgl_th08_stream_arena_install(void *base, size_t half_bytes)
++{
++	if (base == NULL || half_bytes < CACHELINE_SIZE ||
++	    (((uintptr_t)base) & (CACHELINE_SIZE - 1)) != 0) {
++		th08_stream_half[0] = NULL;
++		th08_stream_half[1] = NULL;
++		th08_stream_half_bytes = 0;
++		return 0;
++	}
++	half_bytes &= ~(size_t)(CACHELINE_SIZE - 1);
++	th08_stream_half[0] = (unsigned char *)base;
++	th08_stream_half[1] = (unsigned char *)base + half_bytes;
++	th08_stream_half_bytes = half_bytes;
++	th08_stream_cursor = 0;
++	th08_stream_parity = 0;
++	th08_stream_alloc_count = 0;
++	th08_stream_overflow_count = 0;
++	th08_stream_peak_bytes = 0;
++	return 1;
++}
++
++void __pspgl_th08_stream_arena_begin_frame(unsigned parity)
++{
++	th08_stream_parity = parity & 1u;
++	th08_stream_cursor = 0;
++}
++
++void __pspgl_th08_stream_arena_stats(unsigned long *allocs,
++				     unsigned long *overflows,
++				     unsigned long *peak_bytes)
++{
++	if (allocs)
++		*allocs = th08_stream_alloc_count;
++	if (overflows)
++		*overflows = th08_stream_overflow_count;
++	if (peak_bytes)
++		*peak_bytes = (unsigned long)th08_stream_peak_bytes;
++}
++
+ static GLboolean __pspgl_buffer_init(struct pspgl_buffer *buf,
+ 				     GLsizeiptr size, GLenum usage)
+ {
+ 	void *p = NULL;
+ 	int try_hard = 0;
+ 	int require_upper = 0;
++	int stream_arena = 0;
+ 
+ 	size = ROUNDUP(size, CACHELINE_SIZE);
+ 
+@@ -233,10 +292,24 @@ static GLboolean __pspgl_buffer_init(struct pspgl_buffer *buf,
+ 
+ 	case GL_DYNAMIC_DRAW_ARB:	/* prefer in system memory */
+ 	case GL_STREAM_READ_ARB:
+-	case GL_STREAM_DRAW_ARB:
+ 		/* fallthrough to allocation */
+ 		break;
+ 
++	case GL_STREAM_DRAW_ARB:
++		if (th08_stream_half[0] != NULL) {
++			if (th08_stream_cursor + size <= th08_stream_half_bytes) {
++				p = th08_stream_half[th08_stream_parity] +
++					th08_stream_cursor;
++				th08_stream_cursor += size;
++				if (th08_stream_cursor > th08_stream_peak_bytes)
++					th08_stream_peak_bytes = th08_stream_cursor;
++				th08_stream_alloc_count++;
++				stream_arena = 1;
++			} else
++				th08_stream_overflow_count++;
++		}
++		break;
++
+ 	default:
+ 		GLERROR(GL_INVALID_ENUM);
+ 		return GL_FALSE;
+@@ -260,7 +333,7 @@ static GLboolean __pspgl_buffer_init(struct pspgl_buffer *buf,
+ 
+ 	buf->refcount = 1;
+ 	buf->mapped = 0;
+-	buf->flags = require_upper ? BF_PINNED_FIXED : 0;
++	buf->flags = require_upper ? BF_PINNED_FIXED : (stream_arena ? BF_UNMANAGED : 0);
+ 	buf->generation = 0;
+ 
+ 	buf->pin_prevp = NULL;
+@@ -308,7 +381,7 @@ void __pspgl_buffer_free(struct pspgl_buffer *data)
+ 	if (data->base) {
+ 		if (data->domain != PSPGL_BUFFER_MAIN)
+ 			__pspgl_vidmem_free(data);
+-		else
++		else if (!(data->flags & BF_UNMANAGED))
+ 			free(data->base);
+ 	}
+ 
+diff --git a/pspgl_internal.h b/pspgl_internal.h
+index 9b7f8a5..d3c6765 100644
+--- a/pspgl_internal.h
++++ b/pspgl_internal.h
+@@ -326,6 +326,15 @@ extern void th08_psp_ge4_note_upper_map_denied(
+ extern void th08_psp_ge4_fail_closed(const char *reason)
+ 	__attribute__((weak, noreturn));
+ 
++/* TH08 stream arena (pspgl_buffers.c): frame-parity storage for
++ * GL_STREAM_DRAW_ARB copies, installed and recycled by the application. */
++extern const char __pspgl_th08_stream_arena_marker[];
++extern int __pspgl_th08_stream_arena_install(void *base, size_t half_bytes);
++extern void __pspgl_th08_stream_arena_begin_frame(unsigned parity);
++extern void __pspgl_th08_stream_arena_stats(unsigned long *allocs,
++					    unsigned long *overflows,
++					    unsigned long *peak_bytes);
++
+ static inline int __pspgl_th08_ge4_active(void)
+ {
+ 	return th08_psp_ge4_active != NULL && th08_psp_ge4_active();

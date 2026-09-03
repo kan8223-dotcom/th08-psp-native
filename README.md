@@ -1,318 +1,70 @@
-# 東方永夜抄 ～ Imperishable Night
+# th08-psp-native — 東方永夜抄 ～ Imperishable Night, native PSP port
 
-<p align="center">
-  <img
-    src="resources/title-screen.png"
-    width="640"
-    alt="Original Japanese TH08 1.00d title screen">
-</p>
+**世界初の、東方永夜抄（TH08）PSPネイティブ移植です。** PSP-2000 / PSP-3000 / PSP Go（メインメモリ64MB機）で、
+原作のゲームロジックをそのままPSP上で走らせます。エミュレーションではなく、PC版のデコンパイル（[GensokyoClub/th08](https://github.com/GensokyoClub/th08) と、そこから枝分かれした [N0zoM1z0/th08](https://github.com/N0zoM1z0/th08)）を
+PSPのGE（グラフィックス）／SC（メインCPU）向けに移植したものです。
 
-<p align="center">
-  <img src="resources/progress.svg" alt="TH08 exact-source and playable-platform progress">
-</p>
+**The world's first native PSP port of Touhou 8 (Imperishable Night).** Runs the original game logic natively on
+PSP-2000 / PSP-3000 / PSP Go (64 MB models). Not an emulator: it is a port of the PC decompilation to the PSP's GE and main CPU.
 
-> [!IMPORTANT]
-> 🌙 The authored reconstruction is complete, and native Linux play now covers
-> both i386 and x86_64. Download the
-> [latest native Linux release](https://github.com/N0zoM1z0/th08/releases/latest);
-> active ELF64 source lives on
-> [`port/portable-64bit`](https://github.com/N0zoM1z0/th08/tree/port/portable-64bit).
-> Windows and macOS ports are still in progress.
+> 2026-09-04 時点の状態 / Status as of 2026-09-04
+> - 実機（PSP-3000, 333 MHz）で **1面がプレイ可能**。内蔵デモプレイ4本は最後まで完走します。
+> - 60 Hz simulation × 30描画（SELECTで60/30/20描画を切替）。1面道中で約47〜58 sim fps、5面デモで約54 sim fps。
+> - **既知の問題**: ボス撃破後、2面のロードで停止する／会話中に背景が黒くなる（実機のみ）／デモの吸血鬼組（咲夜・レミリア）のリプレイが非同期。
+> - PSP-1000（32 MB）は非対応。
+> - Stage 1 is playable on real hardware (PSP-3000 @ 333 MHz); all four built-in demo plays run to completion.
+> - Known issues: the game stops when loading Stage 2 after the Stage 1 boss; the background goes black during dialogue (hardware only); the Sakuya/Remilia demo replay desyncs. PSP-1000 (32 MB) is not supported.
 
-## Repository status
+## 必要なもの / Requirements
 
-This repository reconstructs the source code of the original Japanese
-`東方永夜抄 ～ Imperishable Night` version 1.00d executable. The authored-source
-recovery milestone is complete: all 1,107 authored functions are present in
-source. Strict comparison currently accepts 1,106 of those functions, covering
-459,396 of 459,757 authored bytes.
+- CFW導入済みのPSP-2000 / 3000 / Go（ARK-4 / ARK-5 で検証。**VSHのクロック強制設定（`vsh, cpuclock`）は外してください**）
+- **原作『東方永夜抄』の `th08.dat` と `thbgm.dat`**。このリポジトリにもリリースにも原作データは一切含まれません。お手持ちの正規版から取り出してください。
+- フォント: リリース同梱の `NotoSansJP-Regular.ttf`（SIL OFL）。`msgothic-subset.ttf` が同じフォルダにあればそちらを優先しますが、MSゴシックは配布できません。
 
-| Area | Status | Current position |
-| --- | --- | --- |
-| Authored source | **Complete** | 1,107 / 1,107 functions are present in source |
-| Strict authored comparison | **99.92% by bytes** | 1,106 / 1,107 functions are accepted as exact |
-| Whole executable | **In progress** | PE layout, linked runtime/library code, and one authored near match remain |
-| Web | **Playable** | Public WebAssembly/WebGL 2 build |
-| Linux | **Playable** | Native i386 and x86_64 ELFs; AArch64 build available for hardware validation |
-| Windows | **In progress** | Native startup and redistributable packaging are incomplete |
-| macOS | **In progress** | Native backend and packaging have not been implemented |
+## インストール / Install
 
-The exact-reconstruction lane and the playable-port lanes are independent.
-Running on a modern platform is not an exactness claim, and source presence is
-not counted as a byte-exact result. The progress bar above visualizes accepted
-authored bytes only; its platform cards report delivery status separately.
+`ms0:/PSP/GAME/TH08PSP/` に以下を置きます:
 
-Current reconstruction work focuses on the remaining authored near match,
-whole-image layout, and target-linked compiler/runtime and D3DX code.
-Live authored and library figures come from the repository ledgers rather than
-this README.
-
-### Contributing
-
-Contributions are welcome. Useful areas include:
-
-- evidence-backed exact reconstruction and whole-image layout work;
-- reliable native Windows startup and replacement of the non-redistributable
-  D3DX debug dependency;
-- a native macOS window, input, audio, renderer, and packaging backend;
-- Linux renderer fixes, MIDI support, and testing on additional hardware;
-- browser correctness, performance, and compatibility work in
-  [N0zoM1z0/th08-web](https://github.com/N0zoM1z0/th08-web).
-
-Before changing reconstruction state, read [AGENTS.md](AGENTS.md),
-[the reverse-engineering workflow](docs/RE_WORKFLOW.md), and
-[the current handoff](docs/RE_HANDOFF.md). Exact-match contributions must be
-supported by reproducible comparison against the specified target. Never
-commit the original executable, DAT archives, extracted retail assets, private
-analysis databases, or credentials.
-
-## Platform guides
-
-Playable ports compile the reconstructed authored game code for modern hosts.
-They do not bundle the original executable or game archives; players must
-provide data from a legally obtained copy of TH08.
-
-### Web
-
-**Status: Playable**
-
-<p align="center">
-  <a href="https://th08-web.pages.dev/">
-    <img
-      src="https://raw.githubusercontent.com/N0zoM1z0/th08-web/main/resources/th08-web-social-preview.jpg"
-      width="800"
-      alt="TH08 Web source-built browser port and Imperishable Night title screen">
-  </a>
-</p>
-
-[Play in the browser](https://th08-web.pages.dev/) ·
-[source and documentation](https://github.com/N0zoM1z0/th08-web) ·
-[latest release](https://github.com/N0zoM1z0/th08-web/releases/latest) ·
-[engineering the Web port](https://github.com/N0zoM1z0/th08-web/blob/main/docs/WEB_PORTING.md)
-
-TH08 Web compiles the reconstructed C++ game code with Emscripten and runs it
-as WebAssembly on a browser worker. WebGL 2, Web Audio, browser-local files,
-and IndexedDB-backed saves form the platform boundary. It is not a TypeScript
-reimplementation and does not emulate the original executable.
-
-Select `th08.dat` and `thbgm.dat` from a legal TH08 installation in the
-launcher. `th08.dat` remains in volatile session memory; `thbgm.dat` is
-range-read from its browser `File` object. Neither file is uploaded, bundled,
-cached by the site, or placed in persistent browser storage. Chrome is
-recommended for the best observed frame pacing; Firefox is supported but is
-usually slower.
-
-### Linux
-
-**Status: Playable**
-
-- [Download the latest native Linux release](https://github.com/N0zoM1z0/th08/releases/latest)
-- [Download, installation, and player guide](docs/PLAY_LINUX.md)
-- [Native Linux porting architecture and validation](docs/LINUX_PORTING.md)
-- [Native 64-bit build and validation](docs/PORTABLE_64BIT.md)
-- [Replay-driven headless render audit](docs/RENDER_AUDIT.md)
-- [Portable Linux build workflow](.github/workflows/portable-linux.yml)
-
-On Debian or Ubuntu, build and run against the original game-data directory:
-
-```bash
-scripts/setup-modern-linux.sh "/path/to/the/original/TH08 directory"
+```
+EBOOT.PBP               (release asset)
+ge4wrap_texv1.prx       (release asset; GE 4 MiB eDRAM bridge)
+NotoSansJP-Regular.ttf  (release asset, OFL)
+th08.dat                (your own copy)
+thbgm.dat               (your own copy)
 ```
 
-After first-time setup, use the incremental launcher:
+起動後はタイトルで放置するとデモが走ります。SELECTで描画レート（60/30/20）を切り替えられます。
+`TH08PSP_BOOT.LOG` が同じフォルダに書かれます（不具合報告の際に添付してください）。
 
-```bash
-scripts/play-modern-linux.sh "/path/to/the/original/TH08 directory"
+## ビルド / Build
+
+PSPSDK（psp-gcc 15.2 で検証）と SDL2 / SDL2_image / SDL2_ttf の PSP ビルドが必要です。
+
+```
+make -f Makefile.psp clean
+make -f Makefile.psp -j4 TH08_PSP_BUILD_ID=<id> <feature vector>
 ```
 
-Release assets and the CI workflow provide i386, x86_64, and AArch64 portable
-packages. The 64-bit packages are built from
-[`port/portable-64bit`](https://github.com/N0zoM1z0/th08/tree/port/portable-64bit).
-Extract the package for your architecture and pass the original data directory:
+リリース版の feature vector は各リリースノートに記載しています（`TH08_REPLAY_SYNC_AUDIT=0` を必ず指定）。
+すべての最適化・観測機能は `Makefile.psp` の `TH08_PSP_*` スイッチ（既定OFF）で個別に有効化され、
+`tools/test_psp_*.py` のソース契約テストで検証されます。PSPGLは `deps/pspgl-ge4/` に凍結したフォーク（BSD-3）を使います。
 
-```bash
-./run-th08.sh "/path/to/the/original/TH08 directory"
-```
+## 技術メモ / Technical notes
 
-The native i386 ELF has been exercised under WSLg and in a Kali Linux x86-64
-virtual machine. It requires only `th08.dat` and `thbgm.dat`; it does not open
-or execute the original `th08.exe`. Settings, scores, replays, and backups stay
-in the selected data directory.
+- SC-only 構成です。Media Engine（ME）は使用していません（`FEATURE ME=DISABLED` をブートログで確認できます）。
+- GE 側 4 MiB eDRAM（PSP-2000 以降）を `ge4wrap_texv1.prx` で解錠し、上位 2 MiB をテクスチャ昇格に使います。
+- 弾・アイテムの頂点生成は GE へ直接（no-copy）投入、Item/三角関数は bit-exact な double-float 高速経路、
+  描画は SWAP_NOWAIT（VBlank 待ち除去＋表示同一性ガード）など。決定論（リプレイ同期）を壊す最適化は採用していません。
+- 計測・判定の記録は `TH08_PSP_ISSUE_LEDGER.md` / `TH08_PSP_PORT_PLAN.md`（作業リポジトリ側）にあります。
 
-The native-layout product also builds as x86_64 and AArch64 ELF64 PIE. Build
-either architecture with `scripts/build-portable-linux.sh`. The x86_64 build
-has completed a Sakuya/Remilia Lunatic route through Stage 6A, ending, results,
-and return to title, plus product-ready Practice runs through the Stage 4A and
-Stage 6B routes. Original and i386-generated `score.dat` files retain their
-unlocks across the native-layout loader. AArch64 is cross-build/loader verified
-and still needs a gameplay run on real hardware.
+## クレジット / Credits
 
-<p align="center">
-  <img
-    src="resources/portable64-kaguya-lunatic.png"
-    width="800"
-    alt="Native x86_64 TH08 running Kaguya's Lunatic Princess spell under WSLg">
-</p>
-
-> Maintainer bias, openly declared: Kaguya is my favorite, and
-> **竹取飛翔 ～ Lunatic Princess** is my favorite track. XD
-
-<p align="center">
-  <img
-    src="resources/kali-linux-port.gif"
-    width="800"
-    alt="TH08 native Linux reconstruction starting and running on Kali Linux">
-</p>
-
-The portable window uses the project-owned
-[`resources/modern-icon.png`](resources/modern-icon.png), not an icon extracted
-from the original executable. On software-rendered systems, a fresh
-configuration's fullscreen FPS/vsync calibration can be slow; reusing an
-existing `th08.cfg` is optional.
-
-#### Earlier Linux renderer regression
-
-An earlier i386/bring-up build could tile a dynamic text texture across the
-outer frame and HUD during the Stage 4-to-5 transition, most visibly as
-repeated `Yakumo Yukari` text. The same period also exposed missing enemy/boss
-sprites and incomplete effects. These regressions were not reproduced in the
-final x86_64 full-route and Practice validation passes after the native-layout
-and renderer fixes. The screenshot remains here as a historical regression
-sample; please report it if it returns on another driver or desktop.
-
-<p align="center">
-  <img
-    src="resources/linux-stage5-texture-tiling.png"
-    width="640"
-    alt="Historical Linux Stage 5 dynamic text texture tiling regression">
-</p>
-
-### Windows
-
-**Status: In progress**
-
-See the [native Windows guide](docs/PLAY_WINDOWS.md) for the current build and
-release requirements. The source can produce a 32-bit MinGW bring-up
-executable, but native startup is not yet reliable and the build still depends
-on a non-redistributable DirectX SDK debug DLL. There is no supported Windows
-release asset yet.
-
-The intended product will run natively, accept an arbitrary legal TH08 data
-directory, and ship without Wine or non-redistributable SDK components.
-
-### macOS
-
-**Status: In progress**
-
-See the [native macOS guide](docs/PLAY_MACOS.md) for the planned platform
-boundary. No native executable or package exists yet. The port needs macOS
-window, input, audio, rendering, and packaging implementations followed by
-validation on real hardware.
-
-## Exact reconstruction
-
-The exact target is one binary: the original Japanese TH08 version 1.00d. A
-localized, patched, trial, or earlier executable is a different target.
-
-This repository is a history-preserving continuation of
-[GensokyoClub/th08](https://github.com/GensokyoClub/th08). Its complete Git
-history was imported rather than squashed, preserving the original authorship
-and contribution record.
-
-### Target executable
-
-Supply your own original executable as `resources/th08.exe`:
-
-| Property | Required value |
-| --- | --- |
-| Version | Original Japanese 1.00d |
-| Size | `840,704` bytes |
-| SHA-256 | `330fbdbf58a710829d65277b4f312cfbb38d5448b3df523e79350b879213d924` |
-| PE image base | `0x00400000` |
-| Entry point | `0x004A619E` |
-
-The executable and game data are copyrighted assets and are not included.
-Verify the private target before analysis or comparison:
-
-```bash
-python3 scripts/verify-target.py
-```
-
-### Build and compare
-
-Initialize the third-party submodules, then create the Visual Studio .NET
-2002/DirectX 8 environment. On Linux or macOS:
-
-```bash
-git submodule update --init --recursive
-./scripts/create_th08_prefix
-python3 ./scripts/build.py
-```
-
-The prefix helper uses Wine by default. Set `WINE` before invoking it when a
-different compatible runner is required. On Windows, use the setup script
-directly:
-
-```text
-python scripts/create_devenv.py scripts/dls scripts/prefix
-python scripts/build.py
-```
-
-See [Build and exact matching](docs/BUILD_MATCHING.md) for dependencies,
-build modes, reccmp, objdiff, and acceptance rules.
-
-### Analysis and live progress
-
-IDA MCP follows whichever database is active in the GUI and has no reliable
-program selector. Use it for TH08 only after the active database passes
-[the documented attestation](docs/IDA_MCP.md). Otherwise use target-safe
-headless tools and the repository's target-pinned analysis scripts.
-
-Read current figures directly from the ledgers:
-
-```bash
-python3 scripts/analysis/report-reconstruction-status.py --summary
-```
-
-Source mappings, generated progress artwork, a successful build, or inclusion
-in `config/implemented.csv` do not establish exactness. Only an accepted,
-reproducible comparison against the verified target supports an exact-match
-claim. Generated source-presence and strict-match figures are recorded in
-[docs/PROGRESS.md](docs/PROGRESS.md).
-
-## Project map
-
-- [TH08 Web browser port and engineering documentation](https://github.com/N0zoM1z0/th08-web)
-- [Linux download, installation, and play guide](docs/PLAY_LINUX.md)
-- [Native Windows user guide and status](docs/PLAY_WINDOWS.md)
-- [Native macOS user guide and status](docs/PLAY_MACOS.md)
-- [Architecture and binary inventory](docs/ARCHITECTURE.md)
-- [Reverse-engineering workflow](docs/RE_WORKFLOW.md)
-- [Semantic reconstruction and two-oracle acceptance](docs/SEMANTIC_RECONSTRUCTION.md)
-- [IDA and analysis safety](docs/IDA_MCP.md)
-- [Build and exact matching](docs/BUILD_MATCHING.md)
-- [Playable reconstruction ports](docs/PORTING.md)
-- [Native Linux playable reconstruction](docs/LINUX_PORTING.md)
-- [Tool selection and command recipes](docs/TOOLS.md)
-- [Reusable knowledge map and contribution policy](docs/KNOWLEDGE_BASE.md)
-- [Current handoff and next milestones](docs/RE_HANDOFF.md)
-- [Generated reconstruction progress](docs/PROGRESS.md)
-- [Agent operating rules](AGENTS.md)
-
-## Credits and provenance
-
-This continuation exists because of the reconstruction and tooling work by the
-contributors to [GensokyoClub/th08](https://github.com/GensokyoClub/th08).
-Their commits retain their original author/committer metadata. The upstream
-project also credits @EstexNT for porting its `var_order` pragma to MSVC7.
-
-The [N0zoM1z0/th07 reconstruction](https://github.com/N0zoM1z0/th07) supplies
-this repository's workflow, structure, target gates, matching, and
-documentation model. [GensokyoClub/th06](https://github.com/GensokyoClub/th06)
-is adjacent-engine corroboration only; neither reference overrides TH08 target
-evidence.
+- Original game: 東方永夜抄 © 上海アリス幻樂団 (Team Shanghai Alice). This is an unofficial fan port. No original assets are distributed.
+- PC decompilation (two upstream projects): the original reconstruction [GensokyoClub/th08](https://github.com/GensokyoClub/th08) (KSS, MIT), and its fork [N0zoM1z0/th08](https://github.com/N0zoM1z0/th08) (Linux/portable64 port, MIT), which is the direct base of this PSP port.
+- PSPGL fork base: [pspdev/pspgl](https://github.com/pspdev/pspgl) (BSD-3-Clause), SDL2 for PSP, PSPSDK, ARK CFW.
+- PSP eDRAM (4 MiB) knowledge and hardware discussion: **m-c/d** and **Acid_Snake** of the PSP Homebrew Community. Thank you.
+- Port engineering: kan82 with coding agents (OpenAI Codex, Anthropic Claude). See `th07-psp-native` for the sibling Touhou 7 port.
 
 ## License
 
-Repository code and documentation are provided under the included MIT License.
-This does not grant rights to the original game, executable, or game data.
+MIT (see `LICENSE`). Third-party notices are in `licenses/`.

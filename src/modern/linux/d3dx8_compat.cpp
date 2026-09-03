@@ -4,12 +4,53 @@
 #include <SDL_image.h>
 #include <d3dx8.h>
 
+#if defined(PSP)
+#include "fileio.hpp"
+#include "render_resource_arena.hpp"
+#endif
+
 #include <math.h>
 #include <string.h>
 #include <vector>
 
 namespace
 {
+#if defined(PSP)
+struct SurfaceDecodeBreadcrumb
+{
+    explicit SurfaceDecodeBreadcrumb(UINT inputBytes_)
+        : inputBytes(inputBytes_), before(th08::psp::CaptureRenderResourceArenaSnapshot())
+    {
+    }
+
+    ~SurfaceDecodeBreadcrumb()
+    {
+        const th08::psp::RenderResourceArenaSnapshot after =
+            th08::psp::CaptureRenderResourceArenaSnapshot();
+        th08::psp::BootLog(
+            "SURFACE_DECODE result=%s stage=%s input=%lu scope=%d size=%lux%lu "
+            "arena_before_free=%lu arena_before_largest=%lu "
+            "arena_after_free=%lu arena_after_largest=%lu failures=%lu\n",
+            success ? "READY" : "FAILED", stage, static_cast<unsigned long>(inputBytes),
+            scopeActive ? 1 : 0, static_cast<unsigned long>(width),
+            static_cast<unsigned long>(height),
+            static_cast<unsigned long>(before.freeBytes),
+            static_cast<unsigned long>(before.largestFreeBytes),
+            static_cast<unsigned long>(after.freeBytes),
+            static_cast<unsigned long>(after.largestFreeBytes),
+            static_cast<unsigned long>(after.failureCount));
+    }
+
+    UINT inputBytes;
+    th08::psp::RenderResourceArenaSnapshot before;
+    const char *stage = "begin";
+    UINT width = 0;
+    UINT height = 0;
+    bool scopeActive = false;
+    bool success = false;
+};
+#endif
+
 UINT BytesPerPixel(D3DFORMAT format)
 {
     switch (format)
@@ -130,15 +171,222 @@ HRESULT CopySurface(IDirect3DSurface8 *destinationRaw, const RECT *destinationRe
 {
     LinuxSurfaceAccess source;
     if (!th08_linux_surface_access(sourceRaw, &source, true) || source.pixels == NULL) return E_INVALIDARG;
-    std::vector<BYTE> rgba(source.width * source.height * 4);
-    UINT sourceBytes = BytesPerPixel(source.format);
-    for (UINT y = 0; y < source.height; ++y)
-        for (UINT x = 0; x < source.width; ++x)
-            DecodePixel(source.pixels + y * source.pitch + x * sourceBytes, source.format,
-                        &rgba[(y * source.width + x) * 4]);
-    return CopyRgbaToSurface(destinationRaw, destinationRectRaw, rgba.empty() ? NULL : &rgba[0],
-                             source.width, source.height, source.width * 4, sourceRectRaw, colorKey);
+
+    // Embedded ANM images and PSP framebuffer captures are copied between
+    // equal-format, equal-sized rectangles. Preserve those packed pixels
+    // directly instead of expanding the whole source to temporary 32-bit RGBA.
+    LinuxSurfaceAccess destination;
+    if (!th08_linux_surface_access(destinationRaw, &destination, false) ||
+        destination.pixels == NULL)
+        return E_INVALIDARG;
+    if (colorKey == 0 && destination.format == source.format)
+    {
+        const RECT sourceRect = sourceRectRaw != NULL
+                                  ? *sourceRectRaw
+                                  : FullRect(source.width, source.height);
+        const RECT destinationRect = destinationRectRaw != NULL
+                                       ? *destinationRectRaw
+                                       : FullRect(destination.width, destination.height);
+        if (ValidRect(sourceRect) && ValidRect(destinationRect) &&
+            sourceRect.right <= static_cast<LONG>(source.width) &&
+            sourceRect.bottom <= static_cast<LONG>(source.height) &&
+            destinationRect.right <= static_cast<LONG>(destination.width) &&
+            destinationRect.bottom <= static_cast<LONG>(destination.height) &&
+            sourceRect.right - sourceRect.left == destinationRect.right - destinationRect.left &&
+            sourceRect.bottom - sourceRect.top == destinationRect.bottom - destinationRect.top)
+        {
+            const UINT copyWidth = static_cast<UINT>(sourceRect.right - sourceRect.left);
+            const UINT copyHeight = static_cast<UINT>(sourceRect.bottom - sourceRect.top);
+            const UINT bytes = BytesPerPixel(source.format);
+            const UINT rowBytes = copyWidth * bytes;
+            for (UINT y = 0; y < copyHeight; ++y)
+            {
+                memcpy(destination.pixels +
+                           (static_cast<UINT>(destinationRect.top) + y) * destination.pitch +
+                           static_cast<UINT>(destinationRect.left) * bytes,
+                       source.pixels +
+                           (static_cast<UINT>(sourceRect.top) + y) * source.pitch +
+                           static_cast<UINT>(sourceRect.left) * bytes,
+                       rowBytes);
+            }
+            th08_linux_surface_changed(destinationRaw);
+            return S_OK;
+        }
+    }
+
+    // The generic desktop route used to expand the entire source to RGBA
+    // first.  A 1024x64 text surface therefore requested a contiguous 256 KiB
+    // temporary on every copy and failed when the PSP heap's largest block was
+    // 64 bytes smaller, despite ample total free RAM.  Convert each sampled
+    // pixel directly into the destination.  The sampling, color-key and packed
+    // output operations are identical; only the temporary lifetime disappears.
+    const RECT sourceRect = sourceRectRaw != NULL
+                              ? *sourceRectRaw
+                              : FullRect(source.width, source.height);
+    RECT destinationRect = destinationRectRaw != NULL
+                              ? *destinationRectRaw
+                              : FullRect(destination.width, destination.height);
+    if (!ValidRect(sourceRect) || !ValidRect(destinationRect) ||
+        sourceRect.right > static_cast<LONG>(source.width) ||
+        sourceRect.bottom > static_cast<LONG>(source.height))
+        return E_INVALIDARG;
+    if (destinationRect.right > static_cast<LONG>(destination.width))
+        destinationRect.right = static_cast<LONG>(destination.width);
+    if (destinationRect.bottom > static_cast<LONG>(destination.height))
+        destinationRect.bottom = static_cast<LONG>(destination.height);
+    if (!ValidRect(destinationRect))
+        return E_INVALIDARG;
+
+    const UINT destinationWidth = static_cast<UINT>(destinationRect.right - destinationRect.left);
+    const UINT destinationHeight = static_cast<UINT>(destinationRect.bottom - destinationRect.top);
+    const UINT sourceWidth = static_cast<UINT>(sourceRect.right - sourceRect.left);
+    const UINT sourceHeight = static_cast<UINT>(sourceRect.bottom - sourceRect.top);
+    const UINT sourceBytes = BytesPerPixel(source.format);
+    const UINT destinationBytes = BytesPerPixel(destination.format);
+    for (UINT y = 0; y < destinationHeight; ++y)
+    {
+        const UINT sourceY = static_cast<UINT>(sourceRect.top) +
+            static_cast<UINT>((static_cast<unsigned long long>(y) * sourceHeight) /
+                              destinationHeight);
+        BYTE *destinationRow = destination.pixels +
+            (static_cast<UINT>(destinationRect.top) + y) * destination.pitch +
+            static_cast<UINT>(destinationRect.left) * destinationBytes;
+        for (UINT x = 0; x < destinationWidth; ++x)
+        {
+            const UINT sourceX = static_cast<UINT>(sourceRect.left) +
+                static_cast<UINT>((static_cast<unsigned long long>(x) * sourceWidth) /
+                                  destinationWidth);
+            BYTE rgba[4];
+            DecodePixel(source.pixels + sourceY * source.pitch + sourceX * sourceBytes,
+                        source.format, rgba);
+            if (colorKey != 0 && (colorKey & 0x00ffffffu) ==
+                ((static_cast<DWORD>(rgba[0]) << 16) |
+                 (static_cast<DWORD>(rgba[1]) << 8) | rgba[2]))
+                rgba[3] = 0;
+            EncodePixel(destinationRow + x * destinationBytes, destination.format, rgba);
+        }
+    }
+    th08_linux_surface_changed(destinationRaw);
+    return S_OK;
 }
+
+#if defined(PSP)
+HRESULT CopyMemoryAreaAverage(IDirect3DSurface8 *destinationRaw,
+                              const RECT *destinationRectRaw,
+                              const LinuxSurfaceAccess &source,
+                              const RECT *sourceRectRaw, D3DCOLOR colorKey)
+{
+    LinuxSurfaceAccess destination;
+    if (source.pixels == NULL ||
+        !th08_linux_surface_access(destinationRaw, &destination, false) ||
+        destination.pixels == NULL)
+        return E_INVALIDARG;
+
+    const RECT sourceRect = sourceRectRaw != NULL
+                              ? *sourceRectRaw
+                              : FullRect(source.width, source.height);
+    RECT destinationRect = destinationRectRaw != NULL
+                              ? *destinationRectRaw
+                              : FullRect(destination.width, destination.height);
+    if (!ValidRect(sourceRect) || !ValidRect(destinationRect) ||
+        sourceRect.right > static_cast<LONG>(source.width) ||
+        sourceRect.bottom > static_cast<LONG>(source.height))
+        return E_INVALIDARG;
+    if (destinationRect.right > static_cast<LONG>(destination.width))
+        destinationRect.right = static_cast<LONG>(destination.width);
+    if (destinationRect.bottom > static_cast<LONG>(destination.height))
+        destinationRect.bottom = static_cast<LONG>(destination.height);
+    if (!ValidRect(destinationRect))
+        return E_INVALIDARG;
+
+    const UINT destinationWidth = static_cast<UINT>(destinationRect.right - destinationRect.left);
+    const UINT destinationHeight = static_cast<UINT>(destinationRect.bottom - destinationRect.top);
+    const UINT sourceWidth = static_cast<UINT>(sourceRect.right - sourceRect.left);
+    const UINT sourceHeight = static_cast<UINT>(sourceRect.bottom - sourceRect.top);
+    const UINT sourceBytes = BytesPerPixel(source.format);
+    const UINT destinationBytes = BytesPerPixel(destination.format);
+
+    // TH07's PSP text path preserves thin glyph strokes by averaging every
+    // source texel covered by one destination texel.  Do the same directly in
+    // the existing packed surfaces: no temporary row/surface or heap traffic.
+    for (UINT y = 0; y < destinationHeight; ++y)
+    {
+        const UINT sourceY0 = static_cast<UINT>(sourceRect.top) +
+            static_cast<UINT>((static_cast<unsigned long long>(y) * sourceHeight) /
+                              destinationHeight);
+        UINT sourceY1 = static_cast<UINT>(sourceRect.top) +
+            static_cast<UINT>((static_cast<unsigned long long>(y + 1) * sourceHeight +
+                               destinationHeight - 1) /
+                              destinationHeight);
+        if (sourceY1 <= sourceY0)
+            sourceY1 = sourceY0 + 1;
+        if (sourceY1 > static_cast<UINT>(sourceRect.bottom))
+            sourceY1 = static_cast<UINT>(sourceRect.bottom);
+
+        BYTE *destinationRow = destination.pixels +
+            (static_cast<UINT>(destinationRect.top) + y) * destination.pitch +
+            static_cast<UINT>(destinationRect.left) * destinationBytes;
+        for (UINT x = 0; x < destinationWidth; ++x)
+        {
+            const UINT sourceX0 = static_cast<UINT>(sourceRect.left) +
+                static_cast<UINT>((static_cast<unsigned long long>(x) * sourceWidth) /
+                                  destinationWidth);
+            UINT sourceX1 = static_cast<UINT>(sourceRect.left) +
+                static_cast<UINT>((static_cast<unsigned long long>(x + 1) * sourceWidth +
+                                   destinationWidth - 1) /
+                                  destinationWidth);
+            if (sourceX1 <= sourceX0)
+                sourceX1 = sourceX0 + 1;
+            if (sourceX1 > static_cast<UINT>(sourceRect.right))
+                sourceX1 = static_cast<UINT>(sourceRect.right);
+
+            UINT sums[4] = {0, 0, 0, 0};
+            UINT sampleCount = 0;
+            for (UINT sourceY = sourceY0; sourceY < sourceY1; ++sourceY)
+            {
+                const BYTE *sourceRow = source.pixels + sourceY * source.pitch;
+                for (UINT sourceX = sourceX0; sourceX < sourceX1; ++sourceX)
+                {
+                    BYTE rgba[4];
+                    DecodePixel(sourceRow + sourceX * sourceBytes, source.format, rgba);
+                    if (colorKey != 0 && (colorKey & 0x00ffffffu) ==
+                        ((static_cast<DWORD>(rgba[0]) << 16) |
+                         (static_cast<DWORD>(rgba[1]) << 8) | rgba[2]))
+                        rgba[3] = 0;
+                    sums[0] += rgba[0];
+                    sums[1] += rgba[1];
+                    sums[2] += rgba[2];
+                    sums[3] += rgba[3];
+                    ++sampleCount;
+                }
+            }
+
+            BYTE averaged[4];
+            averaged[0] = static_cast<BYTE>(sums[0] / sampleCount);
+            averaged[1] = static_cast<BYTE>(sums[1] / sampleCount);
+            averaged[2] = static_cast<BYTE>(sums[2] / sampleCount);
+            averaged[3] = static_cast<BYTE>(sums[3] / sampleCount);
+            EncodePixel(destinationRow + x * destinationBytes,
+                        destination.format, averaged);
+        }
+    }
+    th08_linux_surface_changed(destinationRaw);
+    return S_OK;
+}
+
+HRESULT CopySurfaceAreaAverage(IDirect3DSurface8 *destinationRaw,
+                               const RECT *destinationRectRaw,
+                               IDirect3DSurface8 *sourceRaw,
+                               const RECT *sourceRectRaw, D3DCOLOR colorKey)
+{
+    LinuxSurfaceAccess source;
+    if (!th08_linux_surface_access(sourceRaw, &source, true) ||
+        source.pixels == NULL)
+        return E_INVALIDARG;
+    return CopyMemoryAreaAverage(destinationRaw, destinationRectRaw, source,
+                                 sourceRectRaw, colorKey);
+}
+#endif
 
 SDL_Surface *LoadImage(LPCVOID data, UINT size)
 {
@@ -325,5 +573,171 @@ HRESULT D3DXLoadSurfaceFromFileInMemory(IDirect3DSurface8 *destination, const vo
 
 HRESULT D3DXLoadSurfaceFromSurface(IDirect3DSurface8 *destination, const void *, const RECT *destinationRect,
                                    IDirect3DSurface8 *source, const void *, const RECT *sourceRect,
-                                   DWORD, D3DCOLOR colorKey)
-{ return CopySurface(destination, destinationRect, source, sourceRect, colorKey); }
+                                   DWORD filter, D3DCOLOR colorKey)
+{
+#if defined(PSP)
+    // D3DX_FILTER_TRIANGLE is 4. Preserve the surface-backed compatibility
+    // route with the same TH07 area-average kernel used by the PSP TextHelper's
+    // direct DIB source; neither route drops rows with nearest sampling.
+    if (filter == 4)
+        return CopySurfaceAreaAverage(destination, destinationRect, source,
+                                      sourceRect, colorKey);
+#else
+    (void)filter;
+#endif
+    return CopySurface(destination, destinationRect, source, sourceRect, colorKey);
+}
+
+#if defined(PSP)
+HRESULT th08_linux_surface_area_average_from_memory(
+    IDirect3DSurface8 *destination, const RECT *destinationRect,
+    const void *sourcePixels, UINT sourceWidth, UINT sourceHeight,
+    UINT sourcePitch, D3DFORMAT sourceFormat, const RECT *sourceRect,
+    D3DCOLOR colorKey)
+{
+    if (sourcePixels == NULL || sourceWidth == 0 || sourceHeight == 0 ||
+        sourcePitch < sourceWidth * BytesPerPixel(sourceFormat))
+        return E_INVALIDARG;
+
+    LinuxSurfaceAccess source;
+    source.pixels = const_cast<BYTE *>(static_cast<const BYTE *>(sourcePixels));
+    source.width = sourceWidth;
+    source.height = sourceHeight;
+    source.pitch = sourcePitch;
+    source.format = sourceFormat;
+    return CopyMemoryAreaAverage(destination, destinationRect, source,
+                                 sourceRect, colorKey);
+}
+
+bool th08_linux_surface_load_image_memory(IDirect3DDevice8 *device, const void *data,
+                                          UINT size, IDirect3DSurface8 **surface,
+                                          UINT *width, UINT *height)
+{
+    if (device == NULL || data == NULL || size == 0 || surface == NULL)
+        return false;
+
+    *surface = NULL;
+#if defined(PSP)
+    // r079 hardware returned to the title with only a 94 KiB largest newlib
+    // block. title00.png itself was read successfully, but SDL_image then
+    // needed a ~1.2 MiB decoded surface plus libpng row work. Keep that
+    // bounded, temporary C allocation lifetime in the retained renderer arena
+    // instead of asking the fragmented gameplay heap.
+    SurfaceDecodeBreadcrumb breadcrumb(size);
+    SDL_Surface *decoded = NULL;
+    {
+        // Keep the C-allocation opt-in strictly around SDL_image/libpng. The
+        // decoded surface can safely leave this lexical block because the
+        // global free wrapper recognizes arena ownership, while stdio/GL and
+        // other libraries below continue using their normal allocators.
+        th08::psp::SurfaceDecodeAllocationScope decodeScope("surface image decode");
+        breadcrumb.scopeActive = th08::psp::SurfaceDecodeAllocationScopeActive();
+        if (!breadcrumb.scopeActive)
+        {
+            breadcrumb.stage = "arena_scope";
+            return false;
+        }
+        SDL_RWops *stream = SDL_RWFromConstMem(data, static_cast<int>(size));
+        if (stream == NULL)
+        {
+            breadcrumb.stage = "rw_stream";
+            return false;
+        }
+        decoded = IMG_Load_RW(stream, 1);
+    }
+#else
+    SDL_RWops *stream = SDL_RWFromConstMem(data, static_cast<int>(size));
+    if (stream == NULL)
+        return false;
+    SDL_Surface *decoded = IMG_Load_RW(stream, 1);
+#endif
+    if (decoded == NULL || decoded->w <= 0 || decoded->h <= 0)
+    {
+        if (decoded != NULL) SDL_FreeSurface(decoded);
+#if defined(PSP)
+        breadcrumb.stage = "image_decode";
+#endif
+        return false;
+    }
+#if defined(PSP)
+    breadcrumb.width = static_cast<UINT>(decoded->w);
+    breadcrumb.height = static_cast<UINT>(decoded->h);
+#endif
+
+    IDirect3DSurface8 *destination = NULL;
+    if (device->CreateImageSurface(static_cast<UINT>(decoded->w),
+                                   static_cast<UINT>(decoded->h),
+                                   D3DFMT_R5G6B5, &destination) != D3D_OK)
+    {
+        SDL_FreeSurface(decoded);
+#if defined(PSP)
+        breadcrumb.stage = "destination_surface";
+#endif
+        return false;
+    }
+
+    LinuxSurfaceAccess access;
+    const bool accessible = th08_linux_surface_access(destination, &access, false) &&
+                            access.pixels != NULL;
+    const bool mustUnlock = SDL_MUSTLOCK(decoded) != 0;
+    const bool sourceLocked = !mustUnlock || SDL_LockSurface(decoded) == 0;
+    const int converted = accessible && sourceLocked
+                              ? SDL_ConvertPixels(decoded->w, decoded->h,
+                                                  decoded->format->format,
+                                                  decoded->pixels, decoded->pitch,
+                                                  SDL_PIXELFORMAT_RGB565,
+                                                  access.pixels,
+                                                  static_cast<int>(access.pitch))
+                              : -1;
+    if (mustUnlock && sourceLocked) SDL_UnlockSurface(decoded);
+    if (converted == 0)
+    {
+#if defined(PSP) && defined(TH08_PSP_SURFACE_PIXEL_AUDIT) && \
+    TH08_PSP_SURFACE_PIXEL_AUDIT
+        unsigned long nonBlackPixels = 0;
+        unsigned long checksum = 2166136261u;
+        for (int y = 0; y < decoded->h; ++y)
+        {
+            const WORD *row = reinterpret_cast<const WORD *>(
+                access.pixels + static_cast<UINT>(y) * access.pitch);
+            for (int x = 0; x < decoded->w; ++x)
+            {
+                const WORD pixel = row[x];
+                if (pixel != 0) ++nonBlackPixels;
+                checksum ^= pixel;
+                checksum *= 16777619u;
+            }
+        }
+        fprintf(stderr,
+                "TH08PSP SURFACE_DECODE size=%dx%d nonblack=%lu checksum=%08lx "
+                "first=%04x center=%04x\n",
+                decoded->w, decoded->h, nonBlackPixels, checksum,
+                static_cast<unsigned int>(*reinterpret_cast<const WORD *>(access.pixels)),
+                static_cast<unsigned int>(*reinterpret_cast<const WORD *>(
+                    access.pixels + static_cast<UINT>(decoded->h / 2) * access.pitch +
+                    static_cast<UINT>(decoded->w / 2) * sizeof(WORD))));
+#endif
+        th08_linux_surface_changed(destination);
+        if (width != NULL) *width = static_cast<UINT>(decoded->w);
+        if (height != NULL) *height = static_cast<UINT>(decoded->h);
+        *surface = destination;
+    }
+    else
+    {
+        destination->Release();
+#if defined(PSP)
+        breadcrumb.stage = accessible ? (sourceLocked ? "pixel_convert" : "source_lock")
+                                      : "destination_access";
+#endif
+    }
+    SDL_FreeSurface(decoded);
+#if defined(PSP)
+    if (converted == 0)
+    {
+        breadcrumb.stage = "complete";
+        breadcrumb.success = true;
+    }
+#endif
+    return converted == 0;
+}
+#endif

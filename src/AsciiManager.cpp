@@ -1,5 +1,9 @@
 #include "th_pch.h"
 
+#if defined(PSP)
+#include "render_perf_telemetry.hpp"
+#endif
+
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -19,6 +23,78 @@ DIFFABLE_STATIC(ChainElem, g_AsciiManagerDrawChainLowPrio);
 DIFFABLE_STATIC(AsciiManager, g_AsciiManager);
 DIFFABLE_STATIC(ChainElem, g_AsciiManagerCalcChain);
 DIFFABLE_STATIC(ChainElem, g_AsciiManagerDrawChainHighPrio);
+
+#if defined(PSP)
+namespace
+{
+struct PspAsciiRenderOwnerSidecar
+{
+    AsciiManager *owner;
+    PspAsciiRenderOwner strings[ASCII_MAX_STRINGS];
+};
+
+PspAsciiRenderOwner g_PspAsciiCurrentRenderOwner =
+    PspAsciiRenderOwner::Game;
+PspAsciiRenderOwnerSidecar g_PspAsciiRenderOwners{};
+
+void PspResetAsciiRenderOwners(AsciiManager *owner)
+{
+    memset(&g_PspAsciiRenderOwners, 0, sizeof(g_PspAsciiRenderOwners));
+    g_PspAsciiRenderOwners.owner = owner;
+}
+
+void PspEnsureAsciiRenderOwners(AsciiManager *owner)
+{
+    if (g_PspAsciiRenderOwners.owner != owner)
+        PspResetAsciiRenderOwners(owner);
+}
+
+PspAsciiRenderOwner PspAsciiStringRenderOwner(AsciiManager *ascii,
+                                               i32 stringIndex)
+{
+    if (g_PspAsciiRenderOwners.owner != ascii || stringIndex < 0 ||
+        stringIndex >= ASCII_MAX_STRINGS)
+    {
+        return PspAsciiRenderOwner::Game;
+    }
+    return g_PspAsciiRenderOwners.strings[stringIndex];
+}
+
+void PspDrawFpsOverlayGlyph(AnmVm *vm)
+{
+    const u32 spritesBefore = g_AnmManager->spritesToDraw;
+    const u32 flushesBefore = g_AnmManager->flushesThisFrame;
+    const ZunResult result = g_AnmManager->DrawNoRotation(vm);
+    if (result != ZUN_SUCCESS)
+        return;
+
+    const u32 spritesAfter = g_AnmManager->spritesToDraw;
+    const u32 flushesAfter = g_AnmManager->flushesThisFrame;
+    const bool appendedWithoutFlush =
+        flushesAfter == flushesBefore && spritesAfter == spritesBefore + 1U;
+    const bool appendedAfterFlush =
+        flushesAfter > flushesBefore && spritesAfter == 1U;
+    if (appendedWithoutFlush || appendedAfterFlush)
+    {
+        // The ordinary AsciiManager path appends one canonical quad.  Its
+        // eventual backend workload is six logical triangle-list vertices.
+        th08::psp::RenderPerfQueueFpsOverlayVertices(6U);
+    }
+}
+} // namespace
+
+PspAsciiRenderOwnerScope::PspAsciiRenderOwnerScope(
+    PspAsciiRenderOwner owner)
+    : previousOwner_(g_PspAsciiCurrentRenderOwner)
+{
+    g_PspAsciiCurrentRenderOwner = owner;
+}
+
+PspAsciiRenderOwnerScope::~PspAsciiRenderOwnerScope()
+{
+    g_PspAsciiCurrentRenderOwner = previousOwner_;
+}
+#endif
 
 // Menu script indices and interrupts used by the original pause/retry state machines.
 #define ASCII_SCRIPT_PAUSE 12
@@ -92,6 +168,167 @@ enum
     RETRY_MENU_STATE_EXIT_TO_TITLE = 4,
 };
 
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+namespace
+{
+constexpr i32 kPspScorePopupSlots =
+    ASCII_MAX_SCORE_POPUPS + ASCII_MAX_PLAYER_POPUPS;
+constexpr i32 kPspTimePopupSlots = ASCII_MAX_TIME_POPUPS;
+constexpr i32 kPspPopupBitsPerWord = 32;
+constexpr i32 kPspScorePopupWords =
+    (kPspScorePopupSlots + kPspPopupBitsPerWord - 1) /
+    kPspPopupBitsPerWord;
+constexpr i32 kPspTimePopupWords =
+    (kPspTimePopupSlots + kPspPopupBitsPerWord - 1) /
+    kPspPopupBitsPerWord;
+
+// This is presentation-only derived state.  Keeping it outside AsciiManager
+// preserves the original object layout and every replay/gameplay owner.  The
+// authoritative inUse flags remain in the retail popup arrays.
+struct PspAsciiPopupOccupancy
+{
+    AsciiManager *owner;
+    u32 scoreWords[kPspScorePopupWords];
+    u32 timeWords[kPspTimePopupWords];
+    i32 scoreLastActiveWord;
+    i32 timeLastActiveWord;
+};
+
+PspAsciiPopupOccupancy g_PspAsciiPopupOccupancy;
+
+void PspSetPopupBit(u32 *words, i32 *lastActiveWord, i32 slot)
+{
+    const i32 word = slot / kPspPopupBitsPerWord;
+    const i32 bit = slot % kPspPopupBitsPerWord;
+    words[word] |= 1U << bit;
+    if (*lastActiveWord < word)
+        *lastActiveWord = word;
+}
+
+void PspClearPopupBit(u32 *words, i32 *lastActiveWord, i32 slot)
+{
+    const i32 word = slot / kPspPopupBitsPerWord;
+    const i32 bit = slot % kPspPopupBitsPerWord;
+    words[word] &= ~(1U << bit);
+
+    if (word != *lastActiveWord || words[word] != 0)
+        return;
+    while (*lastActiveWord >= 0 && words[*lastActiveWord] == 0)
+        --*lastActiveWord;
+}
+
+void PspResetAsciiPopupOccupancy(AsciiManager *owner)
+{
+    memset(&g_PspAsciiPopupOccupancy, 0,
+           sizeof(g_PspAsciiPopupOccupancy));
+    g_PspAsciiPopupOccupancy.owner = owner;
+    g_PspAsciiPopupOccupancy.scoreLastActiveWord = -1;
+    g_PspAsciiPopupOccupancy.timeLastActiveWord = -1;
+}
+
+void PspRebuildAsciiPopupOccupancy(AsciiManager *ascii)
+{
+    PspResetAsciiPopupOccupancy(ascii);
+    for (i32 slot = 0; slot < kPspScorePopupSlots; ++slot)
+    {
+        if (ascii->scorePopups[slot].inUse)
+        {
+            PspSetPopupBit(g_PspAsciiPopupOccupancy.scoreWords,
+                           &g_PspAsciiPopupOccupancy.scoreLastActiveWord,
+                           slot);
+        }
+    }
+    for (i32 slot = 0; slot < kPspTimePopupSlots; ++slot)
+    {
+        if (ascii->timePopups[slot].inUse)
+        {
+            PspSetPopupBit(g_PspAsciiPopupOccupancy.timeWords,
+                           &g_PspAsciiPopupOccupancy.timeLastActiveWord,
+                           slot);
+        }
+    }
+}
+
+void PspEnsureAsciiPopupOccupancy(AsciiManager *ascii)
+{
+    if (g_PspAsciiPopupOccupancy.owner != ascii)
+        PspRebuildAsciiPopupOccupancy(ascii);
+}
+
+void PspMarkScorePopupActive(AsciiManager *ascii, i32 slot)
+{
+    PspEnsureAsciiPopupOccupancy(ascii);
+    PspSetPopupBit(g_PspAsciiPopupOccupancy.scoreWords,
+                   &g_PspAsciiPopupOccupancy.scoreLastActiveWord, slot);
+}
+
+void PspMarkTimePopupActive(AsciiManager *ascii, i32 slot)
+{
+    PspEnsureAsciiPopupOccupancy(ascii);
+    PspSetPopupBit(g_PspAsciiPopupOccupancy.timeWords,
+                   &g_PspAsciiPopupOccupancy.timeLastActiveWord, slot);
+}
+
+void PspMarkScorePopupInactive(i32 slot)
+{
+    PspClearPopupBit(g_PspAsciiPopupOccupancy.scoreWords,
+                     &g_PspAsciiPopupOccupancy.scoreLastActiveWord, slot);
+}
+
+void PspMarkTimePopupInactive(i32 slot)
+{
+    PspClearPopupBit(g_PspAsciiPopupOccupancy.timeWords,
+                     &g_PspAsciiPopupOccupancy.timeLastActiveWord, slot);
+}
+
+// The iterator snapshots one occupancy word at a time.  Clearing the current
+// bit during expiry or stale-positive repair is safe, and ctz preserves the
+// retail ascending slot order exactly.
+struct PspPopupBitIterator
+{
+    PspPopupBitIterator(const u32 *sourceWords, i32 sourceWordCount,
+                        i32 sourceSlotCount)
+        : words(sourceWords), wordCount(sourceWordCount),
+          slotCount(sourceSlotCount), nextWord(0), activeWord(0), pending(0)
+    {
+    }
+
+    bool Next(i32 *slot)
+    {
+        for (;;)
+        {
+            if (pending != 0)
+            {
+                const u32 bit = static_cast<u32>(__builtin_ctz(pending));
+                pending &= pending - 1U;
+                const i32 candidate =
+                    activeWord * kPspPopupBitsPerWord + static_cast<i32>(bit);
+                if (candidate < slotCount)
+                {
+                    *slot = candidate;
+                    return true;
+                }
+                continue;
+            }
+
+            if (nextWord >= wordCount)
+                return false;
+            activeWord = nextWord;
+            pending = words[nextWord++];
+        }
+    }
+
+    const u32 *words;
+    i32 wordCount;
+    i32 slotCount;
+    i32 nextWord;
+    i32 activeWord;
+    u32 pending;
+};
+} // namespace
+#endif
+
 // FUNCTION: th08 0x402000
 AsciiManager::AsciiManager()
 {
@@ -129,10 +366,28 @@ ChainCallbackResult AsciiManager::OnUpdate(AsciiManager *ascii)
         popup = &ascii->scorePopups[0];
         if (((*(u32 *)&g_GameManager.flags >> 10) & 1) == 0)
         {
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+            PspEnsureAsciiPopupOccupancy(ascii);
+            PspPopupBitIterator scoreIterator(
+                g_PspAsciiPopupOccupancy.scoreWords,
+                g_PspAsciiPopupOccupancy.scoreLastActiveWord + 1,
+                kPspScorePopupSlots);
+            while (scoreIterator.Next(&i))
+            {
+                popup = &ascii->scorePopups[i];
+#else
             for (i = 0; i < ASCII_MAX_SCORE_POPUPS + ASCII_MAX_PLAYER_POPUPS; i++, popup++)
             {
+#endif
                 if (!popup->inUse)
                 {
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+                    // A stale positive only costs this visit; repair it
+                    // without changing the authoritative popup array.
+                    PspMarkScorePopupInactive(i);
+#endif
                     continue;
                 }
                 popup->position.y -= 0.5f * g_Supervisor.framerateMultiplier;
@@ -140,20 +395,43 @@ ChainCallbackResult AsciiManager::OnUpdate(AsciiManager *ascii)
                 if (popup->timer > 60)
                 {
                     popup->inUse = false;
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+                    PspMarkScorePopupInactive(i);
+#endif
                 }
             }
 
             popup = &ascii->timePopups[0];
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+            PspPopupBitIterator timeIterator(
+                g_PspAsciiPopupOccupancy.timeWords,
+                g_PspAsciiPopupOccupancy.timeLastActiveWord + 1,
+                kPspTimePopupSlots);
+            while (timeIterator.Next(&i))
+            {
+                popup = &ascii->timePopups[i];
+#else
             for (i = 0; i < ASCII_MAX_TIME_POPUPS; i++, popup++)
             {
+#endif
                 if (!popup->inUse)
                 {
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+                    PspMarkTimePopupInactive(i);
+#endif
                     continue;
                 }
                 popup->timer++;
                 if (popup->timer > 90)
                 {
                     popup->inUse = false;
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+                    PspMarkTimePopupInactive(i);
+#endif
                 }
             }
         }
@@ -218,6 +496,13 @@ void AsciiManager::Reset()
     memset(&this->retryMenu, 0, sizeof(RetryMenu));
     memset(&this->scorePopups, 0, sizeof(this->scorePopups));
     memset(&this->timePopups, 0, sizeof(this->timePopups));
+#if defined(PSP)
+    PspResetAsciiRenderOwners(this);
+#endif
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+    PspResetAsciiPopupOccupancy(this);
+#endif
 
     this->numStrings = 0;
     this->isGui = FALSE;
@@ -286,6 +571,10 @@ ZunResult AsciiManager::RegisterChain()
 ZunResult AsciiManager::AddedCallback(AsciiManager *ascii)
 {
     memset(ascii, 0, sizeof(AsciiManager));
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+    PspResetAsciiPopupOccupancy(ascii);
+#endif
 
     ascii->asciiAnm = g_AnmManager->PreloadAnm(1, "ascii.anm");
     if (ascii->asciiAnm == NULL)
@@ -308,6 +597,16 @@ ZunResult AsciiManager::AddedCallback(AsciiManager *ascii)
 // FUNCTION: th08 0x4028c0
 ZunResult AsciiManager::DeletedCallback(AsciiManager *ascii)
 {
+#if defined(PSP)
+    PspResetAsciiRenderOwners(NULL);
+#endif
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+    // Invalidate rather than claiming that the still-populated retail arrays
+    // are empty.  An unexpected callback before the next AddedCallback will
+    // therefore rebuild, never skip an authoritative inUse popup.
+    PspResetAsciiPopupOccupancy(NULL);
+#endif
     g_AnmManager->ReleaseAnm(1);
     g_AnmManager->ReleaseAnm(3);
 
@@ -332,8 +631,22 @@ void AsciiManager::AddString(Float3 *position, const char *string)
         return;
     }
 
+#if defined(PSP)
+    const i32 stringIndex = this->numStrings;
+    nextString = &this->strings[stringIndex];
+#else
     nextString = &this->strings[this->numStrings];
+#endif
     this->numStrings++;
+
+#if defined(PSP)
+    // The capacity rejection above must not create a phantom owner.  Every
+    // accepted slot is overwritten, so ResetStrings needs no retail-layout or
+    // per-frame memset change.
+    PspEnsureAsciiRenderOwners(this);
+    g_PspAsciiRenderOwners.strings[stringIndex] =
+        g_PspAsciiCurrentRenderOwner;
+#endif
 
     strcpy(nextString->text, string);
 
@@ -397,6 +710,11 @@ void AsciiManager::OnDrawLowPrioImpl()
 
     for (i = 0; i < this->numStrings; i++, curString++)
     {
+#if defined(PSP)
+        const PspAsciiRenderOwner renderOwner =
+            PspAsciiStringRenderOwner(this, i);
+        const bool isFpsOverlay = renderOwner != PspAsciiRenderOwner::Game;
+#endif
         this->largeText.pos = curString->position;
 
         text = (u8 *)curString->text;
@@ -453,7 +771,12 @@ void AsciiManager::OnDrawLowPrioImpl()
                     this->largeText.color1.d3dColor = 0xffffffff;
                 }
 
-                g_AnmManager->DrawNoRotation(&this->largeText);
+#if defined(PSP)
+                if (isFpsOverlay)
+                    PspDrawFpsOverlayGlyph(&this->largeText);
+                else
+#endif
+                    g_AnmManager->DrawNoRotation(&this->largeText);
                 this->largeText.pos.x += spaceWidth;
             }
 
@@ -590,6 +913,10 @@ void AsciiManager::CreateScorePopup(Float3 *position, i32 number, D3DCOLOR color
     popup->position = *position;
     popup->position.x += g_GameManager.arcadeRegionTopLeftPos.x;
     popup->position.y += g_GameManager.arcadeRegionTopLeftPos.y;
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+    PspMarkScorePopupActive(this, nextScorePopupIndex);
+#endif
     this->nextScorePopupIndex++;
 }
 
@@ -633,6 +960,11 @@ void AsciiManager::CreatePlayerPointPopup(Float3 *position, i32 number, D3DCOLOR
     popup->position = *position;
     popup->position.x += g_GameManager.arcadeRegionTopLeftPos.x;
     popup->position.y += g_GameManager.arcadeRegionTopLeftPos.y;
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+    PspMarkScorePopupActive(
+        this, ASCII_MAX_SCORE_POPUPS + nextPlayerPointPopupIndex);
+#endif
     this->nextPlayerPointPopupIndex++;
 }
 
@@ -689,6 +1021,10 @@ void AsciiManager::CreateTimePopup(Float3 *position, i32 primaryNumber, i32 seco
     popup->position.y += g_GameManager.arcadeRegionTopLeftPos.y;
     popup->scale.x = this->scaleX;
     popup->scale.y = this->scaleY;
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+    PspMarkTimePopupActive(this, nextTimePopupIndex);
+#endif
     this->nextTimePopupIndex++;
 }
 
@@ -745,6 +1081,10 @@ void AsciiManager::CreateFamiliarPopup(Float3 *position, i32 primaryNumber, i32 
     popup->position.y += g_GameManager.arcadeRegionTopLeftPos.y;
     popup->scale.x = this->scaleX;
     popup->scale.y = this->scaleY;
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+    PspMarkTimePopupActive(this, nextTimePopupIndex);
+#endif
     this->nextTimePopupIndex++;
 }
 
@@ -1568,12 +1908,46 @@ void AsciiManager::OnDrawHighPrioImpl()
     }
     g_Supervisor.SetRenderState(D3DRS_ZFUNC, D3DCMP_ALWAYS);
 
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_BATCH) && \
+    TH08_PSP_ASCII_POPUP_BATCH
+    const bool scorePopupsDrawnByBatch =
+        g_AnmManager->DrawPspAsciiPopupBatch(
+            &this->smallScoreText, this->asciiAnm, this->scorePopups,
+            ASCII_MAX_SCORE_POPUPS + ASCII_MAX_PLAYER_POPUPS,
+            g_Player.position.x, g_Player.position.y,
+            this->scaleX, this->scaleY) == ZUN_SUCCESS;
+#else
+    const bool scorePopupsDrawnByBatch = false;
+#endif
+
+    if (!scorePopupsDrawnByBatch)
+    {
+
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+    PspEnsureAsciiPopupOccupancy(this);
+    PspPopupBitIterator scoreDrawIterator(
+        g_PspAsciiPopupOccupancy.scoreWords,
+        g_PspAsciiPopupOccupancy.scoreLastActiveWord + 1,
+        kPspScorePopupSlots);
+    while (scoreDrawIterator.Next(&j))
+    {
+        popup = &this->scorePopups[j];
+#else
     for (j = 0; j < ASCII_MAX_SCORE_POPUPS + ASCII_MAX_PLAYER_POPUPS; j++, popup++)
     {
+#endif
         if (!popup->inUse)
         {
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+            PspMarkScorePopupInactive(j);
+#endif
             continue;
         }
+#if defined(PSP)
+        th08::psp::RenderPerfNotePopup(popup->characterCount);
+#endif
 
         this->smallScoreText.pos.x = popup->position.x - (f32)(popup->characterCount * 4);
         this->smallScoreText.pos.y = popup->position.y;
@@ -1621,6 +1995,7 @@ void AsciiManager::OnDrawHighPrioImpl()
             this->smallScoreText.pos.x += 8.0f;
             charPtr--;
         }
+    }
     }
 
     if (this->nightBlindnessAlpha > 0)
@@ -1689,12 +2064,30 @@ void AsciiManager::OnDrawHighPrioImpl()
     }
 
     popup = this->timePopups;
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+    PspPopupBitIterator timeDrawIterator(
+        g_PspAsciiPopupOccupancy.timeWords,
+        g_PspAsciiPopupOccupancy.timeLastActiveWord + 1,
+        kPspTimePopupSlots);
+    while (timeDrawIterator.Next(&j))
+    {
+        popup = &this->timePopups[j];
+#else
     for (j = 0; j < ASCII_MAX_TIME_POPUPS; j++, popup++)
     {
+#endif
         if (!popup->inUse)
         {
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
+    TH08_PSP_ASCII_POPUP_OCCUPANCY
+            PspMarkTimePopupInactive(j);
+#endif
             continue;
         }
+#if defined(PSP)
+        th08::psp::RenderPerfNotePopup(popup->characterCount);
+#endif
 
         this->popupText.pos.x = popup->position.x - 3.5f * popup->characterCount;
         this->popupText.pos.y = popup->position.y;

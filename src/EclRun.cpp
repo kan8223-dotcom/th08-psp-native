@@ -9,6 +9,10 @@
 #include "Player.hpp"
 #include "Spellcard.hpp"
 
+#if defined(PSP)
+#include "ecl_child_memory.hpp"
+#endif
+
 #include <string.h>
 
 #define TH08_ECL_RUN_DECLARATIONS_ONLY

@@ -16,6 +16,17 @@
 #include "Spellcard.hpp"
 #include "Supervisor.hpp"
 
+#if defined(PSP)
+#include "fileio.hpp"
+#include "gui_border_replay.hpp"
+#ifndef TH08_PSP_GUI_BORDER_STATS_ENABLED
+#define TH08_PSP_GUI_BORDER_STATS_ENABLED 0
+#endif
+#include "render_resource_arena.hpp"
+#include <cstdint>
+#include <new>
+#endif
+
 #include <stdio.h>
 
 namespace th08
@@ -24,15 +35,24 @@ namespace th08
 DIFFABLE_STATIC(Gui, g_Gui);
 DIFFABLE_STATIC(ChainElem, g_GuiCalcChain);
 DIFFABLE_STATIC(ChainElem, g_GuiDrawChain);
+#if defined(PSP)
+// The retail linker exports these names at fields owned by Supervisor and
+// Background. Use the typed owners directly on PSP so countdowns are advanced
+// by the main loop and stage-mode scripts reach the background subsystem.
+#define g_GuiFullPowerModeFrames g_Supervisor.screenTransitionCountdown
+#define g_GuiMessageStageMode g_Background.spellVmScriptBase
+#define g_GuiMessageScreenEffectDuration g_Supervisor.screenTransitionCountdown
+#else
 DIFFABLE_STATIC(i32, g_GuiFullPowerModeFrames);
 DIFFABLE_STATIC(i32, g_GuiMessageStageMode);
-DIFFABLE_STATIC(u16, g_GuiMessageInputCurrent);
-DIFFABLE_STATIC(u16, g_GuiMessageInputPrevious);
 #ifdef TH08_PORTABLE_NATIVE_LAYOUT
 #define g_GuiMessageScreenEffectDuration g_GuiFullPowerModeFrames
 #else
 DIFFABLE_STATIC(i32, g_GuiMessageScreenEffectDuration);
 #endif
+#endif
+DIFFABLE_STATIC(u16, g_GuiMessageInputCurrent);
+DIFFABLE_STATIC(u16, g_GuiMessageInputPrevious);
 DIFFABLE_STATIC_ARRAY(i32, MAX_STAGES, g_GuiStageClearBonuses);
 struct GuiMessageTextColorSet
 {
@@ -1203,6 +1223,12 @@ void Gui::DrawGameScene()
     vm = &this->impl->frontVms[13];
     if (g_Supervisor.IsHUDRedrawEnabled() || vm->currentInstruction != NULL || g_GuiFullPowerModeFrames != 0)
     {
+#if TH08_PSP_GUI_BORDER_STATS_ENABLED
+        // The 123 border tiles: canonical loops live in psp/gui_border_replay.cpp
+        // (same calls, same order); the product switch replays the last append.
+        th08::psp::GuiBorderDrawTiles(vm, &this->impl->frontVms[14]);
+        vm = &this->impl->frontVms[14];
+#else
         for (yPos = 0.0f; yPos < 464.0f; yPos += 32.0f)
         {
             vm->pos = Float3(0.0f, yPos, 0.49f);
@@ -1224,6 +1250,7 @@ void Gui::DrawGameScene()
             vm->pos = Float3(xPos, 464.0f, 0.49f);
             g_AnmManager->DrawNoRotation(vm);
         }
+#endif
         g_AnmManager->DrawNoRotation(&this->impl->frontVms[0]);
         g_AnmManager->Draw2D(&this->impl->frontVms[1]);
         g_AnmManager->DrawNoRotation(&this->impl->frontVms[2]);
@@ -1573,6 +1600,68 @@ ZunResult Gui::RegisterChain()
 GuiImpl::GuiImpl()
 {
 }
+
+#if defined(PSP)
+void *GuiImpl::operator new(size_t size)
+{
+    // GuiImpl is a 143,544-byte stage-lifetime object.  Keeping it on the
+    // fragmented newlib heap can fail even when total free memory exceeds the
+    // request.  The render arena was reserved contiguously before frontend
+    // allocations and its live render resources are never evicted or resized;
+    // this allocation consumes only a currently free block.
+    void *memory = psp::RenderResourceArenaAllocate(
+        size, alignof(GuiImpl), "GUI");
+    if (memory != NULL)
+    {
+        psp::BootLog("GUI_IMPL alloc=READY source=render_arena ptr=0x%08lx bytes=%lu "
+                     "fallback=0 sc_only=1\n",
+                     static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(memory)),
+                     static_cast<unsigned long>(size));
+        return memory;
+    }
+
+    // Do not impose an arena-derived logical cap.  The exact original global
+    // new route remains available when the reserved arena has no suitable
+    // block (and retains its existing NEW_FAIL diagnostic on final failure).
+    psp::BootLog("GUI_IMPL alloc=FALLBACK source=global_new bytes=%lu arena_miss=1 "
+                 "sc_only=1\n",
+                 static_cast<unsigned long>(size));
+    memory = ::operator new(size);
+    psp::BootLog("GUI_IMPL alloc=READY source=global_new ptr=0x%08lx bytes=%lu "
+                 "fallback=1 sc_only=1\n",
+                 static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(memory)),
+                 static_cast<unsigned long>(size));
+    return memory;
+}
+
+void GuiImpl::operator delete(void *memory) noexcept
+{
+    if (memory == NULL)
+        return;
+
+    // Only an exact live payload start may be released.  Arena interior,
+    // stale and double-free pointers are consumed by quarantine and must not
+    // reach the global heap deallocator.
+    const psp::RenderResourceArenaFreeResult result =
+        psp::RenderResourceArenaTryFree(memory);
+    if (result == psp::RenderResourceArenaFreeResult::Freed)
+    {
+        psp::BootLog("GUI_IMPL free=RELEASED source=render_arena ptr=0x%08lx\n",
+                     static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(memory)));
+        return;
+    }
+    if (result == psp::RenderResourceArenaFreeResult::Quarantined)
+    {
+        psp::BootLog("GUI_IMPL free=QUARANTINED ptr=0x%08lx consumed=1\n",
+                     static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(memory)));
+        return;
+    }
+
+    psp::BootLog("GUI_IMPL free=RELEASED source=global_delete ptr=0x%08lx\n",
+                 static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(memory)));
+    ::operator delete(memory);
+}
+#endif
 
 // FUNCTION: th08 0x437ce2
 GuiMsgVm::GuiMsgVm()

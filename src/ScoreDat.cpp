@@ -4,6 +4,9 @@
 #include "ScoreDat.hpp"
 #include "Spellcard.hpp"
 #include "pbg/Lzss.hpp"
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+#include "stage_pool_arena.hpp"
+#endif
 
 namespace th08
 {
@@ -181,7 +184,24 @@ ScoreDat *ScoreDat::OpenScore(const char *filename)
         goto recreate_score_file;
     }
 
-    scoreDat2 = (ScoreDat *)g_ZunMemory.Alloc(sizeof(ScoreDat) + 0xa0000, "scorefile2");
+    scoreDat2 = NULL;
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+    // On return from a stage, the original Enemy/Bullet/Laser/Item storage is
+    // idle while score.dat is decoded and immediately consumed. Borrow that
+    // mutually-exclusive storage instead of asking a fragmented heap for a
+    // second 640 KiB buffer. The full score payload and all gameplay pools are
+    // unchanged; StagePoolArenaBeginStage reconstructs the pools before use.
+    scoreDat2 = static_cast<ScoreDat *>(th08::psp::StagePoolArenaAcquireIdleTransient(
+        sizeof(ScoreDat) + 0xa0000, "scorefile2"));
+#endif
+    if (scoreDat2 == NULL)
+        scoreDat2 = (ScoreDat *)g_ZunMemory.Alloc(sizeof(ScoreDat) + 0xa0000, "scorefile2");
+    if (scoreDat2 == NULL)
+    {
+        utils::DebugPrint("error: score.dat decode allocation failed\r\n");
+        g_ZunMemory.Free(scoreDat);
+        return NULL;
+    }
 #ifdef TH08_PORTABLE_NATIVE_LAYOUT
     memcpy(scoreDat2, scoreDat, TH08_SCORE_DAT_WIRE_SIZE);
     Lzss::Decode(TH08_SCORE_DAT_WIRE_PAYLOAD(scoreDat), scoreDat->compressedFileSize,

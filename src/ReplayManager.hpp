@@ -207,6 +207,13 @@ struct ReplayManager
     static void SaveReplay(const char *replayPath, const char *replayName);
     static ReplayData *LoadReplayData(ReplayData *replayData, int fileSize);
     static void StopRecording();
+#if defined(PSP)
+    // Reserve the original recording capacity before stage assets fragment
+    // Main RAM, then shrink completed stages to their exact serialized spans.
+    static ZunResult PrepareRecordingStageBuffers();
+    static void ReleasePreparedRecordingStageBuffers();
+    static void CompactRecordedStage(i32 stage);
+#endif
 
     i32 IsDemo();
 };

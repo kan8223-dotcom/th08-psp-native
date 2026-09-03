@@ -288,7 +288,9 @@ struct Enemy
     i32 linkedChildCount;
     EnemyChildEclBlock *childEclBlocks[4];
     EnemyTrailSample trailSamples[96];
+#if !defined(TH08_PSP_STAGE_POOL_ARENA)
     VertexTex1DiffuseXyzrhw trailVertices[194];
+#endif
     u8 trailFlags;
     u8 trailLengthAlignment534D;
     i16 trailHistoryLength;
@@ -320,7 +322,11 @@ struct Enemy
     void UpdateYoukaiAlignment();
     void IntegrateVelocity();
 };
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+C_ASSERT(sizeof(Enemy) == 0x3e98);
+#else
 C_ASSERT(sizeof(Enemy) == 0x53d0);
+#endif
 C_ASSERT(offsetof(Enemy, nextInDrawGroup) == 0x0);
 C_ASSERT(offsetof(Enemy, previousInAttachmentChain) == 0x4);
 C_ASSERT(offsetof(Enemy, nextInAttachmentChain) == 0x8);
@@ -403,6 +409,19 @@ C_ASSERT(offsetof(Enemy, timerCallbackSubId) == 0x337c);
 C_ASSERT(offsetof(Enemy, linkedChildCount) == 0x3380);
 C_ASSERT(offsetof(Enemy, childEclBlocks) == 0x3384);
 C_ASSERT(offsetof(Enemy, trailSamples) == 0x3394);
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+C_ASSERT(offsetof(Enemy, trailFlags) == 0x3e14);
+C_ASSERT(offsetof(Enemy, trailLengthAlignment534D) == 0x3e15);
+C_ASSERT(offsetof(Enemy, trailHistoryLength) == 0x3e16);
+C_ASSERT(offsetof(Enemy, trailCollisionLength) == 0x3e18);
+C_ASSERT(offsetof(Enemy, trailSampleStride) == 0x3e1a);
+C_ASSERT(offsetof(Enemy, damageReductionTimer) == 0x3e1c);
+C_ASSERT(offsetof(Enemy, attachedEffects) == 0x3e28);
+C_ASSERT(offsetof(Enemy, attachedEffectCount) == 0x3e88);
+C_ASSERT(offsetof(Enemy, attachedEffectDistance) == 0x3e8c);
+C_ASSERT(offsetof(Enemy, alignmentEffect) == 0x3e90);
+C_ASSERT(offsetof(Enemy, phaseEndTimeRemainingSeconds) == 0x3e94);
+#else
 C_ASSERT(offsetof(Enemy, trailVertices) == 0x3e14);
 C_ASSERT(offsetof(Enemy, trailFlags) == 0x534c);
 C_ASSERT(offsetof(Enemy, trailLengthAlignment534D) == 0x534d);
@@ -415,6 +434,7 @@ C_ASSERT(offsetof(Enemy, attachedEffectCount) == 0x53c0);
 C_ASSERT(offsetof(Enemy, attachedEffectDistance) == 0x53c4);
 C_ASSERT(offsetof(Enemy, alignmentEffect) == 0x53c8);
 C_ASSERT(offsetof(Enemy, phaseEndTimeRemainingSeconds) == 0x53cc);
+#endif
 
 struct EclTimelineInstruction
 {
@@ -443,7 +463,17 @@ struct EnemyManager
     EnemyManager();
 
     Enemy spawnTemplate;
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    // PSP draws and ECL updates run serially on the SC. Trail strip vertices
+    // are regenerated completely for each draw, so one manager-lifetime
+    // scratch strip replaces the identical 5,432-byte array in every slot.
+    // Keeping it directly after spawnTemplate preserves the original 0x53d0
+    // manager prefix and the original initialization memset boundary.
+    VertexTex1DiffuseXyzrhw sharedTrailVertices[194];
+    Enemy *enemies;
+#else
     Enemy enemies[481];
+#endif
     Enemy *bosses[8];
     u16 enemyDropCounter;
     u16 enemyDropScheduleIndex;
@@ -478,6 +508,16 @@ struct EnemyManager
     i32 HasBoss();
     static void CutChain();
 };
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+C_ASSERT(sizeof(VertexTex1DiffuseXyzrhw) * 194 == 0x1538);
+C_ASSERT(sizeof(EnemyManager) == 0x5544);
+C_ASSERT(offsetof(EnemyManager, sharedTrailVertices) == 0x3e98);
+C_ASSERT(offsetof(EnemyManager, enemies) == 0x53d0);
+C_ASSERT(offsetof(EnemyManager, bosses) == 0x53d4);
+C_ASSERT(offsetof(EnemyManager, activeEnemyCount) == 0x53f8);
+C_ASSERT(offsetof(EnemyManager, timelines) == 0x5404);
+C_ASSERT(offsetof(EnemyManager, suppressTimelineSpawns) == 0x5540);
+#else
 C_ASSERT(sizeof(EnemyManager) == 0x9dcf10);
 C_ASSERT(offsetof(EnemyManager, spawnTemplate) == 0x0);
 C_ASSERT(offsetof(EnemyManager, enemies) == 0x53d0);
@@ -496,6 +536,7 @@ C_ASSERT(offsetof(EnemyManager, unconsumedDword9DCEF4) == 0x9dcef4);
 C_ASSERT(offsetof(EnemyManager, lastSpawnFailed) == 0x9dcef8);
 C_ASSERT(offsetof(EnemyManager, timelineEventSlots) == 0x9dcefc);
 C_ASSERT(offsetof(EnemyManager, suppressTimelineSpawns) == 0x9dcf0c);
+#endif
 
 DIFFABLE_EXTERN(EnemyManager, g_EnemyManager);
 

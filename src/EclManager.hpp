@@ -143,7 +143,7 @@ void __fastcall ShiftStageEffectOrigins(Float3 *delta);
 DIFFABLE_EXTERN(ChainElem, g_EffectManagerCalcChain);
 DIFFABLE_EXTERN(ChainElem, g_EffectManagerDrawChain);
 
-#ifdef TH08_PORTABLE_NATIVE_LAYOUT
+#if defined(TH08_PORTABLE_NATIVE_LAYOUT) || defined(PSP)
 #define g_EclGameTimeScaleFlags reinterpret_cast<u32 &>(g_Supervisor.flags)
 #else
 DIFFABLE_EXTERN(u32, g_EclGameTimeScaleFlags);

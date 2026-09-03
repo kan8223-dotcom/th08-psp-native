@@ -10,12 +10,479 @@
 #include "inttypes.hpp"
 #include "utils.hpp"
 #include <d3d8.h>
+#if defined(PSP)
+#include "anm_scratch.hpp"
+#endif
 
 #define GAME_WINDOW_WIDTH 640
 #define GAME_WINDOW_HEIGHT 480
 
 namespace th08
 {
+struct AsciiManagerPopup;
+
+#if defined(PSP) && defined(TH08_PSP_EFFECT_INDEXED_QUADS) && \
+        TH08_PSP_EFFECT_INDEXED_QUADS && \
+    defined(TH08_PSP_BULLET_UNIFIED_QUADS) && \
+        TH08_PSP_BULLET_UNIFIED_QUADS
+#define TH08_PSP_EFFECT_INDEXED_QUADS_ENABLED 1
+#else
+#define TH08_PSP_EFFECT_INDEXED_QUADS_ENABLED 0
+#endif
+
+#if TH08_PSP_EFFECT_INDEXED_QUADS_ENABLED
+// Presentation-only interval counters.  Keeping the complete declaration and
+// every writer behind the product gate makes the default-OFF build pay no BSS,
+// branch, or counter-update cost.  None of these fields is manager, VM, RNG,
+// gameplay, or replay state.
+struct PspEffectIndexedQuadStats
+{
+    u32 passes;
+    u32 flushes;
+    u32 batches;
+    u32 successfulOrdinaryQuads;
+    u32 verticesSaved;
+    u32 bytesSaved;
+    u32 fallbacks;
+    u32 fallbackQuads;
+    u32 ownerConflicts;
+    u32 abandonedPasses;
+    u32 abandonedQuads;
+    u32 maxBatchQuads;
+};
+
+void PspQueryEffectIndexedQuadStats(PspEffectIndexedQuadStats *stats);
+void PspResetEffectIndexedQuadStats();
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_ITEM_NATURAL_QUADS) && \
+    TH08_PSP_ITEM_NATURAL_QUADS
+#define TH08_PSP_ITEM_NATURAL_QUADS_ENABLED 1
+#else
+#define TH08_PSP_ITEM_NATURAL_QUADS_ENABLED 0
+#endif
+
+#if TH08_PSP_ITEM_NATURAL_QUADS_ENABLED && \
+    (!defined(TH08_PSP_BULLET_UNIFIED_QUADS) || \
+     !TH08_PSP_BULLET_UNIFIED_QUADS)
+#error "ITEM natural quads require TH08_PSP_BULLET_UNIFIED_QUADS"
+#endif
+
+#if TH08_PSP_ITEM_NATURAL_QUADS_ENABLED && \
+    (((defined(TH08_PSP_ITEM_DIRECT_GE) && TH08_PSP_ITEM_DIRECT_GE)) || \
+     ((defined(TH08_PSP_ITEM_MIXED_QUADS_AUDIT) && \
+       TH08_PSP_ITEM_MIXED_QUADS_AUDIT)) || \
+     ((defined(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH) && \
+       TH08_PSP_ITEM_MIXED_QUADS_FASTPATH)) || \
+     ((defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) && \
+       TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT)) || \
+     ((defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH) && \
+       TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH)))
+#error "ITEM natural quads are isolated from prior Item topology experiments"
+#endif
+
+#if defined(PSP)
+// Fixed OFF/ON telemetry reservation for the natural-batch product.  The
+// counters are presentation-only and reset at telemetry window boundaries;
+// no field is part of AnmManager, Item, simulation, VM, RNG, or replay state.
+struct PspItemNaturalQuadStats
+{
+    u32 passes;
+    u32 canonicalBatches;
+    u32 itemTimeCandidates;
+    u32 visibleItemTime;
+    u32 culledItemTime;
+    u32 triggerBatches;
+    u32 triggerQuads;
+    u32 coalescedQuads;
+    u32 eligibleQuads;
+    u32 submittedBatches;
+    u32 submittedQuads;
+    u32 nativeSubmits;
+    u32 nativeSubmittedQuads;
+    u32 clientFallbackSubmits;
+    u32 clientFallbackQuads;
+    u32 canonicalInputVertices;
+    u32 packedOutputVertices;
+    u32 duplicateVerticesAvoided;
+    u32 fallbackBatches;
+    u32 pointerFallbacks;
+    u32 spanFallbacks;
+    u32 capacityFallbacks;
+    u32 topologyFallbacks;
+    u32 stateFallbacks;
+    u32 extraTopologyBatches;
+    u32 indexFallbacks;
+    u32 nativeFallbacks;
+    u32 extraSplitBatches;
+    u32 extraFlushes;
+    u32 abandonedBatches;
+    u32 abandonedQuads;
+    u32 maxBatchQuads;
+    u32 topologyChecks;
+    u32 topologyCheckedQuads;
+};
+
+#if TH08_PSP_ITEM_NATURAL_QUADS_ENABLED
+void PspItemNaturalQuadNotePass();
+void PspItemNaturalQuadSetCurrentTarget(bool active);
+void PspQueryItemNaturalQuadStats(PspItemNaturalQuadStats *stats);
+void PspResetItemNaturalQuadStats();
+#endif
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) && \
+        TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT && \
+    defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH) && \
+        TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH
+#error "ITEM_TIME draw-pair audit and fast path are mutually exclusive"
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_ITEM_DIRECT_GE) && \
+        TH08_PSP_ITEM_DIRECT_GE && \
+    (((defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) && \
+       TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT)) || \
+     ((defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH) && \
+       TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH)))
+#error "ITEM_TIME draw-pair and Item direct-GE owners are mutually exclusive"
+#endif
+
+#if defined(PSP) && \
+    (((defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) && \
+       TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT)) || \
+     ((defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH) && \
+       TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH)))
+#define TH08_PSP_ITEM_TIME_DRAW_PAIR_ENABLED 1
+#else
+#define TH08_PSP_ITEM_TIME_DRAW_PAIR_ENABLED 0
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH) && \
+    TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH
+#define TH08_PSP_ITEM_TIME_DRAW_PAIR_PRODUCT_ENABLED 1
+#else
+#define TH08_PSP_ITEM_TIME_DRAW_PAIR_PRODUCT_ENABLED 0
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_BULLET_MIXED_QUADS_AUDIT) && \
+        TH08_PSP_BULLET_MIXED_QUADS_AUDIT && \
+    defined(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH) && \
+        TH08_PSP_BULLET_MIXED_QUADS_FASTPATH
+#error "Bullet mixed-quad audit and fast path are mutually exclusive"
+#endif
+
+#if defined(PSP) && \
+    (((defined(TH08_PSP_BULLET_MIXED_QUADS_AUDIT) && \
+       TH08_PSP_BULLET_MIXED_QUADS_AUDIT)) || \
+     ((defined(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH) && \
+       TH08_PSP_BULLET_MIXED_QUADS_FASTPATH)))
+#define TH08_PSP_BULLET_MIXED_QUADS_ENABLED 1
+#else
+#define TH08_PSP_BULLET_MIXED_QUADS_ENABLED 0
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH) && \
+    TH08_PSP_BULLET_MIXED_QUADS_FASTPATH
+#define TH08_PSP_BULLET_MIXED_QUADS_PRODUCT_ENABLED 1
+#else
+#define TH08_PSP_BULLET_MIXED_QUADS_PRODUCT_ENABLED 0
+#endif
+
+#if TH08_PSP_BULLET_MIXED_QUADS_ENABLED && \
+    (!defined(TH08_PSP_BULLET_UNIFIED_QUADS) || \
+     !TH08_PSP_BULLET_UNIFIED_QUADS)
+#error "Bullet mixed quads require TH08_PSP_BULLET_UNIFIED_QUADS"
+#endif
+
+#if TH08_PSP_BULLET_MIXED_QUADS_PRODUCT_ENABLED && \
+    (!defined(TH08_PSP_BULLET_DIRECT_GE) || !TH08_PSP_BULLET_DIRECT_GE)
+#error "Bullet mixed-quad fast path requires TH08_PSP_BULLET_DIRECT_GE"
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH) && \
+        TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH && \
+    (!defined(TH08_PSP_BULLET_UNIFIED_QUADS) || \
+     !TH08_PSP_BULLET_UNIFIED_QUADS || \
+     !defined(TH08_PSP_BULLET_DIRECT_GE) || !TH08_PSP_BULLET_DIRECT_GE)
+#error "Bullet packed-vertex fast path requires unified/direct GE"
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH) && \
+        TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH && \
+    (((defined(TH08_PSP_BULLET_PACKED_VERTEX_AUDIT) && \
+       TH08_PSP_BULLET_PACKED_VERTEX_AUDIT)) || \
+     ((defined(TH08_PSP_BULLET_MIXED_QUADS_AUDIT) && \
+       TH08_PSP_BULLET_MIXED_QUADS_AUDIT)) || \
+     ((defined(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH) && \
+       TH08_PSP_BULLET_MIXED_QUADS_FASTPATH)) || \
+     ((defined(TH08_PSP_ITEM_MIXED_QUADS_AUDIT) && \
+       TH08_PSP_ITEM_MIXED_QUADS_AUDIT)) || \
+     ((defined(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH) && \
+       TH08_PSP_ITEM_MIXED_QUADS_FASTPATH)))
+#error "Bullet packed-vertex product is isolated from audit/mixed 2V modes"
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_BULLET_ONEPASS_4V_AUDIT) && \
+        TH08_PSP_BULLET_ONEPASS_4V_AUDIT && \
+    defined(TH08_PSP_BULLET_ONEPASS_4V_FASTPATH) && \
+        TH08_PSP_BULLET_ONEPASS_4V_FASTPATH
+#error "Bullet one-pass 4V audit and fast path are mutually exclusive"
+#endif
+
+#if defined(PSP) && \
+    (((defined(TH08_PSP_BULLET_ONEPASS_4V_AUDIT) && \
+       TH08_PSP_BULLET_ONEPASS_4V_AUDIT)) || \
+     ((defined(TH08_PSP_BULLET_ONEPASS_4V_FASTPATH) && \
+       TH08_PSP_BULLET_ONEPASS_4V_FASTPATH)))
+#define TH08_PSP_BULLET_ONEPASS_4V_ENABLED 1
+#else
+#define TH08_PSP_BULLET_ONEPASS_4V_ENABLED 0
+#endif
+
+#if TH08_PSP_BULLET_ONEPASS_4V_ENABLED && \
+    (!defined(TH08_PSP_BULLET_FASTPATH) || \
+     !TH08_PSP_BULLET_FASTPATH || \
+     !defined(TH08_PSP_BULLET_UNIFIED_QUADS) || \
+     !TH08_PSP_BULLET_UNIFIED_QUADS || \
+     !defined(TH08_PSP_BULLET_DIRECT_GE) || \
+     !TH08_PSP_BULLET_DIRECT_GE)
+#error "Bullet one-pass 4V requires the rotation sidecar, unified quads, and direct GE"
+#endif
+
+#if TH08_PSP_BULLET_ONEPASS_4V_ENABLED && \
+    (((defined(TH08_PSP_BULLET_PACKED_VERTEX_AUDIT) && \
+       TH08_PSP_BULLET_PACKED_VERTEX_AUDIT)) || \
+     ((defined(TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH) && \
+       TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH)) || \
+     ((defined(TH08_PSP_BULLET_MIXED_QUADS_AUDIT) && \
+       TH08_PSP_BULLET_MIXED_QUADS_AUDIT)) || \
+     ((defined(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH) && \
+       TH08_PSP_BULLET_MIXED_QUADS_FASTPATH)))
+#error "Bullet one-pass 4V is isolated from packed/mixed Bullet experiments"
+#endif
+
+#if defined(PSP)
+// Fixed OFF/AUDIT/PRODUCT reservation.  M0 counters are presentation-only and
+// never enter AnmManager, Bullet, RNG, simulation, or replay state.
+struct PspBulletOnePass4VStats
+{
+    u32 attempts;
+    u32 canonicalDraws;
+    u32 inputFallbacks;
+    u32 ownerFallbacks;
+    u32 stateFallbacks;
+    u32 capacityFallbacks;
+    u32 builtQuads;
+    u32 visibleQuads;
+    u32 culledQuads;
+    u32 wouldAccept;
+    u32 quadMatches;
+    u32 quadMismatches;
+    u32 bufferMatches;
+    u32 bufferMismatches;
+    u32 vmMatches;
+    u32 vmMismatches;
+    u32 stateMatches;
+    u32 stateMismatches;
+    u32 productAccepts;
+    u32 reserved;
+};
+
+static_assert(sizeof(PspBulletOnePass4VStats) == 80U,
+              "Bullet one-pass fixed stats reservation changed");
+PspBulletOnePass4VStats PspPeekBulletOnePass4VStats();
+PspBulletOnePass4VStats PspTakeBulletOnePass4VStats();
+void PspResetBulletOnePass4VStats();
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_ITEM_MIXED_QUADS_AUDIT) && \
+        TH08_PSP_ITEM_MIXED_QUADS_AUDIT && \
+    defined(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH) && \
+        TH08_PSP_ITEM_MIXED_QUADS_FASTPATH
+#error "Item mixed-quad audit and fast path are mutually exclusive"
+#endif
+
+#if defined(PSP) && \
+    (((defined(TH08_PSP_ITEM_MIXED_QUADS_AUDIT) && \
+       TH08_PSP_ITEM_MIXED_QUADS_AUDIT)) || \
+     ((defined(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH) && \
+       TH08_PSP_ITEM_MIXED_QUADS_FASTPATH)))
+#define TH08_PSP_ITEM_MIXED_QUADS_ENABLED 1
+#else
+#define TH08_PSP_ITEM_MIXED_QUADS_ENABLED 0
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH) && \
+    TH08_PSP_ITEM_MIXED_QUADS_FASTPATH
+#define TH08_PSP_ITEM_MIXED_QUADS_PRODUCT_ENABLED 1
+#else
+#define TH08_PSP_ITEM_MIXED_QUADS_PRODUCT_ENABLED 0
+#endif
+
+#if TH08_PSP_ITEM_MIXED_QUADS_ENABLED && \
+    (!defined(TH08_PSP_BULLET_UNIFIED_QUADS) || \
+     !TH08_PSP_BULLET_UNIFIED_QUADS)
+#error "Item mixed quads require TH08_PSP_BULLET_UNIFIED_QUADS"
+#endif
+
+#if TH08_PSP_ITEM_MIXED_QUADS_PRODUCT_ENABLED && \
+    (!defined(TH08_PSP_BULLET_DIRECT_GE) || !TH08_PSP_BULLET_DIRECT_GE)
+#error "Item mixed-quad fast path requires TH08_PSP_BULLET_DIRECT_GE"
+#endif
+
+#if TH08_PSP_ITEM_MIXED_QUADS_ENABLED && \
+    defined(TH08_PSP_ITEM_DIRECT_GE) && TH08_PSP_ITEM_DIRECT_GE
+#error "Item mixed quads and Item direct-GE are mutually exclusive"
+#endif
+
+#if TH08_PSP_ITEM_MIXED_QUADS_ENABLED && TH08_PSP_ITEM_TIME_DRAW_PAIR_ENABLED
+#error "Item mixed quads and ITEM_TIME draw-pair are mutually exclusive"
+#endif
+
+#if TH08_PSP_BULLET_MIXED_QUADS_ENABLED || \
+    TH08_PSP_ITEM_MIXED_QUADS_ENABLED
+#define TH08_PSP_ANY_MIXED_QUADS_ENABLED 1
+#else
+#define TH08_PSP_ANY_MIXED_QUADS_ENABLED 0
+#endif
+
+#if TH08_PSP_BULLET_MIXED_QUADS_PRODUCT_ENABLED || \
+    TH08_PSP_ITEM_MIXED_QUADS_PRODUCT_ENABLED
+#define TH08_PSP_ANY_MIXED_QUADS_PRODUCT_ENABLED 1
+#else
+#define TH08_PSP_ANY_MIXED_QUADS_PRODUCT_ENABLED 0
+#endif
+
+#if defined(PSP)
+// A reason is supplied before the generic axis-aligned pair machinery sees a
+// VM, or produced by that machinery while proving the canonical Draw2D
+// contract.  Keeping this vocabulary stable makes audit/product logs directly
+// comparable and lets every failure take the untouched six-vertex path.
+enum PspItemTimeDrawPairRejectReason
+{
+    PSP_ITEM_TIME_DRAW_PAIR_ACCEPT = 0,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_OWNER,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_LOAD,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_SCRIPT,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_SPRITE,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_VISIBILITY,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_ROTATION,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_SCALE,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_NONFINITE,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_TEXTURE,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_STATE,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_AXIS,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_ENDPOINT,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_CAPACITY,
+    PSP_ITEM_TIME_DRAW_PAIR_REJECT_BACKEND,
+};
+
+struct ItemTimeDrawPairStats
+{
+    u32 passes;
+    u32 candidates;
+    u32 canonicalDraws;
+    u32 visibleCandidates;
+    u32 culledCandidates;
+    u32 eligiblePairs;
+    u32 compatibleRuns;
+    u32 submittedRuns;
+    u32 submittedPairs;
+    u32 endpointMatches;
+    u32 endpointMismatches;
+    u32 canonicalFallbacks;
+    u32 ownerFallbacks;
+    u32 loadFallbacks;
+    u32 scriptFallbacks;
+    u32 spriteFallbacks;
+    u32 visibilityFallbacks;
+    u32 rotationFallbacks;
+    u32 scaleFallbacks;
+    u32 nonfiniteFallbacks;
+    u32 textureFallbacks;
+    u32 stateFallbacks;
+    u32 axisFallbacks;
+    u32 endpointFallbacks;
+    u32 capacityFallbacks;
+    u32 backendFallbacks;
+    u32 verticesSaved;
+    u32 frontendBytesSaved;
+    u32 backendBytesSaved;
+    u32 maxRunLength;
+    u32 peakCandidatesPerPass;
+    u32 peakVisiblePerPass;
+    u32 peakEligiblePerPass;
+    u32 peakRunsPerPass;
+    u32 peakStageFrame;
+    u32 cacheHits;
+    u32 cacheRevalidations;
+    u32 cacheGenerationChanges;
+    u32 cacheValidationFailures;
+    u32 semanticHash;
+};
+
+#if TH08_PSP_ITEM_TIME_DRAW_PAIR_ENABLED
+const ItemTimeDrawPairStats &GetItemTimeDrawPairStats();
+#endif
+
+#if TH08_PSP_ANY_MIXED_QUADS_ENABLED
+enum PspBulletMixedQuadRejectReason
+{
+    PSP_BULLET_MIXED_QUAD_ACCEPT = 0,
+    PSP_BULLET_MIXED_QUAD_REJECT_NONFINITE,
+    PSP_BULLET_MIXED_QUAD_REJECT_AXIS,
+    PSP_BULLET_MIXED_QUAD_REJECT_AREA_OR_MIRROR,
+    PSP_BULLET_MIXED_QUAD_REJECT_Z_OR_W,
+    PSP_BULLET_MIXED_QUAD_REJECT_UV,
+    PSP_BULLET_MIXED_QUAD_REJECT_DIFFUSE,
+};
+
+struct BulletMixedQuadStats
+{
+    u32 passes;
+    u32 ownerConflictPasses;
+    u32 stateRuns;
+    u32 batches;
+    u32 candidates;
+    u32 eligiblePrefixQuads;
+    u32 generalQuads;
+    u32 stickyGeneralQuads;
+    u32 nonfiniteFallbacks;
+    u32 axisFallbacks;
+    u32 areaOrMirrorFallbacks;
+    u32 zOrWFallbacks;
+    u32 uvFallbacks;
+    u32 diffuseFallbacks;
+    u32 submittedBatches;
+    u32 submittedPairQuads;
+    u32 submittedGeneralQuads;
+    u32 backendFallbackBatches;
+    u32 failClosedBatches;
+    u32 missingRunBatches;
+    u32 invalidRangeBatches;
+    u32 canonicalRecoveryDrawFailures;
+    u32 canonicalRecoveryQuads;
+    // Potential savings proved by classification/staging. Bullet pair quads
+    // save 2 frontend and 4 GE vertices; Bullet general quads save none. Item
+    // pair quads save 4 frontend and 4 GE vertices, while Item general quads
+    // save 2 frontend vertices. Backend fallback does not subtract from these
+    // audit-facing opportunity counters.
+    u32 frontendVerticesSaved;
+    u32 geVerticesSaved;
+    u32 maxPairPrefix;
+    u32 maxGeneralSuffix;
+};
+
+#if TH08_PSP_BULLET_MIXED_QUADS_ENABLED
+const BulletMixedQuadStats &GetBulletMixedQuadStats();
+#endif
+#if TH08_PSP_ITEM_MIXED_QUADS_ENABLED
+using ItemMixedQuadStats = BulletMixedQuadStats;
+const ItemMixedQuadStats &GetItemMixedQuadStats();
+#endif
+#endif
+#endif
+
 struct VertexDiffuseXyzrhw
 {
     VertexDiffuseXyzrhw();
@@ -492,6 +959,39 @@ struct AnmLoaded
     void ExecuteAnmIdxArray(AnmVm *vm, i32 scriptIdx, i32 count);
     ZunResult SetSprite(AnmVm *vm, int spriteIdx);
     void SetAndExecuteScript(AnmVm *vm, AnmRawInstr *beginningOfScript);
+#if defined(PSP) && \
+    ((defined(TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT) && \
+      TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT) || \
+     (defined(TH08_PSP_ITEM_TIME_SPAWN_INIT_FASTPATH) && \
+      TH08_PSP_ITEM_TIME_SPAWN_INIT_FASTPATH) || \
+     (defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) && \
+      TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) || \
+     (defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH) && \
+      TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH))
+    // Read-only generation/phase/table/range witnesses shared by the shadow
+    // audit and its separately gated product.  They never wait for, finalize,
+    // or otherwise mutate an ANM load.  Table bounds are proved before either
+    // scripts[68] or sprites[179] is dereferenced; byte bounds are proved
+    // before the four-instruction fingerprint is walked.
+    u32 PspLoadGenerationForItemTimeSpawnInit() const;
+    bool PspLoadReadyForItemTimeSpawnInit(u32 expectedGeneration) const;
+    bool PspItemTimeSpawnInitTablesContain(u32 expectedGeneration,
+                                           i32 scriptIndex,
+                                           i32 spriteIndex) const;
+    bool PspItemTimeSpawnInitScriptRangeContains(
+        u32 expectedGeneration, const void *script, u32 byteCount) const;
+#if defined(TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT) && \
+    TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT
+    u32 PspLoadGenerationForSpawnInitAudit() const
+    {
+        return PspLoadGenerationForItemTimeSpawnInit();
+    }
+    bool PspLoadReadyForSpawnInitAudit(u32 expectedGeneration) const
+    {
+        return PspLoadReadyForItemTimeSpawnInit(expectedGeneration);
+    }
+#endif
+#endif
 };
 
 C_ASSERT(sizeof(AnmLoaded) == 0x1c);
@@ -531,10 +1031,37 @@ struct AnmManager
     ZunResult DrawInner(AnmVm *vm, i32 flags);
     ZunResult AddSpriteToDrawBuffer(VertexTex1DiffuseXyzrhw *vertices);
     ZunResult DrawNoRotation(AnmVm *vm);
+#if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_BATCH) && \
+    TH08_PSP_ASCII_POPUP_BATCH
+    // Presentation-only score popup path. It validates the complete frame and
+    // reserves backend storage before changing the shared VM, so any rejected
+    // condition returns to AsciiManager's untouched canonical digit loop.
+    ZunResult DrawPspAsciiPopupBatch(AnmVm *vm, AnmLoaded *asciiAnm,
+                                     AsciiManagerPopup *popups,
+                                     i32 popupCount, f32 playerX, f32 playerY,
+                                     f32 popupScaleX, f32 popupScaleY);
+#endif
     ZunResult Draw2DRotatedOrAxisAligned(AnmVm *vm);
     void TranslateRotation(VertexTex1DiffuseXyzrhw *vertex, float x, float y, float sine, float cosine, float xOffset,
                            float yOffset);
     ZunResult Draw2D(AnmVm *vm);
+    // Draw2D-equivalent presentation path for callers which already own the
+    // sine/cosine of vm->rotation.z. It still emits the same four-corner input
+    // and six-vertex triangle list through DrawInner.
+    ZunResult Draw2DWithPrecomputedRotation(AnmVm *vm, f32 sine, f32 cosine);
+#if defined(PSP) && defined(TH08_PSP_BULLET_ONEPASS_4V_AUDIT) && \
+    TH08_PSP_BULLET_ONEPASS_4V_AUDIT
+    // M0 remains canonical-authoritative and compares the complete persistent
+    // quad plus the exact 4V staging/state effects after every eligible draw.
+    ZunResult DrawPspBulletOnePass4VAudit(AnmVm *vm, f32 sine, f32 cosine);
+#endif
+#if defined(PSP) && defined(TH08_PSP_BULLET_ONEPASS_4V_FASTPATH) && \
+    TH08_PSP_BULLET_ONEPASS_4V_FASTPATH
+    // Returns false before changing authoritative output when any owner,
+    // state, input, or capacity proof fails; the caller then draws canonically.
+    bool TryDrawPspBulletOnePass4V(AnmVm *vm, f32 sine, f32 cosine,
+                                   ZunResult *result);
+#endif
     void DrawPlayerBullet(AnmVm *vm);
     ZunResult DrawCameraFacingQuad(AnmVm *vm);
     ZunResult DrawProjected3DQuad(AnmVm *vm);
@@ -643,10 +1170,9 @@ struct AnmManager
 
         for (i = 0; i < ARRAY_SIZE_SIGNED(this->surfaces); i++)
         {
-            if (this->surfaces[i] != NULL)
+            if (this->surfaces[i] != NULL || this->surfacesBis[i] != NULL)
             {
-                this->surfaces[i]->Release();
-                this->surfaces[i] = NULL;
+                this->ReleaseSurface(i);
             }
         }
     }
@@ -661,13 +1187,19 @@ struct AnmManager
             this->captureAnmIdx = -1;
         }
 
-        if (this->captureSurfaceIdx >= 0)
-        {
-            CaptureToSurface(this->captureSurfaceIdx, this->surfaceCaptureSrcX, this->surfaceCaptureSrcY,
-                             this->surfaceCaptureSrcW, this->surfaceCaptureSrcH, this->surfaceCaptureDstX,
-                             this->surfaceCaptureDstY, this->surfaceCaptureDstW, this->surfaceCaptureDstH);
-            this->captureSurfaceIdx = -1;
-        }
+        TakePendingSurfaceCapture(false);
+    }
+
+    void TakePendingSurfaceCapture(bool readDisplayedFrame)
+    {
+        if (this->captureSurfaceIdx < 0)
+            return;
+
+        CaptureToSurface(this->captureSurfaceIdx, this->surfaceCaptureSrcX, this->surfaceCaptureSrcY,
+                         this->surfaceCaptureSrcW, this->surfaceCaptureSrcH, this->surfaceCaptureDstX,
+                         this->surfaceCaptureDstY, this->surfaceCaptureDstW, this->surfaceCaptureDstH,
+                         readDisplayedFrame);
+        this->captureSurfaceIdx = -1;
     }
 
     void SetMixColorDefault()
@@ -690,6 +1222,24 @@ struct AnmManager
             return;
         }
 
+#if defined(PSP)
+        // Win the phase scratch before the setup worker is allowed to begin
+        // loading ANMs. Capture returns it in the same Present() that consumes
+        // this request, so no gameplay state or frame timing is altered.
+        if (!th08::psp::AnmScratchReserveTransition(
+                "frame transition capture"))
+        {
+            // Never present an old title/logo surface as a failed transition.
+            if (captureSurfaceIdx >= 0 &&
+                captureSurfaceIdx < ARRAY_SIZE_SIGNED(this->surfaces) &&
+                (this->surfaces[captureSurfaceIdx] != NULL ||
+                 this->surfacesBis[captureSurfaceIdx] != NULL))
+            {
+                this->ReleaseSurface(captureSurfaceIdx);
+            }
+            return;
+        }
+#endif
         this->captureSurfaceIdx = captureSurfaceIdx;
         this->surfaceCaptureSrcX = srcX;
         this->surfaceCaptureSrcY = srcY;
@@ -725,10 +1275,53 @@ struct AnmManager
     void CopyTextureRect(i32 dstAnmIdx, i32 dstEntryIdx, i32 srcAnmIdx, i32 srcEntryIdx, RECT *dstRect,
                          RECT *srcRect);
     void CaptureToSurface(i32 captureSurfaceIdx, i32 srcX, i32 srcY, i32 srcW, i32 srcH, i32 dstX, i32 dstY, i32 dstW,
-                          i32 dstH);
+                          i32 dstH, bool readDisplayedFrame = false);
 
     void ClearVertexBuffer();
     void FlushVertexBuffer();
+#if TH08_PSP_ITEM_TIME_DRAW_PAIR_ENABLED
+    // ItemManager brackets one linked-list traversal.  Internally the staging
+    // owner is generic (ItemTime today, Bullet later), while this public gate
+    // keeps the current experiment isolated to ITEM_TIME.
+    void ResetPspItemTimeDrawPairStats();
+    void BeginPspItemTimeDrawPairPass();
+    void EndPspItemTimeDrawPairPass();
+    void PspItemTimeDrawPairBoundary();
+    PspItemTimeDrawPairRejectReason PspValidateItemTimeDrawPairIdentity(
+        const AnmVm *vm, AnmLoaded *owner, i32 expectedSpriteIndex);
+#if defined(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) && \
+    TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT
+    ZunResult DrawPspItemTimePairAudit(
+        AnmVm *vm, PspItemTimeDrawPairRejectReason identityReason);
+#endif
+#if TH08_PSP_ITEM_TIME_DRAW_PAIR_PRODUCT_ENABLED
+    bool TryDrawPspItemTimeSpritePair(
+        AnmVm *vm, PspItemTimeDrawPairRejectReason identityReason);
+#endif
+#endif
+#if defined(PSP) && defined(TH08_PSP_BULLET_UNIFIED_QUADS) && \
+    TH08_PSP_BULLET_UNIFIED_QUADS
+    void BeginPspBulletUnifiedQuadBatch();
+    void EndPspBulletUnifiedQuadBatch();
+#if defined(TH08_PSP_EFFECT_INDEXED_QUADS) && \
+    TH08_PSP_EFFECT_INDEXED_QUADS
+    void BeginPspEffectIndexedQuadBatch();
+    void EndPspEffectIndexedQuadBatch();
+#endif
+#if TH08_PSP_BULLET_MIXED_QUADS_ENABLED
+    void ResetPspBulletMixedQuadStats();
+#endif
+#if TH08_PSP_ITEM_MIXED_QUADS_ENABLED
+    void BeginPspItemMixedQuadBatch();
+    void EndPspItemMixedQuadBatch();
+    void ResetPspItemMixedQuadStats();
+#endif
+#endif
+#if defined(PSP) && defined(TH08_PSP_ITEM_DIRECT_GE) && \
+    TH08_PSP_ITEM_DIRECT_GE
+    void BeginPspItemUnifiedQuadBatch();
+    void EndPspItemUnifiedQuadBatch();
+#endif
 
     ZunColor color;
     ZunBool useMixColor;

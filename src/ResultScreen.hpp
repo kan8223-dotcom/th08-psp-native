@@ -49,6 +49,14 @@ enum ResultScreenRegistrationMode
 
 struct ResultScreen
 {
+#if defined(PSP) && defined(TH08_PSP_STAGE_POOL_ARENA)
+    // The PSP class allocator preserves ordinary new/delete object lifetime
+    // while routing this large phase-exclusive object through the idle stage
+    // arena when possible.
+    static void *operator new(size_t size);
+    static void operator delete(void *memory) noexcept;
+#endif
+
     ResultScreen()
     {
         memset(this, 0, sizeof(ResultScreen));

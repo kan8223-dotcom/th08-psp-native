@@ -384,7 +384,11 @@ DIFFABLE_EXTERN_ARRAY(i32, 6, g_SpellcardCountsPerDifficulty);
 DIFFABLE_EXTERN_ARRAY(i32, 43, g_LastSpellNumbers);
 DIFFABLE_EXTERN(i32, g_LastSpellCount);
 DIFFABLE_EXTERN(Spellcard, g_Spellcard);
+#if defined(PSP)
+extern ChainElem *&g_SpellcardCalcChain;
+#else
 DIFFABLE_EXTERN(ChainElem *, g_SpellcardCalcChain);
+#endif
 DIFFABLE_EXTERN_ARRAY(i32 *, 10, g_SpellcardNumbersPerStage)
 DIFFABLE_EXTERN_ARRAY(i32, 10, g_SpellcardCountPerStage)
 

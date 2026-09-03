@@ -1,0 +1,837 @@
+diff --git a/glPrioritizeTextures.c b/glPrioritizeTextures.c
+index 7f8bba2..bf88c0b 100644
+--- a/glPrioritizeTextures.c
++++ b/glPrioritizeTextures.c
+@@ -13,8 +13,11 @@ void glPrioritizeTextures (GLsizei n, const GLuint *textures, const GLclampf *pr
+ 	}
+ 
+ 	for (i=0; i<n; i++) {
+-		if ((texobj = __pspgl_hash_lookup(hash, textures[i])))
++		if ((texobj = __pspgl_hash_lookup(hash, textures[i]))) {
+ 			texobj->priority = priorities[i];
++			if (priorities[i] >= 1.0f && __pspgl_th08_ge4_active() &&
++			    __pspgl_th08_ge4_static_hint())
++				__pspgl_texobj_promote_upper(texobj, textures[i]);
++		}
+ 	}
+ }
+-
+diff --git a/glReadPixels.c b/glReadPixels.c
+index c3794e8..666aea0 100644
+--- a/glReadPixels.c
++++ b/glReadPixels.c
+@@ -53,7 +53,9 @@ void glReadPixels( GLint x, GLint y,
+ 		/* The PSP provides a window into VRAM which makes the
+ 		   depth buffer look properly linearized. */
+ 		framebuffer = read->depth_buffer;
+-		fb_offset = sceGeEdramGetSize() * 3;
++		/* The linearized alias is defined from the ordinary 2 MiB window.
++		 * A 4 MiB aperture must not move this to a nonexistent 12 MiB alias. */
++		fb_offset = 0x00200000u * 3u;
+ 
+ 		hwsize = 2;
+ 		pixfmt = GE_RGBA_4444; /* any 16-bit sized format */
+diff --git a/glTexSubImage2D.c b/glTexSubImage2D.c
+index 3119364..e87590c 100644
+--- a/glTexSubImage2D.c
++++ b/glTexSubImage2D.c
+@@ -127,6 +127,10 @@ void glTexSubImage2D( GLenum target, GLint level,
+ 		goto out_error;
+ 
+ 	assert(timg->image->refcount > 0);
++	if (!__pspgl_texobj_demote_image_for_cpu(tobj, level)) {
++		GLERROR(GL_OUT_OF_MEMORY);
++		return;
++	}
+ 
+ 	__pspgl_buffer_dlist_sync(timg->image);
+ 	p = __pspgl_buffer_map(timg->image, GL_WRITE_ONLY_ARB) + timg->offset;
+@@ -137,6 +141,11 @@ void glTexSubImage2D( GLenum target, GLint level,
+ 		convert_subimage(timg, p, pixels, xoffset, yoffset, width, height);
+ 
+ 	__pspgl_buffer_unmap(timg->image, GL_WRITE_ONLY_ARB);
++	if (__pspgl_th08_ge4_active()) {
++		sendCommandi(CMD_TEXCACHE_SYNC, getReg(CMD_TEXCACHE_SYNC) + 1);
++		sendCommandi(CMD_TEXCACHE_FLUSH,
++			     getReg(CMD_TEXCACHE_FLUSH) + 1);
++	}
+ 
+ 	if (level == 0 && (tobj->flags & TOF_GENERATE_MIPMAPS))
+ 		__pspgl_update_mipmaps();
+diff --git a/pspgl_buffers.c b/pspgl_buffers.c
+index 2440131..97807e8 100644
+--- a/pspgl_buffers.c
++++ b/pspgl_buffers.c
+@@ -126,16 +126,9 @@ void __pspgl_bufferobj_unmap(const struct pspgl_bufferobj *buf, GLenum access)
+ 		__pspgl_buffer_unmap(buf->data, access);
+ }
+ 
+-static int is_edram_addr(void *p)
++GLboolean __pspgl_buffer_is_upper(const struct pspgl_buffer *data)
+ {
+-	static void *edram_start, *edram_end;
+-
+-	if (edram_end == NULL) {
+-		edram_start = sceGeEdramGetAddr();
+-		edram_end = sceGeEdramGetAddr() + sceGeEdramGetSize();
+-	}
+-
+-	return (p >= edram_start) && (p < edram_end);
++	return data != NULL && data->domain == PSPGL_BUFFER_EDRAM_UPPER;
+ }
+ 
+ /* Kick things out of vidmem until there's enough free space */
+@@ -143,6 +136,15 @@ static void evict_vidmem(size_t need)
+ {
+ 	size_t evicted = 0;
+ 
++	/* See __pspgl_vidmem_compact: address-changing lower-tier eviction also
++	 * leaves saved registers of unbound textures stale.  Keep the active GE4 V1
++	 * route non-migrating and fall back to Main RAM instead. */
++	if (__pspgl_th08_ge4_active()) {
++		if (th08_psp_ge4_note_allocator_block != NULL)
++			th08_psp_ge4_note_allocator_block(0);
++		return;
++	}
++
+ 	/* If we're allocating lots of small stuff and we need to
+ 	   evict, then we may as well try to amortize the eviction for
+ 	   multiple allocations by doing a bit more work now. */
+@@ -156,7 +158,7 @@ static void evict_vidmem(size_t need)
+ 
+ 		buf = list_base;
+ 		do {
+-			if (is_edram_addr(buf->base)) {
++			if (buf->domain != PSPGL_BUFFER_MAIN) {
+ 				evicted += __pspgl_vidmem_evict(buf);
+ 
+ 				if (evicted >= need)
+@@ -180,13 +182,21 @@ static GLboolean __pspgl_buffer_init(struct pspgl_buffer *buf,
+ {
+ 	void *p = NULL;
+ 	int try_hard = 0;
++	int require_upper = 0;
+ 
+ 	size = ROUNDUP(size, CACHELINE_SIZE);
+ 
+ 	buf->base = NULL;
+ 	buf->size = size;
++	buf->domain = PSPGL_BUFFER_MAIN;
+ 
+ 	switch(usage) {
++	case PSPGL_TH08_UPPER_STATIC:
++		require_upper = 1;
++		if (__pspgl_vidmem_alloc_upper(buf))
++			p = buf->base;
++		break;
++
+ 	case GL_STATIC_COPY_ARB:	/* must be in edram */
+ 	case GL_DYNAMIC_COPY_ARB:
+ 	case GL_STREAM_COPY_ARB:
+@@ -232,19 +242,25 @@ static GLboolean __pspgl_buffer_init(struct pspgl_buffer *buf,
+ 		return GL_FALSE;
+ 	}
+ 
++	if (p == NULL && require_upper)
++		return GL_FALSE;
++
+ 	if (p == NULL) {
+ 		p = memalign(CACHELINE_SIZE, size);
+ 
+ 		if (p == NULL)
+ 			return GL_FALSE;
++		buf->domain = PSPGL_BUFFER_MAIN;
+ 	}
+ 
+-  	/* put cache into appropriate unmapped state */
+-	sceKernelDcacheWritebackInvalidateRange(p, size);
++	/* Upper eDRAM is a GE-only shelf.  Never ask the CPU cache controller to
++	 * establish a writable mapping for it. */
++	if (!require_upper)
++		sceKernelDcacheWritebackInvalidateRange(p, size);
+ 
+ 	buf->refcount = 1;
+ 	buf->mapped = 0;
+-	buf->flags = 0;
++	buf->flags = require_upper ? BF_PINNED_FIXED : 0;
+ 	buf->generation = 0;
+ 
+ 	buf->pin_prevp = NULL;
+@@ -290,7 +306,7 @@ void __pspgl_buffer_free(struct pspgl_buffer *data)
+ 	buffer_remove(data);
+ 
+ 	if (data->base) {
+-		if (is_edram_addr(data->base))
++		if (data->domain != PSPGL_BUFFER_MAIN)
+ 			__pspgl_vidmem_free(data);
+ 		else
+ 			free(data->base);
+@@ -343,6 +359,19 @@ void *__pspgl_buffer_map(struct pspgl_buffer *data, GLenum access)
+ {
+ 	void *p = data->base;
+ 
++	/* Every legitimate CPU mutation of a promoted texture must first demote it.
++	 * A missed path is unsafe on real hardware, so fail closed instead of
++	 * silently writing the upper shelf. */
++	if (__pspgl_buffer_is_upper(data))
++	{
++		if (th08_psp_ge4_note_upper_map_denied != NULL)
++			th08_psp_ge4_note_upper_map_denied(data->base, data->size);
++		if (th08_psp_ge4_fail_closed != NULL)
++			th08_psp_ge4_fail_closed("pspgl-cpu-map-upper");
++		GLERROR(GL_INVALID_OPERATION);
++		return NULL;
++	}
++
+ 	assert(data->mapped >= 0);
+ 
+ 	switch(access) {
+diff --git a/pspgl_buffers.h b/pspgl_buffers.h
+index 166ea8d..16ca69f 100644
+--- a/pspgl_buffers.h
++++ b/pspgl_buffers.h
+@@ -3,11 +3,18 @@
+ 
+ #include "pspgl_internal.h"
+ 
++enum pspgl_buffer_domain {
++	PSPGL_BUFFER_MAIN = 0,
++	PSPGL_BUFFER_EDRAM_LOWER = 1,
++	PSPGL_BUFFER_EDRAM_UPPER = 2
++};
++
+ struct pspgl_buffer {
+ 	short refcount;
+ 	short generation;	/* generation counter to detect changes */
+ 	signed char mapped;	/* mapping counter */
+ 	unsigned char flags;
++	unsigned char domain;
+ #define BF_PINNED_RD	(1<<0)	/* buffer is pinned for reading (by hardware) */
+ #define BF_PINNED_WR	(1<<1)	/* buffer if pinned for writing (by hardware) */
+ #define BF_PINNED (BF_PINNED_RD|BF_PINNED_WR)
+@@ -16,6 +23,10 @@ struct pspgl_buffer {
+ #define BF_TRANSIENT	(1<<4)	/* buffer is in the transient pool */
+ #define BF_MIGRATING	(1<<5)	/* buffer is marked for migration (transient) */
+ 
++/* Private usage token: require an allocation wholly inside the independent
++ * upper 2 MiB.  It never falls back to Main RAM or lower eDRAM. */
++#define PSPGL_TH08_UPPER_STATIC	0x60000001u
++
+ 	/* Pointers for the pin list */
+ 	struct pspgl_buffer **pin_prevp;
+ 	struct pspgl_buffer  *pin_next;
+@@ -81,4 +92,8 @@ void __pspgl_buffer_want_vidmem(struct pspgl_buffer *buf);
+ /* Wait for hardware to finished with a buffer */
+ void __pspgl_buffer_dlist_sync(struct pspgl_buffer *data);
+ 
++/* True only while TH08's bridge owns a 4 MiB aperture and the complete buffer
++ * is in its independent upper half. */
++GLboolean __pspgl_buffer_is_upper(const struct pspgl_buffer *data);
++
+ #endif	/* PSPGL_BUFFERS_H */
+diff --git a/pspgl_internal.h b/pspgl_internal.h
+index d2fe904..9b7f8a5 100644
+--- a/pspgl_internal.h
++++ b/pspgl_internal.h
+@@ -279,6 +279,7 @@ extern struct pspgl_context *__pspgl_curctx;
+ #define pspgl_curctx	__pspgl_curctx
+ 
+ extern int   __pspgl_vidmem_alloc (struct pspgl_buffer *buf);
++extern int   __pspgl_vidmem_alloc_upper (struct pspgl_buffer *buf);
+ extern void  __pspgl_vidmem_free (struct pspgl_buffer *buf);
+ extern EGLBoolean __pspgl_vidmem_setup_write_and_display_buffer (struct pspgl_surface *s);
+ extern GLboolean __pspgl_vidmem_compact(void);
+@@ -295,6 +296,47 @@ extern void __pspgl_copy_pixels(const void *srcbuf, int srcstride, int srcx, int
+ 				int width, int height, unsigned hwpixfmt);
+ void __pspgl_copy_memory(const void *src, void *dst, size_t size);
+ 
++/* TH08's hardware-proven, process-owned GE 4 MiB bridge.  This PSPGL fork
++ * keeps ordinary allocations in the lower 2 MiB and reaches the upper region
++ * only through an explicit immutable-texture promotion. */
++extern int th08_psp_ge4_active(void) __attribute__((weak));
++extern int th08_psp_ge4_static_upload_hint_active(void)
++	__attribute__((weak));
++extern int th08_psp_ge4_is_upper_range(const void *address,
++                                       unsigned int bytes)
++	__attribute__((weak));
++extern void th08_psp_ge4_note_upper_alloc(const void *address,
++                                          unsigned int bytes)
++	__attribute__((weak));
++extern void th08_psp_ge4_note_upper_free(const void *address,
++                                         unsigned int bytes)
++	__attribute__((weak));
++extern void th08_psp_ge4_note_promotion(
++	unsigned int bytes, int promoted, unsigned int texture_id,
++	unsigned int width, unsigned int height, unsigned int hardware_format,
++	unsigned int old_domain, const void *new_address)
++	__attribute__((weak));
++extern void th08_psp_ge4_note_allocator_block(int compaction)
++	__attribute__((weak));
++extern void th08_psp_ge4_note_upper_alloc_failure(
++	int reason, unsigned int requested_bytes, unsigned int total_free_bytes,
++	unsigned int largest_gap_bytes) __attribute__((weak));
++extern void th08_psp_ge4_note_upper_map_denied(
++	const void *address, unsigned int bytes) __attribute__((weak));
++extern void th08_psp_ge4_fail_closed(const char *reason)
++	__attribute__((weak, noreturn));
++
++static inline int __pspgl_th08_ge4_active(void)
++{
++	return th08_psp_ge4_active != NULL && th08_psp_ge4_active();
++}
++
++static inline int __pspgl_th08_ge4_static_hint(void)
++{
++	return th08_psp_ge4_static_upload_hint_active != NULL &&
++		th08_psp_ge4_static_upload_hint_active();
++}
++
+ /* pspgl_stats.c */
+ 
+ #include <time.h>
+@@ -484,4 +526,3 @@ extern void __pspglEnable(struct stDisplayElement *de);
+ extern void __pspglTranslate(struct stDisplayElement *de);
+ 
+ #endif
+-
+diff --git a/pspgl_misc.c b/pspgl_misc.c
+index 4f6630e..ae84768 100644
+--- a/pspgl_misc.c
++++ b/pspgl_misc.c
+@@ -98,12 +98,21 @@ void __pspgl_dlist_dump (unsigned long *cmd_buf, unsigned long len)
+ void __pspgl_vram_dump (void)
+ {
+ 	unsigned long vram_start = (unsigned long) sceGeEdramGetAddr();
+-	unsigned long vram_size = (unsigned long) sceGeEdramGetSize() * 4;
++	unsigned long vram_size;
+ 	unsigned long header [4];
+ 	unsigned char vram_copy [0x10000];
+ 	int fd;
+ 	int i;
+ 
++	/* Set4 changes the first contiguous window itself: an 8 MiB CPU dump would
++	 * traverse the real upper shelf.  V1 has no GE-to-Main diagnostic staging,
++	 * so disable this debug-only operation while GE4 owns the aperture. */
++	if (__pspgl_th08_ge4_active()) {
++		__pspgl_log("VRAM dump denied while TH08 GE4 is active\n");
++		return;
++	}
++	vram_size = (unsigned long)sceGeEdramGetSize() * 4;
++
+ 	fd = sceIoOpen(PSPGL_GE_DUMPFILE, PSP_O_CREAT | PSP_O_APPEND | PSP_O_WRONLY, 0644);
+ 
+ 	if (pspgl_curctx) {
+diff --git a/pspgl_texobj.c b/pspgl_texobj.c
+index 60fccfb..7c0c7e0 100644
+--- a/pspgl_texobj.c
++++ b/pspgl_texobj.c
+@@ -3,8 +3,15 @@
+ #include <malloc.h>
+ 
+ #include "pspgl_internal.h"
++#include "pspgl_dlist.h"
+ #include "pspgl_texobj.h"
+ 
++/* Build/link provenance marker.  TH08's final-ELF gate requires this exact
++ * string and the private promotion symbol, preventing an accidental fallback
++ * to the system-installed upstream libGL.a. */
++const char __pspgl_th08_ge4_fork_marker[] =
++	"pspGL TH08 GE4 fork v1 upstream de4260adf56d06516ec46018d404ca77e0b61748";
++
+ 
+ /*
+   RRRRRGGGGGGBBBBB	<- GL
+@@ -318,6 +325,132 @@ static void tobj_setstate(struct pspgl_texobj *tobj, uint32_t reg, uint32_t sett
+ 	tobj->ge_texreg[reg - TEXSTATE_START] = (reg << 24) | (setting & 0x00ffffff);
+ }
+ 
++static void set_live_mipmap_regs(unsigned level, struct pspgl_teximg *img)
++{
++	unsigned ptr = (unsigned)img->image->base + img->offset;
++	unsigned w_lg2 = lg2(img->width);
++	unsigned h_lg2 = lg2(img->height);
++
++	sendCommandi(CMD_TEX_MIPMAP0 + level, ptr);
++	sendCommandi(CMD_TEX_STRIDE0 + level,
++		     ((ptr >> 8) & 0xf0000) | img->stride);
++	sendCommandi(CMD_TEX_SIZE0 + level, (h_lg2 << 8) | w_lg2);
++}
++
++static GLboolean replace_image_buffer_with_ge_copy(struct pspgl_texobj *tobj,
++						     unsigned level,
++						     GLenum new_usage)
++{
++	struct pspgl_teximg *timg;
++	struct pspgl_buffer *old_image;
++	struct pspgl_buffer *new_image;
++
++	if (tobj == NULL || level >= MIPMAP_LEVELS ||
++	    tobj != pspgl_curctx->texture.bound)
++		return GL_FALSE;
++	timg = tobj->images[level];
++	if (timg == NULL || timg->image == NULL || timg->offset != 0)
++		return GL_FALSE;
++
++	old_image = timg->image;
++	__pspgl_buffer_dlist_sync(old_image);
++	if (old_image->refcount != 1)
++		return GL_FALSE;
++	/* Upstream __pspgl_copy_memory advances its byte pointers by a word count
++	 * between blits.  Until that unrelated general routine is repaired, admit
++	 * only sizes which it submits as exactly one legal 512xN (or Nx1) GE copy.
++	 * Every promoted/demoted upper texture is therefore copied in one command,
++	 * with no faulty second-chunk pointer arithmetic. */
++	if (old_image->size == 0 || old_image->size > 2u * 1024u * 1024u ||
++	    (old_image->size & 3u) != 0 ||
++	    (old_image->size >= 512u * 4u &&
++	     (old_image->size % (512u * 4u)) != 0))
++		return GL_FALSE;
++
++	new_image = __pspgl_buffer_new(old_image->size, new_usage);
++	if (new_image == NULL)
++		return GL_FALSE;
++
++	__pspgl_copy_memory(old_image->base, new_image->base, old_image->size);
++	__pspgl_dlist_pin_buffer(old_image, BF_PINNED_RD);
++	__pspgl_dlist_pin_buffer(new_image, BF_PINNED_WR);
++	/* V1 deliberately pays one synchronous boundary per lifetime promotion.
++	 * This proves the copy and ownership handoff before Main/lower storage is
++	 * released; later profiling may batch only after real-hardware evidence. */
++	glFinish();
++
++	timg->image = new_image;
++	set_live_mipmap_regs(level, timg);
++	sendCommandi(CMD_TEXCACHE_SYNC, getReg(CMD_TEXCACHE_SYNC) + 1);
++	sendCommandi(CMD_TEXCACHE_FLUSH, getReg(CMD_TEXCACHE_FLUSH) + 1);
++	__pspgl_buffer_free(old_image);
++	return GL_TRUE;
++}
++
++GLboolean __pspgl_texobj_promote_upper(struct pspgl_texobj *tobj,
++					       GLuint texture_id)
++{
++	struct pspgl_teximg *timg;
++	unsigned i;
++	unsigned bytes = 0;
++	unsigned width = 0;
++	unsigned height = 0;
++	unsigned hwformat = 0;
++	unsigned old_domain = PSPGL_BUFFER_MAIN;
++	const void *new_address = NULL;
++
++	if (!__pspgl_th08_ge4_active() ||
++	    !__pspgl_th08_ge4_static_hint())
++		return GL_FALSE;
++	if (tobj == NULL || tobj != pspgl_curctx->texture.bound)
++		return GL_FALSE;
++	for (i = 1; i < MIPMAP_LEVELS; i++)
++		if (tobj->images[i] != NULL)
++			goto fallback;
++	timg = tobj->images[0];
++	if (timg == NULL || timg->image == NULL)
++		goto fallback;
++	bytes = timg->image->size;
++	width = timg->width;
++	height = timg->height;
++	hwformat = timg->texfmt != NULL ? timg->texfmt->hwformat : 0;
++	old_domain = timg->image->domain;
++	if (__pspgl_buffer_is_upper(timg->image))
++		return GL_TRUE;
++	if (bytes == 0 || bytes > 2u * 1024u * 1024u ||
++	    !replace_image_buffer_with_ge_copy(tobj, 0,
++					       PSPGL_TH08_UPPER_STATIC))
++		goto fallback;
++
++	new_address = timg->image->base;
++	if (th08_psp_ge4_note_promotion != NULL)
++		th08_psp_ge4_note_promotion(bytes, 1, texture_id, width, height,
++					      hwformat, old_domain, new_address);
++	return GL_TRUE;
++
++fallback:
++	if (th08_psp_ge4_note_promotion != NULL)
++		th08_psp_ge4_note_promotion(bytes, 0, texture_id, width, height,
++					      hwformat, old_domain, NULL);
++	return GL_FALSE;
++}
++
++GLboolean __pspgl_texobj_demote_image_for_cpu(struct pspgl_texobj *tobj,
++					       unsigned level)
++{
++	struct pspgl_teximg *timg;
++
++	if (tobj == NULL || level >= MIPMAP_LEVELS)
++		return GL_FALSE;
++	timg = tobj->images[level];
++	if (timg == NULL || timg->image == NULL)
++		return GL_FALSE;
++	if (!__pspgl_buffer_is_upper(timg->image))
++		return GL_TRUE;
++	return replace_image_buffer_with_ge_copy(tobj, level,
++						  GL_DYNAMIC_DRAW_ARB);
++}
++
+ struct pspgl_texobj *__pspgl_texobj_new(GLuint id, GLenum target)
+ {
+ 	struct pspgl_texobj *tobj = malloc(sizeof(*tobj));
+@@ -440,7 +573,7 @@ struct pspgl_teximg *__pspgl_teximg_new(const void *pixels, const struct pixelst
+ 		    ((pixels - NULL) + srcsize) > buffer->data->size)
+ 			goto out_error;
+ 
+-		if (texfmt->flags & TF_NATIVE) {
++		if ((texfmt->flags & TF_NATIVE) && !__pspgl_th08_ge4_active()) {
+ 			/* They provided the texture in a buffer in
+ 			   native format; use it directly */
+ 			timg->image = buffer->data;
+@@ -453,7 +586,15 @@ struct pspgl_teximg *__pspgl_teximg_new(const void *pixels, const struct pixelst
+ 	if (timg->image == NULL && size > 0) {
+ 		const void *src;
+ 
+-		timg->image = __pspgl_buffer_new(size, GL_STATIC_DRAW_ARB);
++		/* With GE4 active, mutable/NULL-backed textures stay in Main RAM.
++		 * Only a caller-held immutable-upload hint may use lower eDRAM as
++		 * staging before explicit promotion to the upper shelf.  Inactive
++		 * builds retain upstream PSPGL's exact allocation policy. */
++		GLenum usage = GL_STATIC_DRAW_ARB;
++		if (__pspgl_th08_ge4_active() &&
++		    !__pspgl_th08_ge4_static_hint())
++			usage = GL_DYNAMIC_DRAW_ARB;
++		timg->image = __pspgl_buffer_new(size, usage);
+ 
+ 		error = GL_OUT_OF_MEMORY;
+ 		if (timg->image == NULL)
+diff --git a/pspgl_texobj.h b/pspgl_texobj.h
+index 5248de9..0bb7788 100644
+--- a/pspgl_texobj.h
++++ b/pspgl_texobj.h
+@@ -74,6 +74,10 @@ struct pspgl_teximg *__pspgl_teximg_from_buffer(struct pspgl_buffer *buffer, uns
+ extern void __pspgl_teximg_free(struct pspgl_teximg *timg);
+ 
+ extern void __pspgl_update_texenv(struct pspgl_texobj *tobj);
++extern GLboolean __pspgl_texobj_promote_upper(struct pspgl_texobj *tobj,
++					       GLuint texture_id);
++extern GLboolean __pspgl_texobj_demote_image_for_cpu(struct pspgl_texobj *tobj,
++						      unsigned level);
+ 
+ extern const struct pspgl_texfmt *__pspgl_hardware_format(const struct pspgl_texfmt *, GLenum format, GLenum type);
+ 
+@@ -130,4 +134,3 @@ static inline unsigned unswizzle(unsigned offset, unsigned log2_w)
+ 
+ 
+ #endif
+-
+diff --git a/pspgl_vidmem.c b/pspgl_vidmem.c
+index 225e97a..c399173 100644
+--- a/pspgl_vidmem.c
++++ b/pspgl_vidmem.c
+@@ -1,4 +1,5 @@
+ #include <psptypes.h>
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <pspdisplay.h>
+@@ -14,10 +15,36 @@ struct pspgl_context *__pspgl_curctx = NULL;
+ static struct pspgl_buffer **vidmem_map = NULL;
+ static unsigned long vidmem_map_len = 0, vidmem_map_size = 0;
+ static size_t vidmem_used = 0;
++static size_t vidmem_lower_used = 0;
++static size_t vidmem_upper_used = 0;
++
++#define TH08_PSPGL_LOWER_EDRAM_BYTES (2u * 1024u * 1024u)
++#define TH08_PSPGL_UPPER_EDRAM_BYTES (2u * 1024u * 1024u)
++
++static int upper_candidate_is_owned(uintptr_t address, unsigned size,
++				    unsigned total_free,
++				    unsigned largest_gap)
++{
++	/* GetSize==4 is not an ownership proof: the process bridge must also
++	 * accept this complete candidate as part of its independent upper shelf.
++	 * A missing/rejecting weak hook leaves the ordinary allocator untouched and
++	 * makes this private upper request fall back without any GE/CPU access. */
++	if (th08_psp_ge4_is_upper_range != NULL &&
++	    th08_psp_ge4_is_upper_range((const void *)address, size))
++		return 1;
++	if (th08_psp_ge4_note_upper_alloc_failure != NULL)
++		th08_psp_ge4_note_upper_alloc_failure(0, size, total_free,
++					       largest_gap);
++	return 0;
++}
+ 
+ size_t __pspgl_vidmem_avail(void)
+ {
+-	return sceGeEdramGetSize() - vidmem_used;
++	size_t lower_capacity = sceGeEdramGetSize();
++	if (lower_capacity > TH08_PSPGL_LOWER_EDRAM_BYTES)
++		lower_capacity = TH08_PSPGL_LOWER_EDRAM_BYTES;
++	return vidmem_lower_used < lower_capacity
++		? lower_capacity - vidmem_lower_used : 0;
+ }
+ 
+ static int vidmem_map_insert_new (unsigned long idx, struct pspgl_buffer *buf)
+@@ -25,17 +52,19 @@ static int vidmem_map_insert_new (unsigned long idx, struct pspgl_buffer *buf)
+ 	/* grow map if necessary */
+ 	if ((vidmem_map_len+1) > vidmem_map_size) {
+ 		void *tmp;
++		unsigned long new_map_size;
+ 
+ 		if (vidmem_map_size == 0)
+-			vidmem_map_size = 4;
++			new_map_size = 4;
+ 		else
+-			vidmem_map_size *= 2;
++			new_map_size = vidmem_map_size * 2;
+ 
+-		tmp = realloc(vidmem_map, vidmem_map_size * sizeof(vidmem_map[0]));
++		tmp = realloc(vidmem_map, new_map_size * sizeof(vidmem_map[0]));
+ 
+ 		if (!tmp)
+ 			return 0;
+ 		vidmem_map = tmp;
++		vidmem_map_size = new_map_size;
+ 	}
+ 
+ 	psp_log("alloc vidmem %lu: adr %08p - size 0x%08x\n",
+@@ -46,6 +75,22 @@ static int vidmem_map_insert_new (unsigned long idx, struct pspgl_buffer *buf)
+ 	vidmem_map_len++;
+ 	vidmem_map[idx] = buf;
+ 	vidmem_used += buf->size;
++	if (buf->domain == PSPGL_BUFFER_EDRAM_UPPER) {
++		vidmem_upper_used += buf->size;
++		if (th08_psp_ge4_note_upper_alloc != NULL)
++			th08_psp_ge4_note_upper_alloc(buf->base, buf->size);
++	} else {
++		assert(buf->domain == PSPGL_BUFFER_EDRAM_LOWER);
++		vidmem_lower_used += buf->size;
++	}
++	assert(vidmem_lower_used <= TH08_PSPGL_LOWER_EDRAM_BYTES);
++	assert(vidmem_upper_used <= TH08_PSPGL_UPPER_EDRAM_BYTES);
++	for (unsigned long check = 1; check < vidmem_map_len; check++) {
++		uintptr_t previous_end =
++			(uintptr_t)vidmem_map[check - 1]->base +
++			vidmem_map[check - 1]->size;
++		assert(previous_end <= (uintptr_t)vidmem_map[check]->base);
++	}
+ 
+ 	return 1;
+ }
+@@ -53,45 +98,133 @@ static int vidmem_map_insert_new (unsigned long idx, struct pspgl_buffer *buf)
+ 
+ int __pspgl_vidmem_alloc (struct pspgl_buffer *buf)
+ {
+-	void *start = sceGeEdramGetAddr();
+-	void *adr = start;
++	uintptr_t start = (uintptr_t)sceGeEdramGetAddr();
++	uintptr_t end = start + sceGeEdramGetSize();
++	uintptr_t adr = start;
+ 	unsigned long i;
+ 	unsigned size;
++	if (end > start + TH08_PSPGL_LOWER_EDRAM_BYTES)
++		end = start + TH08_PSPGL_LOWER_EDRAM_BYTES;
+ 
+ 	/* make sure eveything is usefully aligned */
+ 	size = ROUNDUP(buf->size, CACHELINE_SIZE);
+ 
+ 	for(i = 0; i < vidmem_map_len; i++) {
+-		void *new_adr = vidmem_map[i]->base;
++		uintptr_t new_adr = (uintptr_t)vidmem_map[i]->base;
++		if (new_adr >= end)
++			break;
+ 
+ 		if ((adr+size) <= new_adr) {
+-			buf->base = adr;
++			buf->base = (void *)adr;
+ 			buf->size = size;
++			buf->domain = PSPGL_BUFFER_EDRAM_LOWER;
+ 			return vidmem_map_insert_new(i, buf);
+ 		}
+ 
+ 		adr = new_adr + vidmem_map[i]->size;
+ 	}
+ 
+-	if ((adr + size) > (start + sceGeEdramGetSize())) {
++	if ((adr + size) > end) {
+ 		psp_log("vidmem alloc failed for %d bytes, %d avail\n",
+ 			size, __pspgl_vidmem_avail());
+ 		return 0;
+ 	}
+ 
+-	buf->base = adr;
++	buf->base = (void *)adr;
++	buf->size = size;
++	buf->domain = PSPGL_BUFFER_EDRAM_LOWER;
++	return vidmem_map_insert_new(i, buf);
++}
++
++int __pspgl_vidmem_alloc_upper (struct pspgl_buffer *buf)
++{
++	uintptr_t edram = (uintptr_t)sceGeEdramGetAddr();
++	uintptr_t start = edram + TH08_PSPGL_LOWER_EDRAM_BYTES;
++	uintptr_t end = start + TH08_PSPGL_UPPER_EDRAM_BYTES;
++	uintptr_t adr = start;
++	unsigned long i;
++	unsigned size = ROUNDUP(buf->size, CACHELINE_SIZE);
++	unsigned largest_gap = 0;
++	unsigned total_free = vidmem_upper_used < TH08_PSPGL_UPPER_EDRAM_BYTES
++		? TH08_PSPGL_UPPER_EDRAM_BYTES - vidmem_upper_used : 0;
++	int inserted;
++
++	if (!__pspgl_th08_ge4_active() ||
++	    sceGeEdramGetSize() != TH08_PSPGL_LOWER_EDRAM_BYTES +
++				      TH08_PSPGL_UPPER_EDRAM_BYTES) {
++		if (th08_psp_ge4_note_upper_alloc_failure != NULL)
++			th08_psp_ge4_note_upper_alloc_failure(0, size, 0, 0);
++		return 0;
++	}
++
++	for (i = 0; i < vidmem_map_len; i++) {
++		uintptr_t new_adr = (uintptr_t)vidmem_map[i]->base;
++		uintptr_t new_end = new_adr + vidmem_map[i]->size;
++		unsigned gap;
++
++		if (new_end <= start)
++			continue;
++		if (new_adr >= end)
++			break;
++		gap = new_adr > adr ? (unsigned)(new_adr - adr) : 0;
++		if (gap > largest_gap)
++			largest_gap = gap;
++		if ((adr + size) <= new_adr) {
++			if (!upper_candidate_is_owned(adr, size, total_free,
++						      largest_gap))
++				return 0;
++			buf->base = (void *)adr;
++			buf->size = size;
++			buf->domain = PSPGL_BUFFER_EDRAM_UPPER;
++			inserted = vidmem_map_insert_new(i, buf);
++			if (!inserted) {
++				buf->domain = PSPGL_BUFFER_MAIN;
++				if (th08_psp_ge4_note_upper_alloc_failure != NULL)
++					th08_psp_ge4_note_upper_alloc_failure(
++						3, size, total_free, largest_gap);
++			}
++			return inserted;
++		}
++		if (new_end > adr)
++			adr = new_end;
++	}
++
++	if (adr < end && (unsigned)(end - adr) > largest_gap)
++		largest_gap = (unsigned)(end - adr);
++	if ((adr + size) > end || total_free < size) {
++		if (th08_psp_ge4_note_upper_alloc_failure != NULL)
++			th08_psp_ge4_note_upper_alloc_failure(
++				total_free < size ? 1 : 2, size, total_free,
++				largest_gap);
++		return 0;
++	}
++
++	if (!upper_candidate_is_owned(adr, size, total_free, largest_gap))
++		return 0;
++	buf->base = (void *)adr;
+ 	buf->size = size;
+-	return vidmem_map_insert_new(vidmem_map_len, buf);
++	buf->domain = PSPGL_BUFFER_EDRAM_UPPER;
++	inserted = vidmem_map_insert_new(i, buf);
++	if (!inserted) {
++		buf->domain = PSPGL_BUFFER_MAIN;
++		assert(vidmem_lower_used <= TH08_PSPGL_LOWER_EDRAM_BYTES);
++		assert(vidmem_upper_used <= TH08_PSPGL_UPPER_EDRAM_BYTES);
++		if (th08_psp_ge4_note_upper_alloc_failure != NULL)
++			th08_psp_ge4_note_upper_alloc_failure(
++				3, size, total_free, largest_gap);
++	}
++	return inserted;
+ }
+ 
+ static int addr_cmp(const void *key, const void *b)
+ {
+-	const void *k = *(void **)key;
++	uintptr_t k = (uintptr_t)*(void **)key;
+ 	struct pspgl_buffer **kb = (struct pspgl_buffer **)b;
++	uintptr_t base = (uintptr_t)(*kb)->base;
+ 
+-	if (k < (*kb)->base)
++	if (k < base)
+ 		return -1;
+-	if (k == (*kb)->base)
++	if (k == base)
+ 		return 0;
+ 	return 1;
+ }
+@@ -105,6 +238,7 @@ void  __pspgl_vidmem_free (struct pspgl_buffer *buf)
+ 
+ 	if (chunk) {
+ 		int i = chunk - vidmem_map;
++		int upper = buf->domain == PSPGL_BUFFER_EDRAM_UPPER;
+ 		psp_log("free vidmem %d: adr 0x%08p - size 0x%08x\n", i,
+ 			buf->base, buf->size);
+ 			
+@@ -114,9 +248,23 @@ void  __pspgl_vidmem_free (struct pspgl_buffer *buf)
+ 
+ 		assert((vidmem_used - buf->size) < vidmem_used);
+ 		vidmem_used -= buf->size;
+-	} else
++		if (upper) {
++			assert(vidmem_upper_used >= buf->size);
++			vidmem_upper_used -= buf->size;
++			if (th08_psp_ge4_note_upper_free != NULL)
++				th08_psp_ge4_note_upper_free(buf->base, buf->size);
++		} else {
++			assert(vidmem_lower_used >= buf->size);
++			vidmem_lower_used -= buf->size;
++		}
++		buf->domain = PSPGL_BUFFER_MAIN;
++	} else {
+ 		__pspgl_log("%s: didn't find chunk for buf=%p base=%p\n",
+ 			    __FUNCTION__, buf, buf->base);
++		if (buf->domain == PSPGL_BUFFER_EDRAM_UPPER &&
++		    th08_psp_ge4_fail_closed != NULL)
++			th08_psp_ge4_fail_closed("pspgl-upper-free-map-miss");
++	}
+ }
+ 
+ 
+@@ -184,6 +332,7 @@ size_t __pspgl_vidmem_evict(struct pspgl_buffer *buf)
+ 	struct pspgl_buffer **chunk;
+ 	struct pspgl_buffer *standin;
+ 	void *t;
++	unsigned char domain;
+ 
+ 	chunk = bsearch(&buf->base, vidmem_map, vidmem_map_len, 
+ 			sizeof(*vidmem_map), addr_cmp);
+@@ -192,7 +341,8 @@ size_t __pspgl_vidmem_evict(struct pspgl_buffer *buf)
+ 		return 0;		/* presume already evicted */
+ 
+ 	/* Don't evict migrating, pinned or mapped things */
+-	if ((buf->flags & (BF_MIGRATING | BF_PINNED_FIXED)) || buf->mapped)
++	if (buf->domain == PSPGL_BUFFER_EDRAM_UPPER ||
++	    (buf->flags & (BF_MIGRATING | BF_PINNED_FIXED)) || buf->mapped)
+ 		return 0;
+ 
+ 	psp_log("evicting buffer %p (vidmem %p-%p)\n",
+@@ -210,6 +360,9 @@ size_t __pspgl_vidmem_evict(struct pspgl_buffer *buf)
+ 	t = buf->base;
+ 	buf->base = standin->base;
+ 	standin->base = t;
++	domain = buf->domain;
++	buf->domain = standin->domain;
++	standin->domain = domain;
+ 	*chunk = standin;
+ 
+ 	/* Prevent another attempt to evict this buffer */
+@@ -245,6 +398,15 @@ GLboolean __pspgl_vidmem_compact()
+ 	int nbufs = vidmem_map_len;
+ 	GLboolean needsync = GL_FALSE;
+ 
++	/* V1 keeps every GE4 allocation address-stable.  PSPGL's historical
++	 * compactor updates only the currently bound texture registers, so allowing
++	 * it while an upper tier exists could leave an unbound texture stale. */
++	if (__pspgl_th08_ge4_active()) {
++		if (th08_psp_ge4_note_allocator_block != NULL)
++			th08_psp_ge4_note_allocator_block(1);
++		return GL_FALSE;
++	}
++
+ 	bufs = malloc(sizeof(*bufs) * vidmem_map_len);
+ 	if (bufs == NULL)
+ 		return GL_FALSE;

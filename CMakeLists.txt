@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.20)
 
 project(th08-modern LANGUAGES CXX)
 
+option(TH08_REPLAY_SYNC_AUDIT
+    "Build the fixed-buffer replay synchronization sidecar audit" OFF)
+
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(TH08_PORTABLE_NATIVE_LAYOUT ON)
 elseif(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -61,6 +64,7 @@ set(TH08_GAME_SOURCES
     src/MusicRoom.cpp
     src/Player.cpp
     src/PlayerBomb.cpp
+    src/ReplaySyncAudit.cpp
     src/ReplayManager.cpp
     src/ResultScreen.cpp
     src/ScoreDat.cpp
@@ -99,6 +103,9 @@ target_compile_definitions(th08-modern PRIVATE
     TH08_MODERN_PORT
     WIN32_LEAN_AND_MEAN
 )
+if(TH08_REPLAY_SYNC_AUDIT)
+    target_compile_definitions(th08-modern PRIVATE TH08_REPLAY_SYNC_AUDIT=1)
+endif()
 if(TH08_PORTABLE_NATIVE_LAYOUT)
     target_compile_definitions(th08-modern PRIVATE TH08_PORTABLE_NATIVE_LAYOUT)
 endif()

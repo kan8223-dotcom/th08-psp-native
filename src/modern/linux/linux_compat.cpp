@@ -6,10 +6,28 @@
 #include <dinput.h>
 #include <dsound.h>
 
+#if defined(PSP)
+#include <kubridge.h>
+#include <pspctrl.h>
+
+#include "Th08FontCoverage.hpp"
+#include "audio_telemetry.hpp"
+#include "audio_cursor_audit.hpp"
+#include "boot_checkpoint.hpp"
+#include "cp932_compact.generated.hpp"
+#include "fileio.hpp"
+#include "font_glyph_cache_policy.hpp"
+#if defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+#include "io_activity_lamp.hpp"
+#endif
+#include "newlib_heap_geometry.hpp"
+#else
 #include <dlfcn.h>
+#include <fontconfig/fontconfig.h>
+#define TH08_PSP_BOOT_CHECKPOINT(phase, state, result) ((void)0)
+#endif
 #include <errno.h>
 #include <fcntl.h>
-#include <fontconfig/fontconfig.h>
 #include <glob.h>
 #include <iconv.h>
 #include <limits.h>
@@ -39,7 +57,16 @@ struct LinuxHandle
 struct FileHandle : LinuxHandle
 {
     explicit FileHandle(int value) : LinuxHandle(HANDLE_FILE), fd(value) {}
-    ~FileHandle() { if (fd >= 0) close(fd); }
+    ~FileHandle()
+    {
+        if (fd < 0)
+            return;
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+        th08::psp::IoActivityScope ioActivity(
+            th08::psp::IoActivityKind::Close);
+#endif
+        close(fd);
+    }
     int fd;
 };
 
@@ -109,10 +136,28 @@ struct GdiBitmap : GdiObject
 
 struct GdiFont : GdiObject
 {
+#if defined(PSP)
+    GdiFont()
+        : font(NULL), pointSize(0), style(TTF_STYLE_NORMAL), sharedRuntime(false)
+    {
+        kind = FONT;
+    }
+    GdiFont(TTF_Font *font_, int pointSize_, int style_)
+        : font(font_), pointSize(pointSize_), style(style_), sharedRuntime(font_ != NULL)
+    {
+        kind = FONT;
+    }
+    ~GdiFont() {}
+    TTF_Font *font;
+    int pointSize;
+    int style;
+    bool sharedRuntime;
+#else
     GdiFont() : font(NULL) { kind = FONT; }
     explicit GdiFont(TTF_Font *font_) : font(font_) { kind = FONT; }
     ~GdiFont() { if (font != NULL) TTF_CloseFont(font); }
     TTF_Font *font;
+#endif
 };
 
 struct GdiDc
@@ -124,6 +169,227 @@ struct GdiDc
     COLORREF color;
 };
 
+#if defined(PSP)
+#if !defined(TH08_PSP_LOCAL_FONT_SUBSET)
+#define TH08_PSP_LOCAL_FONT_SUBSET 0
+#endif
+#if !defined(TH08_PSP_FONT_GLYPH_CACHE_RETAIN)
+#define TH08_PSP_FONT_GLYPH_CACHE_RETAIN 0
+#endif
+
+// PSP text rendering is serialized on the game thread. Keep one file-backed
+// FreeType face alive from TextHelper startup through teardown so a late-stage
+// text row never has to reopen and reparse the 4.3 MiB Noto file in a
+// fragmented heap. GdiFont remains a lightweight Win32-compatible descriptor
+// for the requested point size and weight; it never owns this shared face.
+struct PspGdiTextRuntime
+{
+    TTF_Font *face;
+    int currentPointSize;
+    int currentStyle;
+    int hardwareModel;
+    unsigned int liveDescriptors;
+    bool ownsTtfInitialization;
+};
+
+PspGdiTextRuntime g_pspGdiText = {};
+
+constexpr size_t kExpectedStockFontCodepointCount = 1531u;
+constexpr size_t kExpectedNameEntryCodepointCount = 94u;
+static_assert(kTh08PspStockFontCodepointCount ==
+                  kExpectedStockFontCodepointCount,
+              "the local font profile must pin the audited 1531-codepoint stock union");
+static_assert(kTh08PspNameEntryCodepointCount ==
+                  kExpectedNameEntryCodepointCount,
+              "the local font profile must include the complete name-entry charset");
+static_assert(sizeof(kTh08PspStockFontCodepoints) /
+                      sizeof(kTh08PspStockFontCodepoints[0]) ==
+                  kExpectedStockFontCodepointCount,
+              "the local font coverage array and count must agree");
+
+struct PspFontCandidate
+{
+    const char *path;
+    const char *source;
+};
+
+struct PspFontCoverageResult
+{
+    size_t provided;
+    size_t missing;
+    Uint32 firstMissing;
+};
+
+Uint32 PspCp932Codepoint(Uint32 encodedValue, size_t byteCount);
+
+void LogPspFontHeap(const char *stage, const char *source)
+{
+    const th08::psp::NewlibHeapGeometrySnapshot heap =
+        th08::psp::CaptureNewlibHeapGeometry();
+    th08::psp::BootLog(
+        "FONT_HEAP stage=%s source=%s committed_arena=%lu committed_used=%lu "
+        "committed_free=%lu largest_free=%lu largest_nogrow=%lu top=%lu "
+        "chunks=%lu scan_valid=%lu scan_errors=%lu scan_flags=0x%08lx\n",
+        stage != NULL ? stage : "unknown", source != NULL ? source : "unknown",
+        static_cast<unsigned long>(heap.arenaBytes),
+        static_cast<unsigned long>(heap.usedBytes),
+        static_cast<unsigned long>(heap.freeBytes),
+        static_cast<unsigned long>(heap.largestFreeChunkBytes),
+        static_cast<unsigned long>(heap.largestNoGrowRequestBytes),
+        static_cast<unsigned long>(heap.topChunkBytes),
+        static_cast<unsigned long>(heap.freeChunkCount),
+        static_cast<unsigned long>(heap.scanValid),
+        static_cast<unsigned long>(heap.scanErrorCount),
+        static_cast<unsigned long>(heap.scanErrorFlags));
+}
+
+PspFontCoverageResult CheckPspFontCoverage(TTF_Font *font)
+{
+    PspFontCoverageResult result{};
+    if (font == NULL)
+    {
+        result.missing = kExpectedStockFontCodepointCount;
+        return result;
+    }
+
+    for (size_t index = 0; index < kExpectedStockFontCodepointCount; ++index)
+    {
+        const Uint32 codepoint = kTh08PspStockFontCodepoints[index];
+        if (TTF_GlyphIsProvided32(font, codepoint) != 0)
+        {
+            ++result.provided;
+        }
+        else
+        {
+            if (result.firstMissing == 0)
+                result.firstMissing = codepoint;
+            ++result.missing;
+        }
+    }
+
+    return result;
+}
+
+Uint32 PspCp932Codepoint(Uint32 encodedValue, size_t byteCount)
+{
+    const uint8_t input[2] = {
+        static_cast<uint8_t>(byteCount == 2u ? encodedValue >> 8 : encodedValue),
+        static_cast<uint8_t>(encodedValue & 0xffu),
+    };
+    const th08::cp932::DecodeResult result =
+        th08::cp932::DecodeOne(input, byteCount);
+    return result.status == th08::cp932::DecodeStatus::Valid &&
+                   result.consumed == byteCount
+               ? static_cast<Uint32>(result.codepoint)
+               : 0u;
+}
+
+bool PspSubsetAuthorityMatchesRuntimeConverter()
+{
+    const Uint32 backslash = PspCp932Codepoint(0x5cu, 1u);
+    const Uint32 tilde = PspCp932Codepoint(0x7eu, 1u);
+    const Uint32 waveDash = PspCp932Codepoint(0x8160u, 2u);
+    const Uint32 doubleVertical = PspCp932Codepoint(0x8161u, 2u);
+    const Uint32 fullwidthMinus = PspCp932Codepoint(0x817cu, 2u);
+    const Uint32 fullwidthCent = PspCp932Codepoint(0x8191u, 2u);
+    const Uint32 fullwidthPound = PspCp932Codepoint(0x8192u, 2u);
+    const Uint32 fullwidthNot = PspCp932Codepoint(0x81cau, 2u);
+    const bool compatible =
+        backslash == 0x005cu && tilde == 0x007eu &&
+        waveDash == 0xff5eu && doubleVertical == 0x2225u &&
+        fullwidthMinus == 0xff0du && fullwidthCent == 0xffe0u &&
+        fullwidthPound == 0xffe1u && fullwidthNot == 0xffe2u;
+    th08::psp::BootLog(
+        "FONT_AUTHORITY codepoints=%lu profile_sha256=%s build_gate=%d "
+        "decoder=python_cp932_v1 table_bytes=%lu "
+        "runtime_5c=U+%04lX runtime_7e=U+%04lX runtime_8160=U+%04lX "
+        "runtime_8161=U+%04lX runtime_817c=U+%04lX "
+        "runtime_8191=U+%04lX runtime_8192=U+%04lX "
+        "runtime_81ca=U+%04lX converter_match=%d subset_allowed=%d "
+        "main_ram_copy=0\n",
+        static_cast<unsigned long>(kExpectedStockFontCodepointCount),
+        kTh08PspStockFontProfileSha256, TH08_PSP_LOCAL_FONT_SUBSET,
+        static_cast<unsigned long>(sizeof(th08::cp932::kLeadRows) +
+                                   sizeof(th08::cp932::kDoubleByteCodepoints)),
+        static_cast<unsigned long>(backslash), static_cast<unsigned long>(tilde),
+        static_cast<unsigned long>(waveDash),
+        static_cast<unsigned long>(doubleVertical),
+        static_cast<unsigned long>(fullwidthMinus),
+        static_cast<unsigned long>(fullwidthCent),
+        static_cast<unsigned long>(fullwidthPound),
+        static_cast<unsigned long>(fullwidthNot),
+        compatible ? 1 : 0,
+        (TH08_PSP_LOCAL_FONT_SUBSET != 0 && compatible) ? 1 : 0);
+    return compatible;
+}
+
+TTF_Font *OpenCoverageCheckedPspFont(const PspFontCandidate &candidate)
+{
+    struct stat fileStatus{};
+    const bool statOk = candidate.path != NULL && stat(candidate.path, &fileStatus) == 0;
+    const unsigned long long fileBytes =
+        statOk && fileStatus.st_size >= 0
+            ? static_cast<unsigned long long>(fileStatus.st_size)
+            : 0ULL;
+
+    if (candidate.path == NULL || access(candidate.path, R_OK) != 0)
+    {
+        th08::psp::BootLog(
+            "FONT candidate source=%s face=0 path=%s bytes=%llu stat_ok=%d "
+            "result=absent coverage=0/%lu missing=%lu first_missing=n/a "
+            "main_ram_copy=0\n",
+            candidate.source != NULL ? candidate.source : "unknown",
+            candidate.path != NULL ? candidate.path : "(null)", fileBytes,
+            statOk ? 1 : 0,
+            static_cast<unsigned long>(kExpectedStockFontCodepointCount),
+            static_cast<unsigned long>(kExpectedStockFontCodepointCount));
+        return NULL;
+    }
+
+    LogPspFontHeap("before_open", candidate.source);
+    TTF_Font *font = TTF_OpenFont(candidate.path, 10);
+    LogPspFontHeap("after_open", candidate.source);
+    if (font == NULL)
+    {
+        th08::psp::BootLog(
+            "FONT candidate source=%s face=0 path=%s bytes=%llu stat_ok=%d "
+            "result=open_fail coverage=0/%lu missing=%lu first_missing=n/a "
+            "main_ram_copy=0 error=%s\n",
+            candidate.source, candidate.path, fileBytes, statOk ? 1 : 0,
+            static_cast<unsigned long>(kExpectedStockFontCodepointCount),
+            static_cast<unsigned long>(kExpectedStockFontCodepointCount),
+            TTF_GetError());
+        return NULL;
+    }
+
+    const PspFontCoverageResult coverage = CheckPspFontCoverage(font);
+    LogPspFontHeap("after_coverage", candidate.source);
+    if (coverage.missing != 0)
+    {
+        th08::psp::BootLog(
+            "FONT candidate source=%s face=0 path=%s bytes=%llu stat_ok=%d "
+            "result=reject coverage=%lu/%lu missing=%lu first_missing=U+%04lX "
+            "main_ram_copy=0\n",
+            candidate.source, candidate.path, fileBytes, statOk ? 1 : 0,
+            static_cast<unsigned long>(coverage.provided),
+            static_cast<unsigned long>(kExpectedStockFontCodepointCount),
+            static_cast<unsigned long>(coverage.missing),
+            static_cast<unsigned long>(coverage.firstMissing));
+        TTF_CloseFont(font);
+        LogPspFontHeap("after_reject_close", candidate.source);
+        return NULL;
+    }
+
+    th08::psp::BootLog(
+        "FONT selected source=%s face=0 path=%s bytes=%llu stat_ok=%d "
+        "coverage=%lu/%lu missing=0 first_missing=none main_ram_copy=0\n",
+        candidate.source, candidate.path, fileBytes, statOk ? 1 : 0,
+        static_cast<unsigned long>(coverage.provided),
+        static_cast<unsigned long>(kExpectedStockFontCodepointCount));
+    return font;
+}
+#endif
+
 DWORD g_lastError;
 WNDPROC g_windowProcedure;
 SDL_Window *g_window;
@@ -132,6 +398,12 @@ pthread_mutex_t g_messageMutex = PTHREAD_MUTEX_INITIALIZER;
 
 std::string ExecutableSiblingPath(const char *filename)
 {
+#if defined(PSP)
+    const char *directory = th08::psp::GameDirectory();
+    if (directory == NULL || filename == NULL)
+        return std::string();
+    return std::string(directory) + "/" + filename;
+#else
     char path[PATH_MAX + 1];
     ssize_t count = readlink("/proc/self/exe", path, PATH_MAX);
     if (count <= 0 || count > PATH_MAX)
@@ -142,7 +414,49 @@ std::string ExecutableSiblingPath(const char *filename)
         return std::string();
     separator[1] = '\0';
     return std::string(path) + filename;
+#endif
 }
+
+#if defined(PSP)
+bool EqualAsciiIgnoreCase(const char *left, const char *right)
+{
+    if (left == NULL || right == NULL)
+        return false;
+    while (*left != '\0' && *right != '\0')
+    {
+        char a = *left++;
+        char b = *right++;
+        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+        if (a != b)
+            return false;
+    }
+    return *left == *right;
+}
+
+// Writable state deliberately remains relative to the EBOOT directory.  Only
+// the two immutable retail archives may live in the separately discovered
+// data directory, so resolve exactly those simple relative names.
+std::string ResolvePspArchivePath(const char *path)
+{
+    if (path == NULL)
+        return std::string();
+
+    const char *name = path;
+    while (name[0] == '.' && (name[1] == '/' || name[1] == '\\'))
+        name += 2;
+    if (strchr(name, '/') != NULL || strchr(name, '\\') != NULL ||
+        strchr(name, ':') != NULL ||
+        (!EqualAsciiIgnoreCase(name, "th08.dat") &&
+         !EqualAsciiIgnoreCase(name, "thbgm.dat")))
+        return std::string(path);
+
+    const char *dataDirectory = th08::psp::DataDirectory();
+    if (dataDirectory == NULL || dataDirectory[0] == '\0')
+        return std::string(path);
+    return std::string(dataDirectory) + "/" + name;
+}
+#endif
 
 void SetApplicationIcon(SDL_Window *window)
 {
@@ -160,14 +474,89 @@ void SetApplicationIcon(SDL_Window *window)
 
 DWORD CurrentThreadIdImpl()
 {
+#if defined(PSP)
+    return static_cast<DWORD>(reinterpret_cast<uintptr_t>(pthread_self()));
+#else
     return static_cast<DWORD>(pthread_self());
+#endif
 }
 
-std::string ConvertCp932ToUtf8(const char *text, size_t length)
+std::string ConvertCp932ToUtf8(const char *text, size_t length,
+                               bool *conversionValid)
 {
-    if (text == NULL || length == 0) return std::string();
+    if (conversionValid != NULL)
+        *conversionValid = true;
+    if (text == NULL || length == 0)
+        return std::string();
+#if defined(PSP)
+    // newlib's PSP iconv build only links its basic Unicode/Latin tables;
+    // CP932 requires external NLS files that do not exist on a Memory Stick.
+    // Decode through the generated Windows-31J table used by the stock-font
+    // authority. Keep the explicit length because TextOutA strings are not
+    // required to be NUL terminated. Invalid/truncated input fails visibly;
+    // silently skipping a byte could select the wrong glyph from a subset.
+    std::string output;
+    output.reserve(length * 3);
+    size_t inputIndex = 0;
+    while (inputIndex < length)
+    {
+        const uint8_t *input =
+            reinterpret_cast<const uint8_t *>(text) + inputIndex;
+        const th08::cp932::DecodeResult decoded =
+            th08::cp932::DecodeOne(input, length - inputIndex);
+        if (decoded.status != th08::cp932::DecodeStatus::Valid ||
+            decoded.consumed == 0u)
+        {
+            if (conversionValid != NULL)
+                *conversionValid = false;
+            static bool loggedDecodeFailure = false;
+            if (!loggedDecodeFailure)
+            {
+                const unsigned long byte1 =
+                    inputIndex + 1u < length
+                        ? static_cast<unsigned long>(input[1])
+                        : 0x100ul;
+                th08::psp::BootLog(
+                    "FONT CP932 decode_error offset=%lu remaining=%lu "
+                    "status=%u byte0=0x%02lX byte1=%s0x%02lX\n",
+                    static_cast<unsigned long>(inputIndex),
+                    static_cast<unsigned long>(length - inputIndex),
+                    static_cast<unsigned int>(decoded.status),
+                    static_cast<unsigned long>(input[0]),
+                    byte1 == 0x100ul ? "absent/" : "",
+                    byte1 == 0x100ul ? 0ul : byte1);
+                loggedDecodeFailure = true;
+            }
+            return std::string();
+        }
+        inputIndex += decoded.consumed;
+
+        const uint32_t unicode = decoded.codepoint;
+        if (unicode < 0x80)
+        {
+            output.push_back(static_cast<char>(unicode));
+        }
+        else if (unicode < 0x800)
+        {
+            output.push_back(static_cast<char>(0xc0 | (unicode >> 6)));
+            output.push_back(static_cast<char>(0x80 | (unicode & 0x3f)));
+        }
+        else
+        {
+            output.push_back(static_cast<char>(0xe0 | (unicode >> 12)));
+            output.push_back(static_cast<char>(0x80 | ((unicode & 0x0fff) >> 6)));
+            output.push_back(static_cast<char>(0x80 | (unicode & 0x3f)));
+        }
+    }
+    return output;
+#else
     iconv_t converter = iconv_open("UTF-8", "CP932");
-    if (converter == reinterpret_cast<iconv_t>(-1)) return std::string(text, length);
+    if (converter == reinterpret_cast<iconv_t>(-1))
+    {
+        if (conversionValid != NULL)
+            *conversionValid = false;
+        return std::string(text, length);
+    }
 
     std::vector<char> output(length * 4 + 8, 0);
     char *input = const_cast<char *>(text);
@@ -177,12 +566,16 @@ std::string ConvertCp932ToUtf8(const char *text, size_t length)
     if (iconv(converter, &input, &inputLeft, &destination, &outputLeft) == static_cast<size_t>(-1))
     {
         iconv_close(converter);
+        if (conversionValid != NULL)
+            *conversionValid = false;
         return std::string(text, length);
     }
     iconv_close(converter);
     return std::string(&output[0], destination - &output[0]);
+#endif
 }
 
+#if !defined(PSP)
 const char *ResolveJapaneseFont()
 {
     static std::string path;
@@ -215,6 +608,202 @@ const char *ResolveJapaneseFont()
     FcPatternDestroy(match);
     return path.empty() ? NULL : path.c_str();
 }
+#endif
+
+#if defined(PSP)
+bool InitializePspGdiText()
+{
+    if (g_pspGdiText.face != NULL)
+        return true;
+    if (g_pspGdiText.liveDescriptors != 0)
+    {
+        fprintf(stderr, "TH08PSP FONT init rejected live_descriptors=%u\n",
+                g_pspGdiText.liveDescriptors);
+        return false;
+    }
+
+    const bool ownsTtfInitialization = TTF_WasInit() == 0;
+    if (ownsTtfInitialization && TTF_Init() != 0)
+    {
+        fprintf(stderr, "TH08PSP FONT SDL_ttf initialization failed: %s\n",
+                TTF_GetError());
+        return false;
+    }
+
+    const bool converterMatchesAuthority =
+        PspSubsetAuthorityMatchesRuntimeConverter();
+    TTF_Font *face = NULL;
+
+    // An explicit developer override retains highest priority, but it now
+    // obeys the same complete stock-coverage contract as every default face.
+    // A rejected override safely falls through instead of reaching gameplay
+    // with a latent missing-glyph failure.
+    const char *overridePath = getenv("TH08_FONT");
+    if (overridePath != NULL && overridePath[0] != '\0' &&
+        access(overridePath, R_OK) == 0)
+    {
+        const PspFontCandidate overrideCandidate = {overridePath, "override"};
+        face = OpenCoverageCheckedPspFont(overrideCandidate);
+    }
+
+#if TH08_PSP_LOCAL_FONT_SUBSET
+    if (face == NULL && converterMatchesAuthority)
+    {
+        const std::string path = ExecutableSiblingPath("msgothic-subset.ttf");
+        const PspFontCandidate candidate = {path.c_str(), "subset"};
+        face = OpenCoverageCheckedPspFont(candidate);
+    }
+#else
+    (void)converterMatchesAuthority;
+#endif
+
+    if (face == NULL)
+    {
+        const std::string path = ExecutableSiblingPath("msgothic.ttc");
+        const PspFontCandidate candidate = {path.c_str(), "msgothic"};
+        face = OpenCoverageCheckedPspFont(candidate);
+    }
+    if (face == NULL && converterMatchesAuthority)
+    {
+        // Redistributable OFL fallback generated from the same 1,531-scalar
+        // authority. Its primary names deliberately avoid the upstream
+        // Reserved Font Name; coverage is still verified at runtime before
+        // the face can become the shared text owner.
+        const std::string path =
+            ExecutableSiblingPath("TH08PspSubsetSansJP-Regular.otf");
+        const PspFontCandidate candidate = {path.c_str(), "ofl_subset"};
+        face = OpenCoverageCheckedPspFont(candidate);
+    }
+    if (face == NULL)
+    {
+        const std::string path = ExecutableSiblingPath("NotoSansJP-Regular.ttf");
+        const PspFontCandidate candidate = {path.c_str(), "noto"};
+        face = OpenCoverageCheckedPspFont(candidate);
+    }
+
+    if (face == NULL)
+    {
+        fprintf(stderr, "TH08PSP FONT no complete coverage candidate: %s\n",
+                TTF_GetError());
+        th08::psp::BootLog(
+            "FONT selected source=none result=failed coverage=0/%lu "
+            "main_ram_copy=0\n",
+            static_cast<unsigned long>(kExpectedStockFontCodepointCount));
+        if (ownsTtfInitialization)
+            TTF_Quit();
+        return false;
+    }
+
+    TTF_SetFontStyle(face, TTF_STYLE_NORMAL);
+    TTF_SetFontHinting(face, TTF_HINTING_LIGHT);
+#if TH08_PSP_FONT_GLYPH_CACHE_RETAIN
+    const int hardwareModel = kuKernelGetModel();
+#else
+    // Do not add a model-query dependency to the established OFF path.
+    const int hardwareModel = -1;
+#endif
+    g_pspGdiText.face = face;
+    g_pspGdiText.currentPointSize = 10;
+    g_pspGdiText.currentStyle = TTF_STYLE_NORMAL;
+    g_pspGdiText.hardwareModel = hardwareModel;
+    g_pspGdiText.liveDescriptors = 0;
+    g_pspGdiText.ownsTtfInitialization = ownsTtfInitialization;
+    th08::psp::BootLog(
+        "FONT shared_face=file ready=1 coverage_required=%lu main_ram_copy=0\n",
+        static_cast<unsigned long>(kExpectedStockFontCodepointCount));
+    th08::psp::BootLog(
+        "FONT glyph_cache_retain feature=%d model=%d eligible=%d\n",
+        TH08_PSP_FONT_GLYPH_CACHE_RETAIN != 0 ? 1 : 0, hardwareModel,
+        TH08_PSP_FONT_GLYPH_CACHE_RETAIN != 0 &&
+                th08::psp::IsPspFontGlyphCacheRetainModel(hardwareModel)
+            ? 1
+            : 0);
+    return true;
+}
+
+bool ConfigurePspGdiFont(GdiFont *font)
+{
+    if (font == NULL || !font->sharedRuntime || font->font == NULL ||
+        font->font != g_pspGdiText.face || font->pointSize <= 0)
+        return false;
+
+    if (g_pspGdiText.currentPointSize != font->pointSize)
+    {
+        if (TTF_SetFontSize(g_pspGdiText.face, font->pointSize) != 0)
+        {
+            fprintf(stderr, "TH08PSP FONT size failed point=%d: %s\n",
+                    font->pointSize, TTF_GetError());
+            return false;
+        }
+        g_pspGdiText.currentPointSize = font->pointSize;
+    }
+    if (g_pspGdiText.currentStyle != font->style)
+    {
+        // Always restore NORMAL explicitly after a bold descriptor. Otherwise
+        // the shared face would leak the prior row's weight into later text.
+        TTF_SetFontStyle(g_pspGdiText.face, font->style);
+        g_pspGdiText.currentStyle = font->style;
+    }
+    return true;
+}
+
+void ReleasePspGdiFontDescriptor(GdiFont *font)
+{
+    if (font == NULL || !font->sharedRuntime)
+        return;
+
+    if (font->font != g_pspGdiText.face || g_pspGdiText.liveDescriptors == 0)
+    {
+        fprintf(stderr, "TH08PSP FONT descriptor ownership mismatch\n");
+        font->font = NULL;
+        font->sharedRuntime = false;
+        return;
+    }
+
+    const bool retainGlyphCache = th08::psp::ShouldRetainPspFontGlyphCache(
+        TH08_PSP_FONT_GLYPH_CACHE_RETAIN != 0,
+        g_pspGdiText.hardwareModel, g_pspGdiText.face,
+        g_pspGdiText.currentPointSize, font->font, font->pointSize);
+    --g_pspGdiText.liveDescriptors;
+    font->font = NULL;
+    font->sharedRuntime = false;
+
+    if (g_pspGdiText.liveDescriptors == 0 && g_pspGdiText.face != NULL &&
+        g_pspGdiText.currentPointSize > 0 && !retainGlyphCache)
+    {
+        // TH07 proved this same-size call as a deterministic glyph-cache
+        // flush. The default-OFF path and PSP-1000 retain it once after the
+        // complete outline/main-text group, never between its five TextOutA
+        // passes. Slim+/Go may skip it only for the exact same face and size.
+        if (TTF_SetFontSize(g_pspGdiText.face, g_pspGdiText.currentPointSize) != 0)
+        {
+            fprintf(stderr, "TH08PSP FONT glyph flush failed point=%d: %s\n",
+                    g_pspGdiText.currentPointSize, TTF_GetError());
+        }
+    }
+}
+
+void ShutdownPspGdiText()
+{
+    if (g_pspGdiText.face == NULL)
+        return;
+    if (g_pspGdiText.liveDescriptors != 0)
+    {
+        // A leak is preferable to closing a face still borrowed by a GDI
+        // descriptor. Normal TextHelper teardown reaches this with zero.
+        fprintf(stderr, "TH08PSP FONT shutdown deferred live_descriptors=%u\n",
+                g_pspGdiText.liveDescriptors);
+        return;
+    }
+
+    TTF_CloseFont(g_pspGdiText.face);
+    g_pspGdiText.face = NULL;
+    if (g_pspGdiText.ownsTtfInitialization)
+        TTF_Quit();
+    g_pspGdiText = {};
+    th08::psp::BootLog("FONT shared_face=file released=1\n");
+}
+#endif
 
 void PutGdiTextPixel(GdiBitmap *bitmap, int x, int y, COLORREF color, BYTE coverage)
 {
@@ -263,6 +852,10 @@ bool FillFindData(FindHandle *handle, WIN32_FIND_DATAA *data)
     const char *name = strrchr(path.c_str(), '/');
     strncpy(data->cFileName, name != NULL ? name + 1 : path.c_str(), MAX_PATH - 1);
     struct stat info;
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    th08::psp::IoActivityScope ioActivity(
+        th08::psp::IoActivityKind::Metadata, path.c_str());
+#endif
     if (stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode))
         data->dwFileAttributes |= FILE_ATTRIBUTE_DIRECTORY;
     return true;
@@ -298,6 +891,43 @@ void PumpSdlEvents(MSG *message, bool *hasMessage)
 void FillKeyboard(BYTE *state, bool directInput)
 {
     memset(state, 0, 256);
+#if defined(PSP)
+    SceCtrlData pad;
+    memset(&pad, 0, sizeof(pad));
+    if (sceCtrlPeekBufferPositive(&pad, 1) <= 0)
+        return;
+
+    const bool up = (pad.Buttons & PSP_CTRL_UP) != 0 || pad.Ly < 64;
+    const bool down = (pad.Buttons & PSP_CTRL_DOWN) != 0 || pad.Ly > 192;
+    const bool left = (pad.Buttons & PSP_CTRL_LEFT) != 0 || pad.Lx < 64;
+    const bool right = (pad.Buttons & PSP_CTRL_RIGHT) != 0 || pad.Lx > 192;
+    const bool shoot = (pad.Buttons & PSP_CTRL_CROSS) != 0;
+    const bool bomb = (pad.Buttons & PSP_CTRL_CIRCLE) != 0;
+    const bool focus = (pad.Buttons & (PSP_CTRL_SQUARE | PSP_CTRL_LTRIGGER |
+                                      PSP_CTRL_RTRIGGER)) != 0;
+    const bool skip = (pad.Buttons & PSP_CTRL_TRIANGLE) != 0;
+    const bool menu = (pad.Buttons & PSP_CTRL_START) != 0;
+
+#define MAP_PSP_KEY(key, pressed) state[(key)] = (pressed) ? 0x80 : 0
+    if (directInput)
+    {
+        MAP_PSP_KEY(DIK_UP, up); MAP_PSP_KEY(DIK_DOWN, down);
+        MAP_PSP_KEY(DIK_LEFT, left); MAP_PSP_KEY(DIK_RIGHT, right);
+        MAP_PSP_KEY(DIK_Z, shoot); MAP_PSP_KEY(DIK_RETURN, shoot);
+        MAP_PSP_KEY(DIK_X, bomb); MAP_PSP_KEY(DIK_LSHIFT, focus);
+        MAP_PSP_KEY(DIK_RSHIFT, focus); MAP_PSP_KEY(DIK_LCONTROL, skip);
+        MAP_PSP_KEY(DIK_ESCAPE, menu);
+    }
+    else
+    {
+        MAP_PSP_KEY(VK_UP, up); MAP_PSP_KEY(VK_DOWN, down);
+        MAP_PSP_KEY(VK_LEFT, left); MAP_PSP_KEY(VK_RIGHT, right);
+        MAP_PSP_KEY('Z', shoot); MAP_PSP_KEY(VK_RETURN, shoot);
+        MAP_PSP_KEY('X', bomb); MAP_PSP_KEY(VK_SHIFT, focus);
+        MAP_PSP_KEY(VK_CONTROL, skip); MAP_PSP_KEY(VK_ESCAPE, menu);
+    }
+#undef MAP_PSP_KEY
+#else
     SDL_PumpEvents();
     const Uint8 *keys = SDL_GetKeyboardState(NULL);
 #define MAP_KEY(win, sdl) state[(win)] = keys[(sdl)] ? 0x80 : 0
@@ -331,10 +961,23 @@ void FillKeyboard(BYTE *state, bool directInput)
         MAP_KEY(VK_RETURN, SDL_SCANCODE_RETURN);
     }
 #undef MAP_KEY
+#endif
 }
 } // namespace
 
 extern "C" SDL_Window *th08_linux_get_window() { return g_window; }
+
+#if defined(PSP)
+extern "C" BOOL th08_psp_gdi_text_initialize()
+{
+    return InitializePspGdiText() ? TRUE : FALSE;
+}
+
+extern "C" void th08_psp_gdi_text_shutdown()
+{
+    ShutdownPspGdiText();
+}
+#endif
 
 extern "C" {
 HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD, LPVOID, DWORD disposition, DWORD, HANDLE)
@@ -344,7 +987,21 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD, LPVOID, DWORD disposition, 
     if (access & FILE_APPEND_DATA) flags |= O_APPEND;
     if (disposition == CREATE_ALWAYS) flags |= O_CREAT | O_TRUNC;
     if (disposition == OPEN_ALWAYS) flags |= O_CREAT;
+#if defined(PSP)
+    const std::string resolvedPath = ResolvePspArchivePath(path);
+#if defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    int fd;
+    {
+        th08::psp::IoActivityScope ioActivity(
+            th08::psp::IoActivityKind::Open, resolvedPath.c_str());
+        fd = open(resolvedPath.c_str(), flags, 0666);
+    }
+#else
+    int fd = open(resolvedPath.c_str(), flags, 0666);
+#endif
+#else
     int fd = open(path, flags, 0666);
+#endif
     if (fd < 0) { g_lastError = errno; return INVALID_HANDLE_VALUE; }
     return new FileHandle(fd);
 }
@@ -361,21 +1018,61 @@ HANDLE CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPVOID security, DWO
 BOOL ReadFile(HANDLE raw, LPVOID data, DWORD size, LPDWORD readSize, LPVOID)
 {
     if (raw == INVALID_HANDLE_VALUE || raw == NULL) return FALSE;
-    ssize_t result = read(static_cast<FileHandle *>(raw)->fd, data, size);
-    if (readSize != NULL) *readSize = result < 0 ? 0 : static_cast<DWORD>(result);
-    return result >= 0;
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Read);
+#endif
+    BYTE *cursor = static_cast<BYTE *>(data);
+    DWORD total = 0;
+    while (total < size)
+    {
+        const ssize_t result = read(static_cast<FileHandle *>(raw)->fd,
+                                    cursor + total, size - total);
+        if (result > 0)
+        {
+            total += static_cast<DWORD>(result);
+            continue;
+        }
+        if (result == 0) break;
+        if (errno == EINTR) continue;
+        if (readSize != NULL) *readSize = total;
+        g_lastError = errno;
+        return FALSE;
+    }
+    if (readSize != NULL) *readSize = total;
+    return TRUE;
 }
 
 BOOL WriteFile(HANDLE raw, LPCVOID data, DWORD size, LPDWORD written, LPVOID)
 {
     if (raw == INVALID_HANDLE_VALUE || raw == NULL) return FALSE;
-    ssize_t result = write(static_cast<FileHandle *>(raw)->fd, data, size);
-    if (written != NULL) *written = result < 0 ? 0 : static_cast<DWORD>(result);
-    return result >= 0;
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Write);
+#endif
+    const BYTE *cursor = static_cast<const BYTE *>(data);
+    DWORD total = 0;
+    while (total < size)
+    {
+        const ssize_t result = write(static_cast<FileHandle *>(raw)->fd,
+                                     cursor + total, size - total);
+        if (result > 0)
+        {
+            total += static_cast<DWORD>(result);
+            continue;
+        }
+        if (result < 0 && errno == EINTR) continue;
+        if (written != NULL) *written = total;
+        if (result < 0) g_lastError = errno;
+        return FALSE;
+    }
+    if (written != NULL) *written = total;
+    return TRUE;
 }
 
 DWORD SetFilePointer(HANDLE raw, LONG offset, LONG *, DWORD origin)
 {
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Seek);
+#endif
     int whence = origin == FILE_BEGIN ? SEEK_SET : origin == FILE_CURRENT ? SEEK_CUR : SEEK_END;
     off_t result = lseek(static_cast<FileHandle *>(raw)->fd, offset, whence);
     return result < 0 ? static_cast<DWORD>(-1) : static_cast<DWORD>(result);
@@ -383,6 +1080,10 @@ DWORD SetFilePointer(HANDLE raw, LONG offset, LONG *, DWORD origin)
 
 DWORD GetFileSize(HANDLE raw, LPDWORD high)
 {
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    th08::psp::IoActivityScope ioActivity(
+        th08::psp::IoActivityKind::Metadata);
+#endif
     struct stat info;
     if (fstat(static_cast<FileHandle *>(raw)->fd, &info) != 0) return static_cast<DWORD>(-1);
     if (high != NULL) *high = static_cast<DWORD>(static_cast<unsigned long long>(info.st_size) >> 32);
@@ -403,13 +1104,31 @@ BOOL CloseHandle(HANDLE raw)
     return TRUE;
 }
 
-BOOL FlushFileBuffers(HANDLE raw) { return fsync(static_cast<FileHandle *>(raw)->fd) == 0; }
-BOOL DeleteFileA(LPCSTR path) { return unlink(path) == 0; }
+BOOL FlushFileBuffers(HANDLE raw)
+{
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Sync);
+#endif
+    return fsync(static_cast<FileHandle *>(raw)->fd) == 0;
+}
+
+BOOL DeleteFileA(LPCSTR path)
+{
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    th08::psp::IoActivityScope ioActivity(
+        th08::psp::IoActivityKind::Write, path);
+#endif
+    return unlink(path) == 0;
+}
 
 DWORD GetFileAttributesW(LPCWSTR path)
 {
     char converted[PATH_MAX];
     if (wcstombs(converted, path, sizeof(converted) - 1) == static_cast<size_t>(-1)) return INVALID_FILE_ATTRIBUTES;
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    th08::psp::IoActivityScope ioActivity(
+        th08::psp::IoActivityKind::Metadata, converted);
+#endif
     struct stat info;
     if (stat(converted, &info) != 0) return INVALID_FILE_ATTRIBUTES;
     return S_ISDIR(info.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
@@ -425,7 +1144,17 @@ BOOL SetCurrentDirectoryW(LPCWSTR path)
 HANDLE FindFirstFileA(LPCSTR pattern, WIN32_FIND_DATAA *data)
 {
     glob_t result;
-    if (glob(pattern, 0, NULL, &result) != 0) return INVALID_HANDLE_VALUE;
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    int globResult;
+    {
+        th08::psp::IoActivityScope ioActivity(
+            th08::psp::IoActivityKind::Directory, pattern);
+        globResult = glob(pattern, 0, NULL, &result);
+    }
+#else
+    const int globResult = glob(pattern, 0, NULL, &result);
+#endif
+    if (globResult != 0) return INVALID_HANDLE_VALUE;
     FindHandle *handle = new FindHandle();
     for (size_t i = 0; i < result.gl_pathc; ++i) handle->paths.push_back(result.gl_pathv[i]);
     globfree(&result);
@@ -524,10 +1253,54 @@ UINT_PTR SetTimer(HWND, UINT_PTR id, UINT, void *) { return id != 0 ? id : 1; }
 BOOL KillTimer(HWND, UINT_PTR) { return TRUE; }
 HANDLE CreateMutexA(LPVOID, BOOL, LPCSTR) { g_lastError = 0; return new MutexHandle(); }
 DWORD GetLastError(void) { return g_lastError; }
-void InitializeCriticalSection(CRITICAL_SECTION *value) { pthread_mutex_init(value, NULL); }
-void DeleteCriticalSection(CRITICAL_SECTION *value) { pthread_mutex_destroy(value); }
-void EnterCriticalSection(CRITICAL_SECTION *value) { pthread_mutex_lock(value); }
-void LeaveCriticalSection(CRITICAL_SECTION *value) { pthread_mutex_unlock(value); }
+void InitializeCriticalSection(CRITICAL_SECTION *value)
+{
+#if defined(PSP)
+    memset(value, 0, sizeof(*value));
+    value->native = static_cast<pthread_mutex_t *>(malloc(sizeof(*value->native)));
+    if (value->native != NULL)
+    {
+        pthread_mutexattr_t attributes;
+        pthread_mutexattr_init(&attributes);
+        pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(value->native, &attributes);
+        pthread_mutexattr_destroy(&attributes);
+    }
+#else
+    pthread_mutex_init(value, NULL);
+#endif
+}
+void DeleteCriticalSection(CRITICAL_SECTION *value)
+{
+#if defined(PSP)
+    if (value->native != NULL)
+    {
+        pthread_mutex_destroy(value->native);
+        free(value->native);
+        value->native = NULL;
+    }
+#else
+    pthread_mutex_destroy(value);
+#endif
+}
+void EnterCriticalSection(CRITICAL_SECTION *value)
+{
+#if defined(PSP)
+    if (value->native != NULL)
+        pthread_mutex_lock(value->native);
+#else
+    pthread_mutex_lock(value);
+#endif
+}
+void LeaveCriticalSection(CRITICAL_SECTION *value)
+{
+#if defined(PSP)
+    if (value->native != NULL)
+        pthread_mutex_unlock(value->native);
+#else
+    pthread_mutex_unlock(value);
+#endif
+}
 
 BOOL PeekMessageA(MSG *message, HWND, UINT, UINT, UINT)
 {
@@ -544,17 +1317,48 @@ BOOL RegisterClassA(const WNDCLASSA *value) { g_windowProcedure = value->lpfnWnd
 
 HWND CreateWindowExA(DWORD, LPCSTR, LPCSTR title, DWORD style, int, int, int width, int height, HWND, HANDLE, HINSTANCE, LPVOID)
 {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0)
-    { fprintf(stderr, "th08-modern: SDL_Init failed: %s\n", SDL_GetError()); return NULL; }
+    TH08_PSP_BOOT_CHECKPOINT("sdl_init", "before", 0);
+    const int sdlInitResult =
+        SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER);
+    TH08_PSP_BOOT_CHECKPOINT("sdl_init", "after", sdlInitResult);
+    if (sdlInitResult != 0)
+    {
+        fprintf(stderr, "th08-modern: SDL_Init failed: %s\n", SDL_GetError());
+#if defined(PSP)
+        SDL_Quit();
+#endif
+        return NULL;
+    }
+    TH08_PSP_BOOT_CHECKPOINT("sdl_gl_attributes", "before", 0);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1); SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
+#if !defined(PSP)
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+#endif
+    TH08_PSP_BOOT_CHECKPOINT("sdl_gl_attributes", "after", 0);
     Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN;
+#if defined(PSP)
+    (void)style;
+    width = 480;
+    height = 272;
+#else
     if (style == WS_OVERLAPPEDWINDOW) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     else { width = 640; height = 480; }
-    g_window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width, height, flags);
-    if (g_window == NULL) fprintf(stderr, "th08-modern: SDL_CreateWindow failed: %s\n", SDL_GetError());
+#endif
+    TH08_PSP_BOOT_CHECKPOINT("sdl_window", "before_create", 0);
+    g_window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED,
+                                SDL_WINDOWPOS_CENTERED, width, height, flags);
+    TH08_PSP_BOOT_CHECKPOINT("sdl_window", "after_create",
+                             g_window != NULL ? 1 : 0);
+    if (g_window == NULL)
+    {
+        fprintf(stderr, "th08-modern: SDL_CreateWindow failed: %s\n", SDL_GetError());
+#if defined(PSP)
+        // Leave GU/eDRAM ownership clean for the outer fail-visible screen.
+        SDL_Quit();
+#endif
+    }
     else SetApplicationIcon(g_window);
     return reinterpret_cast<HWND>(g_window);
 }
@@ -581,8 +1385,16 @@ int MessageBoxW(HWND, LPCWSTR text, LPCWSTR title, UINT) { fwprintf(stderr, L"%l
 
 DWORD GetModuleFileNameA(HMODULE, LPSTR buffer, DWORD size)
 {
+#if defined(PSP)
+    const std::string path = ExecutableSiblingPath("EBOOT.PBP");
+    if (size == 0 || path.empty()) return 0;
+    strncpy(buffer, path.c_str(), size - 1);
+    buffer[size - 1] = 0;
+    return static_cast<DWORD>(strlen(buffer));
+#else
     ssize_t count = readlink("/proc/self/exe", buffer, size - 1); if (count < 0) return 0;
     buffer[count] = 0; return static_cast<DWORD>(count);
+#endif
 }
 DWORD GetConsoleTitleA(LPSTR buffer, DWORD size) { if (size) buffer[0] = 0; return 0; }
 void GetStartupInfoA(STARTUPINFOA *value) { DWORD size = value->cb; memset(value, 0, size); value->cb = size; }
@@ -598,8 +1410,13 @@ DWORD FormatMessageA(DWORD flags, LPCVOID, DWORD error, DWORD, LPSTR buffer, DWO
 LPVOID LocalFree(LPVOID value) { free(value); return NULL; }
 HGLOBAL GlobalAlloc(UINT, size_t size) { return calloc(1, size); }
 HGLOBAL GlobalFree(HGLOBAL value) { free(value); return NULL; }
+#if defined(PSP)
+HMODULE LoadLibraryA(LPCSTR) { return NULL; }
+void *GetProcAddress(HMODULE, LPCSTR) { return NULL; }
+#else
 HMODULE LoadLibraryA(LPCSTR path) { return dlopen(path, RTLD_NOW); }
 void *GetProcAddress(HMODULE module, LPCSTR name) { return dlsym(module, name); }
+#endif
 HDC CreateCompatibleDC(HDC) { return new GdiDc(); }
 BOOL DeleteDC(HDC value) { delete static_cast<GdiDc *>(value); return TRUE; }
 HGDIOBJ SelectObject(HDC dcRaw, HGDIOBJ objectRaw)
@@ -617,11 +1434,37 @@ HGDIOBJ SelectObject(HDC dcRaw, HGDIOBJ objectRaw)
     dc->font = static_cast<GdiFont *>(object);
     return old;
 }
-BOOL DeleteObject(HGDIOBJ value) { delete static_cast<GdiObject *>(value); return TRUE; }
+BOOL DeleteObject(HGDIOBJ value)
+{
+    GdiObject *object = static_cast<GdiObject *>(value);
+#if defined(PSP)
+    if (object != NULL && object->kind == GdiObject::FONT)
+        ReleasePspGdiFontDescriptor(static_cast<GdiFont *>(object));
+#endif
+    delete object;
+    return TRUE;
+}
 int SetBkMode(HDC, int mode) { return mode; }
 COLORREF SetTextColor(HDC raw, COLORREF color) { GdiDc *dc = static_cast<GdiDc *>(raw); COLORREF old = dc->color; dc->color = color; return old; }
 HFONT CreateFontA(int height, int, int, int, int weight, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCSTR)
 {
+#if defined(PSP)
+    if (g_pspGdiText.face == NULL)
+    {
+        fprintf(stderr, "TH08PSP FONT CreateFontA rejected before startup\n");
+        return NULL;
+    }
+    const int pointSize = height < 0 ? -height : height;
+    const int style = weight >= FW_SEMIBOLD ? TTF_STYLE_BOLD : TTF_STYLE_NORMAL;
+    GdiFont *font = new (std::nothrow) GdiFont(g_pspGdiText.face, pointSize, style);
+    if (font == NULL)
+    {
+        fprintf(stderr, "TH08PSP FONT descriptor allocation failed\n");
+        return NULL;
+    }
+    ++g_pspGdiText.liveDescriptors;
+    return font;
+#else
     const char *path = ResolveJapaneseFont();
     if (path == NULL) return new GdiFont();
     if (!TTF_WasInit() && TTF_Init() != 0)
@@ -638,6 +1481,7 @@ HFONT CreateFontA(int height, int, int, int, int weight, DWORD, DWORD, DWORD, DW
     if (weight >= FW_SEMIBOLD) TTF_SetFontStyle(font, TTF_STYLE_BOLD);
     TTF_SetFontHinting(font, TTF_HINTING_LIGHT);
     return new GdiFont(font);
+#endif
 }
 HBITMAP CreateDIBSection(HDC, const void *infoRaw, UINT, VOID **pixels, HANDLE, DWORD)
 {
@@ -649,7 +1493,14 @@ BOOL TextOutA(HDC dcRaw, int x, int y, LPCSTR text, int length)
     if (dcRaw == NULL || text == NULL || length <= 0) return FALSE;
     GdiDc *dc = static_cast<GdiDc *>(dcRaw);
     if (dc->bitmap == NULL || dc->font == NULL || dc->font->font == NULL) return FALSE;
-    std::string utf8 = ConvertCp932ToUtf8(text, static_cast<size_t>(length));
+#if defined(PSP)
+    if (!ConfigurePspGdiFont(dc->font)) return FALSE;
+#endif
+    bool conversionValid = true;
+    std::string utf8 = ConvertCp932ToUtf8(
+        text, static_cast<size_t>(length), &conversionValid);
+    if (!conversionValid)
+        return FALSE;
     SDL_Color white = {255, 255, 255, 255};
     SDL_Surface *rendered = TTF_RenderUTF8_Blended(dc->font->font, utf8.c_str(), white);
     if (rendered == NULL) return FALSE;
@@ -804,7 +1655,16 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
         *first = &bytes[offset]; *firstSize = contiguous; if (second) *second = length > contiguous ? &bytes[0] : NULL; if (secondSize) *secondSize = length - contiguous; return S_OK;
     }
     HRESULT Play(DWORD, DWORD, DWORD flags)
-    { LockAudio(); playing = true; looping = (flags & DSBPLAY_LOOPING) != 0; UnlockAudio(); return S_OK; }
+    {
+        LockAudio();
+        playing = true;
+        looping = (flags & DSBPLAY_LOOPING) != 0;
+        UnlockAudio();
+#if defined(PSP)
+        th08::psp::AudioTelemetryRecordPlaySubmit();
+#endif
+        return S_OK;
+    }
     HRESULT SetCurrentPosition(DWORD value)
     {
         LockAudio();
@@ -830,6 +1690,11 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
             notifications.assign(positions, positions + count);
         UnlockAudio();
     }
+#if defined(PSP)
+    // The SDL callback owns the audio-device lock while it walks this list, so
+    // this read does not introduce a lock or change mixer ordering.
+    bool IsPlayingForTelemetry() const { return playing; }
+#endif
     void Mix(Sint16 *output, int outputFrames)
     {
         const DWORD frameBytes = FrameBytes();
@@ -844,15 +1709,64 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
         const float rightGain = gain * (panValue < 0.0f ? 1.0f + panValue : 1.0f);
         const DWORD oldPosition = position;
         bool wrapped = false;
+#if TH08_PSP_AUDIO_FIXED_CURSOR_ENABLED || TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT_ENABLED
+        // Exact fixed-point cursor when 44100 / rate is a power of two and the
+        // binary64 cursor is a multiple of that step (see audio_fixed_cursor_math.hpp).
+        unsigned int fixedShift = 0U;
+        std::uint64_t fixedCursor = 0U;
+        const bool fixedEligible =
+            th08::psp::AudioFixedCursorEligible(format.nSamplesPerSec, &fixedShift) &&
+            th08::psp::AudioFixedCursorFromDouble(cursorFrame, fixedShift, &fixedCursor);
+#endif
+#if TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT_ENABLED
+        th08::psp::AudioCursorAuditBeginMix(format.nSamplesPerSec, fixedEligible, outputFrames);
+        bool fixedWrapped = false;
+#endif
+#if TH08_PSP_AUDIO_FIXED_CURSOR_ENABLED
+        th08::psp::AudioCursorProductNoteMix(format.nSamplesPerSec, fixedEligible);
+#endif
 
         for (int frame = 0; frame < outputFrames && playing; ++frame)
         {
+#if TH08_PSP_AUDIO_FIXED_CURSOR_ENABLED
+            DWORD sourceFrame;
+            if (fixedEligible)
+            {
+                std::uint32_t fixedFrame = 0U;
+                if (!th08::psp::AudioFixedCursorStep(&fixedCursor, fixedShift, sourceFrames,
+                                                     looping, &fixedFrame, &wrapped))
+                {
+                    playing = false;
+                    break;
+                }
+                sourceFrame = fixedFrame;
+            }
+            else
+            {
+                sourceFrame = static_cast<DWORD>(cursorFrame);
+                if (sourceFrame >= sourceFrames)
+                {
+                    if (!looping) { playing = false; break; }
+                    cursorFrame -= sourceFrames; sourceFrame = static_cast<DWORD>(cursorFrame); wrapped = true;
+                }
+            }
+#else
             DWORD sourceFrame = static_cast<DWORD>(cursorFrame);
             if (sourceFrame >= sourceFrames)
             {
                 if (!looping) { playing = false; break; }
                 cursorFrame -= sourceFrames; sourceFrame = static_cast<DWORD>(cursorFrame); wrapped = true;
             }
+#if TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT_ENABLED
+            if (fixedEligible)
+            {
+                std::uint32_t fixedFrame = 0U;
+                const bool fixedContinues = th08::psp::AudioFixedCursorStep(
+                    &fixedCursor, fixedShift, sourceFrames, looping, &fixedFrame, &fixedWrapped);
+                th08::psp::AudioCursorAuditCompareFrame(fixedContinues, fixedFrame, sourceFrame);
+            }
+#endif
+#endif
             const BYTE *source = &bytes[sourceFrame * frameBytes];
             int left, right;
             if (format.wBitsPerSample == 8)
@@ -877,8 +1791,23 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
             if (mixedRight < -32768) mixedRight = -32768; else if (mixedRight > 32767) mixedRight = 32767;
             output[frame * 2] = static_cast<Sint16>(mixedLeft);
             output[frame * 2 + 1] = static_cast<Sint16>(mixedRight);
+#if TH08_PSP_AUDIO_FIXED_CURSOR_ENABLED
+            if (!fixedEligible)
+                cursorFrame += step;
+#else
             cursorFrame += step;
+#endif
         }
+#if TH08_PSP_AUDIO_FIXED_CURSOR_ENABLED
+        if (fixedEligible)
+            cursorFrame = th08::psp::AudioFixedCursorToDouble(fixedCursor, fixedShift);
+#endif
+#if TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT_ENABLED
+        if (fixedEligible)
+            th08::psp::AudioCursorAuditEndMix(
+                wrapped, fixedWrapped, cursorFrame,
+                th08::psp::AudioFixedCursorToDouble(fixedCursor, fixedShift), playing);
+#endif
 
         if (cursorFrame >= sourceFrames)
         {
@@ -891,7 +1820,12 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
             const DWORD offset = notifications[index].dwOffset;
             if ((!wrapped && oldPosition <= offset && position > offset) ||
                 (wrapped && (offset >= oldPosition || offset < position)))
+            {
+#if defined(PSP)
+                th08::psp::AudioTelemetryRecordBgmNotify();
+#endif
                 SetEvent(notifications[index].hEventNotify);
+            }
         }
     }
   private:
@@ -916,8 +1850,36 @@ void AudioCallback(void *, Uint8 *stream, int length)
     memset(stream, 0, length);
     Sint16 *output = reinterpret_cast<Sint16 *>(stream);
     const int frames = length / (sizeof(Sint16) * 2);
+#if defined(PSP) && TH08_PSP_RUNTIME_TELEMETRY
+    std::uint32_t activeVoices = 0;
+#endif
     for (size_t index = 0; index < g_soundBuffers.size(); ++index)
+    {
+#if defined(PSP) && TH08_PSP_RUNTIME_TELEMETRY
+        if (g_soundBuffers[index]->IsPlayingForTelemetry())
+            ++activeVoices;
+#endif
         g_soundBuffers[index]->Mix(output, frames);
+    }
+
+#if defined(PSP) && TH08_PSP_RUNTIME_TELEMETRY
+    std::uint32_t nonzeroSamples = 0;
+    std::uint32_t peakAmplitude = 0;
+    const std::size_t sampleCount =
+        static_cast<std::size_t>(frames > 0 ? frames : 0) * 2U;
+    for (std::size_t index = 0; index < sampleCount; ++index)
+    {
+        const int sample = static_cast<int>(output[index]);
+        const std::uint32_t amplitude = static_cast<std::uint32_t>(sample < 0 ? -sample : sample);
+        if (amplitude != 0)
+            ++nonzeroSamples;
+        if (amplitude > peakAmplitude)
+            peakAmplitude = amplitude;
+    }
+    th08::psp::AudioTelemetryRecordCallback(
+        static_cast<std::uint32_t>(frames > 0 ? frames : 0),
+        nonzeroSamples, peakAmplitude, activeVoices);
+#endif
 }
 
 void EnsureAudio()

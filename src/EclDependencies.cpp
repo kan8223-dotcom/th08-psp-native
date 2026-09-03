@@ -10,6 +10,10 @@
 #include "EclManager.hpp"
 #include "utils.hpp"
 
+#if defined(PSP)
+#include "ecl_child_memory.hpp"
+#endif
+
 #include <math.h>
 
 namespace th08
@@ -99,12 +103,23 @@ namespace EclRunLow
 void __fastcall StartTimedPolarDisplacement(
     Enemy *enemy, EclRawInstruction *instruction, f32 angle)
 {
+#ifdef TH08_MODERN_PORT
+    const f32 speedX = DEP_READ_FLOAT(enemy, instruction, 2);
+    const i32 durationX = DEP_READ_INT(enemy, instruction, 0);
+    enemy->movementInterpolationDelta.x =
+        X87CompatibleCosMulInt(angle, speedX, durationX);
+    const f32 speedY = DEP_READ_FLOAT(enemy, instruction, 2);
+    const i32 durationY = DEP_READ_INT(enemy, instruction, 0);
+    enemy->movementInterpolationDelta.y =
+        X87CompatibleSinMulInt(angle, speedY, durationY);
+#else
     enemy->movementInterpolationDelta.x =
         cosf(angle) * DEP_READ_FLOAT(enemy, instruction, 2) *
         DEP_READ_INT(enemy, instruction, 0);
     enemy->movementInterpolationDelta.y =
         sinf(angle) * DEP_READ_FLOAT(enemy, instruction, 2) *
         DEP_READ_INT(enemy, instruction, 0);
+#endif
     enemy->movementInterpolationDelta.z = 0.0f;
     enemy->movementInterpolationOrigin =
         enemy->worldPosition;
@@ -510,7 +525,11 @@ int __fastcall PopEclContext(
     {
         contextIndex = enemy->activeEclContext->childContextSlot - 1;
         if (enemy->childEclBlocks[contextIndex] != NULL)
+#if defined(PSP)
+            psp::EnemyChildEclFree(enemy->childEclBlocks[contextIndex]);
+#else
             g_ZunMemory.Free(enemy->childEclBlocks[contextIndex]);
+#endif
         enemy->childEclBlocks[contextIndex] = NULL;
         enemy->activeEclCallStack =
             reinterpret_cast<EnemyEclContext *>(

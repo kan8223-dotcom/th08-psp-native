@@ -8,6 +8,10 @@
 #include "i18n.hpp"
 #include "utils.hpp"
 
+#if defined(PSP)
+#include "audio_telemetry.hpp"
+#endif
+
 namespace th08
 {
 
@@ -874,10 +878,31 @@ DWORD WINAPI SoundPlayer::BGMPlayerThread(LPVOID lpThreadParameter)
         case 0:
             if (g_SoundPlayer.bgm != NULL && g_SoundPlayer.bgm->m_bIsPlaying)
             {
+#if defined(PSP)
+                const DWORD nominalRefillBytes = g_SoundPlayer.bgm->m_dwNotifySize;
+#endif
                 g_SoundPlayer.bgm->m_bIsLocked = TRUE;
                 res = g_SoundPlayer.bgm->HandleWaveStreamNotification(looped);
                 g_SoundPlayer.bgm->m_bIsLocked = FALSE;
+#if defined(PSP)
+                if (res == S_OK)
+                    psp::AudioTelemetryRecordBgmRefillSuccess(
+                        static_cast<std::uint32_t>(nominalRefillBytes));
+                else if (res == CO_E_FIRST)
+                    psp::AudioTelemetryRecordBgmRefillSkip();
+                else
+                    psp::AudioTelemetryRecordBgmRefillFailure();
+#endif
             }
+#if defined(PSP)
+            else
+            {
+                // An auto-reset notification can race a stop/release.  It was
+                // consumed but performed no stream write, so record it as an
+                // explicit skip rather than a successful refill.
+                psp::AudioTelemetryRecordBgmRefillSkip();
+            }
+#endif
             break;
         case 1:
             while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE) != 0)

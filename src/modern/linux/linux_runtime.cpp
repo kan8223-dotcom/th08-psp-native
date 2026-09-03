@@ -1,8 +1,18 @@
 #include "modern/windows_runtime.hpp"
 
+#if defined(PSP)
+#include "boot_checkpoint.hpp"
+#include "fileio.hpp"
+#if defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+#include "io_activity_lamp.hpp"
+#endif
+#else
 #include <execinfo.h>
+#endif
 #include <fcntl.h>
+#if !defined(PSP)
 #include <signal.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -83,6 +93,7 @@ namespace
 {
 int g_argumentCount;
 char **g_arguments;
+#if !defined(PSP)
 volatile sig_atomic_t g_reportingCrash;
 
 void WriteCrashLine(int file, const char *line)
@@ -125,6 +136,7 @@ void InstallSignalHandler(int signalNumber)
     action.sa_flags = SA_SIGINFO | SA_RESETHAND;
     sigaction(signalNumber, &action, NULL);
 }
+#endif
 
 uintptr_t CodeAddress(int (__fastcall *callback)(AnmVm *))
 {
@@ -227,6 +239,27 @@ void InitializeTargetData()
 
 bool ConfigureDataDirectory()
 {
+#if defined(PSP)
+    // Keep the process working directory at the EBOOT directory so writable
+    // state (configuration, score, replays, snapshots, and logs) stays on the
+    // Memory Stick install.  linux_compat.cpp resolves only the two immutable
+    // retail archives through DataDirectory().
+    const char *gameDirectory = th08::psp::GameDirectory();
+    const th08::psp::DataDiscovery &data = th08::psp::DiscoverOriginalData();
+    if (gameDirectory == NULL || gameDirectory[0] == '\0' ||
+        chdir(gameDirectory) != 0)
+    {
+        fprintf(stderr, "th08-psp: unable to enter game directory: %s\n",
+                gameDirectory != NULL ? gameDirectory : "<null>");
+        return false;
+    }
+    if (!data.ready || data.root[0] == '\0')
+    {
+        fprintf(stderr, "th08-psp: original th08.dat/thbgm.dat are unavailable\n");
+        return false;
+    }
+    return true;
+#else
     const char *directory = NULL;
     for (int index = 1; index < g_argumentCount; ++index)
     {
@@ -262,21 +295,38 @@ bool ConfigureDataDirectory()
     unlink("modern-render.txt");
     unlink("modern-enemy-render.csv");
     return true;
+#endif
 }
 
 void InstallCrashReporter()
 {
     InitializeTargetData();
+#if !defined(PSP)
     InstallSignalHandler(SIGSEGV);
     InstallSignalHandler(SIGABRT);
     InstallSignalHandler(SIGFPE);
     InstallSignalHandler(SIGILL);
     InstallSignalHandler(SIGBUS);
+#endif
 }
 
 void LogArchiveRequest(const char *path)
 {
+#if defined(PSP)
+    char logPath[640];
+    const char *gameDirectory = th08::psp::GameDirectory();
+    if (gameDirectory == NULL ||
+        snprintf(logPath, sizeof(logPath), "%s/%s", gameDirectory,
+                 "modern-files.txt") < 0)
+        return;
+#if defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    th08::psp::IoActivityScope ioActivity(
+        th08::psp::IoActivityKind::Write, logPath);
+#endif
+    FILE *file = fopen(logPath, "ab");
+#else
     FILE *file = fopen("modern-files.txt", "ab");
+#endif
     if (file == NULL)
         return;
     fprintf(file, "thread=%08lx path=%s\n", (unsigned long)GetCurrentThreadId(), path != NULL ? path : "<null>");
@@ -291,8 +341,21 @@ void SetArguments(int argc, char **argv)
 } // namespace modern
 } // namespace th08
 
+#if defined(PSP)
+extern "C" int th08_psp_run_engine(int argc, char **argv)
+{
+    TH08_PSP_BOOT_CHECKPOINT("runtime", "before_set_arguments", 0);
+    th08::modern::SetArguments(argc, argv);
+    TH08_PSP_BOOT_CHECKPOINT("runtime", "after_set_arguments", 0);
+    TH08_PSP_BOOT_CHECKPOINT("runtime", "before_winmain", 0);
+    const int result = WinMain(NULL, NULL, NULL, 0);
+    TH08_PSP_BOOT_CHECKPOINT("runtime", "after_winmain", result);
+    return result;
+}
+#else
 int main(int argc, char **argv)
 {
     th08::modern::SetArguments(argc, argv);
     return WinMain(NULL, NULL, NULL, 0);
 }
+#endif

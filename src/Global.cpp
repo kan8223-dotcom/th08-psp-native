@@ -4,6 +4,10 @@
 #include "modern/windows_runtime.hpp"
 #endif
 
+#if defined(PSP)
+#include "draw_priority_subprofile.hpp"
+#endif
+
 #include "Global.hpp"
 #include "Supervisor.hpp"
 #include "ZunMath.hpp"
@@ -220,6 +224,15 @@ int Chain::RunDrawChain()
     ChainElem *current;
     int updatedCount;
     ChainCallbackResult result;
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    std::uint64_t drawPriorityChainStartUs;
+    std::uint64_t drawPriorityCallbackStartUs;
+    int drawPriorityCallbackPriority;
+    bool drawPrioritySampleActive;
+
+    drawPrioritySampleActive =
+        psp::DrawPrioritySubprofileBeginDrawChain(drawPriorityChainStartUs);
+#endif
 
     updatedCount = 0;
     current = &this->drawChain;
@@ -231,8 +244,30 @@ int Chain::RunDrawChain()
         if (current->callback != NULL)
         {
         execute_again:
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+            // Snapshot the invocation's priority while the chain lock is held.
+            // The measured callback interval starts only after the canonical
+            // unlock and ends before the canonical re-lock.
+            drawPriorityCallbackPriority = current->priority;
+            psp::DrawPrioritySubprofileNoteCallbackPriority(drawPriorityCallbackPriority);
+#endif
             g_Supervisor.LeaveCriticalSectionWrapper(0);
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+            if (drawPrioritySampleActive)
+            {
+                drawPriorityCallbackStartUs =
+                    psp::DrawPrioritySubprofileReadClock();
+            }
+#endif
             result = current->callback(current->arg);
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+            if (drawPrioritySampleActive)
+            {
+                psp::DrawPrioritySubprofileRecordCallback(
+                    drawPriorityCallbackPriority,
+                    drawPriorityCallbackStartUs);
+            }
+#endif
             g_Supervisor.EnterCriticalSectionWrapper(0);
 
             switch (result)
@@ -272,6 +307,13 @@ int Chain::RunDrawChain()
 
 loop_exit:
     g_Supervisor.LeaveCriticalSectionWrapper(0);
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    if (drawPrioritySampleActive)
+    {
+        psp::DrawPrioritySubprofileEndDrawChain(
+            drawPriorityChainStartUs);
+    }
+#endif
     return updatedCount;
 }
 
@@ -897,17 +939,98 @@ DIFFABLE_STATIC_ARRAY_ASSIGN(DecryptParams, 8, g_DecryptParams) = {
 
 DIFFABLE_STATIC_ARRAY_ASSIGN(u8, 3, g_CryptSignature) = {0x85, 0xa4, 0xda};
 
+#if defined(PSP) || defined(TH08_RESOURCE_DECRYPT_STREAM_TEST_REFERENCE)
+// The test-only define exposes this exact PSP implementation to the 64-bit
+// host fixture without enabling unrelated PSP ABI/layout branches.
+// Large encrypted resources such as title01.anm are roughly 7 MiB.  The
+// retail routine keeps both the compressed-resource allocation and a second
+// full-size decrypted allocation alive at once.  On PSP that allocation can
+// fail; the retail fallback then returns inData + 4 and immediately frees its
+// owning allocation, leaving a dangling pointer.  Decrypt each independent
+// interleave chunk through a small scratch buffer instead and compact the
+// four-byte encryption signature in place.
+static bool DecryptPspResourceInPlace(LPBYTE rawData, i32 totalSize, u8 xorValue,
+                                      u8 xorValueInc, i32 chunkSize, i32 maxBytes)
+{
+    static const i32 kLargestDecryptChunk = 0x1400;
+    u8 scratch[kLargestDecryptChunk];
+
+    if (rawData == NULL || totalSize < 4 || chunkSize <= 0 ||
+        chunkSize > kLargestDecryptChunk)
+    {
+        return false;
+    }
+
+    i32 remaining = totalSize - 4;
+    i32 numUnencrypted =
+        (remaining % chunkSize < chunkSize / 4) ? remaining % chunkSize : 0;
+    numUnencrypted += remaining & 1;
+    remaining -= numUnencrypted;
+
+    LPBYTE inCursor = rawData + 4;
+    LPBYTE outCursor = rawData;
+
+    while (remaining > 0 && maxBytes > 0)
+    {
+        i32 currentChunkSize = chunkSize;
+        if (remaining < currentChunkSize)
+        {
+            currentChunkSize = remaining;
+        }
+
+        memcpy(scratch, inCursor, currentChunkSize);
+        LPBYTE outCursorBackup = outCursor;
+        i32 inputOffset = 0;
+
+        outCursor = &outCursorBackup[currentChunkSize - 1];
+        for (i32 i = (currentChunkSize + 1) / 2; i > 0; i--, inputOffset++)
+        {
+            *outCursor = scratch[inputOffset] ^ xorValue;
+            outCursor -= 2;
+            xorValue += xorValueInc;
+        }
+
+        outCursor = &outCursorBackup[currentChunkSize - 2];
+        for (i32 i = currentChunkSize / 2; i > 0; i--, inputOffset++)
+        {
+            *outCursor = scratch[inputOffset] ^ xorValue;
+            outCursor -= 2;
+            xorValue += xorValueInc;
+        }
+
+        inCursor += currentChunkSize;
+        outCursor = &outCursorBackup[currentChunkSize];
+        remaining -= currentChunkSize;
+        maxBytes -= currentChunkSize;
+    }
+
+    remaining += numUnencrypted;
+    if (remaining > 0)
+    {
+        memmove(outCursor, inCursor, remaining);
+    }
+    return true;
+}
+#endif
+
 #pragma var_order(rawData, decryptedData, i)
 LPBYTE FileSystem::TryDecryptFromTable(LPBYTE inData, LPINT unused, i32 size)
 {
     LPBYTE rawData = inData;
     LPBYTE decryptedData;
 
+#if defined(PSP) || defined(TH08_RESOURCE_DECRYPT_STREAM_TEST_REFERENCE)
+    if (rawData == NULL || size < 4)
+    {
+        return rawData;
+    }
+#endif
+
     if (rawData[0] == g_CryptSignature[0] - 0x20 && rawData[1] == g_CryptSignature[1] - 0x40 &&
         rawData[2] == g_CryptSignature[2] - 0x60)
     {
         u32 i = 0;
-        while (rawData[3] != g_DecryptParams[i].key - (i << 4) - 0x10 && i < 8)
+        while (i < 8 && rawData[3] != g_DecryptParams[i].key - (i << 4) - 0x10)
         {
             i++;
         }
@@ -916,18 +1039,31 @@ LPBYTE FileSystem::TryDecryptFromTable(LPBYTE inData, LPINT unused, i32 size)
             return rawData;
         }
 
+#if defined(PSP) || defined(TH08_RESOURCE_DECRYPT_STREAM_TEST_REFERENCE)
+        if (DecryptPspResourceInPlace(rawData, size, g_DecryptParams[i].xorValue,
+                                      g_DecryptParams[i].xorValueInc,
+                                      g_DecryptParams[i].chunkSize,
+                                      g_DecryptParams[i].maxBytesToDecrypt))
+        {
+            return rawData;
+        }
+        return rawData;
+#else
         // 4 bytes are skipped to exclude the encryption signature
         decryptedData = Decrypt(rawData + 4, size - 4, g_DecryptParams[i].xorValue, g_DecryptParams[i].xorValueInc,
                                 g_DecryptParams[i].chunkSize, g_DecryptParams[i].maxBytesToDecrypt);
         g_ZunMemory.Free(inData);
         return decryptedData;
+#endif
     }
 
     return rawData;
 }
 
 #pragma var_order(inCursor, i, out, outCursor, numUnencrypted, inCursorBackup, unused)
-LPBYTE FileSystem::Encrypt(LPBYTE inData, i32 size, u8 xorValue, u8 xorValueInc, i32 chunkSize, i32 maxBytes)
+LPBYTE FileSystem::Encrypt(LPBYTE inData, i32 size, u8 xorValue, u8 xorValueInc,
+                           i32 chunkSize, i32 maxBytes, LPBYTE outBuffer,
+                           i32 outCapacity)
 {
     i32 i;
     LPBYTE inCursorBackup;
@@ -936,7 +1072,12 @@ LPBYTE FileSystem::Encrypt(LPBYTE inData, i32 size, u8 xorValue, u8 xorValueInc,
     i32 numUnencrypted = (size % chunkSize < chunkSize / 4) ? size % chunkSize : 0;
 
     LPBYTE inCursor = inData;
-    LPBYTE out = (LPBYTE)g_ZunMemory.Alloc(size);
+    if (inData == NULL || size < 0 ||
+        (outBuffer != NULL && outCapacity < size))
+    {
+        return NULL;
+    }
+    LPBYTE out = outBuffer != NULL ? outBuffer : (LPBYTE)g_ZunMemory.Alloc(size);
     LPBYTE outCursor = out;
 
     if (out == NULL)
@@ -987,6 +1128,67 @@ LPBYTE FileSystem::Encrypt(LPBYTE inData, i32 size, u8 xorValue, u8 xorValueInc,
     return out;
 }
 
+namespace
+{
+const char *ArchiveEntryName(LPCSTR path)
+{
+    const char *entryname = strrchr(path, '\\');
+    entryname = entryname == NULL ? path : entryname + 1;
+    const char *forwardSlash = strrchr(entryname, '/');
+    return forwardSlash == NULL ? entryname : forwardSlash + 1;
+}
+} // namespace
+
+#if defined(PSP)
+DWORD FileSystem::GetArchiveEntrySize(LPCSTR path)
+{
+    if (path == NULL)
+        return 0;
+    g_Supervisor.EnterCriticalSectionWrapper(2);
+    const DWORD size = g_PbgArchive.GetEntryDecompressedSize(ArchiveEntryName(path));
+    g_Supervisor.LeaveCriticalSectionWrapper(2);
+    return size;
+}
+
+LPBYTE FileSystem::OpenArchiveFileInto(LPCSTR path, i32 *fileSize,
+                                       LPBYTE destination,
+                                       size_t destinationCapacity)
+{
+#ifdef TH08_MODERN_PORT
+    modern::LogArchiveRequest(path);
+#endif
+    if (fileSize != NULL)
+        *fileSize = 0;
+    if (path == NULL || destination == NULL)
+        return NULL;
+
+    g_Supervisor.EnterCriticalSectionWrapper(2);
+    const char *entryname = ArchiveEntryName(path);
+    const DWORD size = g_PbgArchive.GetEntryDecompressedSize(entryname);
+    if (fileSize != NULL)
+        *fileSize = static_cast<i32>(size);
+    if (size == 0 || static_cast<size_t>(size) > destinationCapacity)
+    {
+        g_GameErrorContext.Fatal("error : %s is not found or destination is too small.\r\n",
+                                 entryname);
+        g_Supervisor.LeaveCriticalSectionWrapper(2);
+        return NULL;
+    }
+
+    utils::DebugPrint("%s Decode into ANM arena ... \r\n", entryname);
+    if (g_PbgArchive.ReadDecompressEntry(entryname, destination) == NULL)
+    {
+        g_Supervisor.LeaveCriticalSectionWrapper(2);
+        return NULL;
+    }
+    LPBYTE decrypted = TryDecryptFromTable(destination, fileSize, static_cast<i32>(size));
+    g_Supervisor.LeaveCriticalSectionWrapper(2);
+    // PSP decryption is deliberately in-place. Never transfer an allocation
+    // with a different owner through this destination-based API.
+    return decrypted == destination ? destination : NULL;
+}
+#endif
+
 #pragma var_order(unused, entryname, size, data, handle)
 LPBYTE FileSystem::OpenFile(LPCSTR path, i32 *fileSize, BOOL isExternalResource)
 {
@@ -1004,24 +1206,7 @@ LPBYTE FileSystem::OpenFile(LPCSTR path, i32 *fileSize, BOOL isExternalResource)
 
     if (!isExternalResource)
     {
-        entryname = strrchr(path, '\\');
-        if (entryname == NULL)
-        {
-            entryname = path;
-        }
-        else
-        {
-            entryname = entryname + 1;
-        }
-        entryname = strrchr(entryname, '/');
-        if (entryname == (char *)0x0)
-        {
-            entryname = path;
-        }
-        else
-        {
-            entryname = entryname + 1;
-        }
+        entryname = ArchiveEntryName(path);
         size = g_PbgArchive.GetEntryDecompressedSize(entryname);
         if (fileSize != NULL)
         {
@@ -1041,7 +1226,11 @@ LPBYTE FileSystem::OpenFile(LPCSTR path, i32 *fileSize, BOOL isExternalResource)
             {
                 goto error;
             }
-            g_PbgArchive.ReadDecompressEntry(entryname, data);
+            if (g_PbgArchive.ReadDecompressEntry(entryname, data) == NULL)
+            {
+                g_ZunMemory.Free(data);
+                goto error;
+            }
             data = TryDecryptFromTable(data, fileSize, size);
             goto done;
         }
@@ -1208,6 +1397,11 @@ u16 Rng::GetSeed()
     return this->seed;
 }
 
+u32 Rng::GetGenerationCount() const
+{
+    return this->generationCount;
+}
+
 u16 Rng::GetRandomU16(void)
 {
     u16 temp = (this->seed ^ 0x9630) - 0x6553;
@@ -1260,10 +1454,22 @@ f32 AddNormalizeAngle(f32 a, f32 b)
 #pragma var_order(sinOut, cosOut)
 void Rotate(Float3 *outVector, Float3 *point, f32 angle)
 {
+#ifdef TH08_MODERN_PORT
+    f32 sinOut = X87CompatibleSin(angle);
+    f32 cosOut = X87CompatibleCos(angle);
+#else
     f32 sinOut = sinf(angle);
     f32 cosOut = cosf(angle);
+#endif
+#ifdef TH08_MODERN_PORT
+    outVector->x = X87CompatibleMulSub(cosOut, point->x,
+                                       sinOut, point->y);
+    outVector->y = X87CompatibleMulAdd(cosOut, point->y,
+                                       sinOut, point->x);
+#else
     outVector->x = cosOut * point->x - sinOut * point->y;
     outVector->y = cosOut * point->y + sinOut * point->x;
+#endif
 }
 
 ZunMemory::ZunMemory()

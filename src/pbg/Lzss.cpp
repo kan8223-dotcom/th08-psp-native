@@ -2,6 +2,9 @@
 
 #include "pbg/Lzss.hpp"
 #include "pbg/PbgMemory.hpp"
+#if defined(TH08_PSP_PORT)
+#include "pbg/PbgFile.hpp"
+#endif
 
 #define LZSS_BREAKEVEN 3
 #define LZSS_LOOKAHEAD_MAX ((1 << LZSS_LENGTH_BITS) + LZSS_BREAKEVEN - 1)
@@ -60,7 +63,8 @@ u8 Lzss::m_Dict[LZSS_DICTSIZE];
  * \param inSize Size of input data in bytes
  * \param out Output buffer (if NULL, a buffer will allocated automatically)
  */
-u8 *Lzss::Encode(u8 *in, i32 inSize, i32 *outSize)
+u8 *Lzss::Encode(u8 *in, i32 inSize, i32 *outSize,
+                 u8 *callerOutput, i32 callerOutputCapacity)
 {
     u8 outBitMask;
     u32 outBits;
@@ -81,7 +85,19 @@ u8 *Lzss::Encode(u8 *in, i32 inSize, i32 *outSize)
     outBits = 0;
     checksum = 0;
 
-    out = (LPBYTE)MemAlloc(inSize * 2);
+    if (in == NULL || outSize == NULL || inSize < 0 || inSize > 0x3fffffff)
+        return NULL;
+    const i32 requiredCapacity = inSize * 2;
+    if (callerOutput != NULL)
+    {
+        if (callerOutputCapacity < requiredCapacity)
+            return NULL;
+        out = callerOutput;
+    }
+    else
+    {
+        out = (LPBYTE)MemAlloc(requiredCapacity);
+    }
     if (out == NULL)
     {
         return NULL;
@@ -346,6 +362,358 @@ u8 *Lzss::Decode(u8 *in, i32 inSize, u8 *out, i32 outSize)
 #undef DECODE_UNPACK_BIT
 #undef DECODE_UNPACK_BITS
 }
+
+#if defined(TH08_PSP_PORT)
+namespace
+{
+// The archive reader can legally return a short read.  Keep requesting the
+// remainder, and distinguish a true zero-byte I/O failure from the LZSS
+// format's implicit zero bits after the declared compressed payload.
+class LzssFileBitReader
+{
+  public:
+    LzssFileBitReader(IPbgFile *file, u32 inputSize)
+        : m_File(file), m_Remaining(inputSize), m_BufferOffset(0), m_BufferSize(0),
+          m_CurrentByte(0), m_BitMask(0)
+    {
+    }
+
+    i32 ReadBit()
+    {
+        if (m_BitMask == 0)
+        {
+            if (m_BufferOffset >= m_BufferSize)
+            {
+                if (m_Remaining == 0)
+                {
+                    // Lzss::Decode supplies zero bytes once its input cursor
+                    // reaches inSize.  Keep that exact end-of-input semantic:
+                    // valid TH08 entries may obtain their offset-0 terminator
+                    // from these implicit bits.
+                    m_CurrentByte = 0;
+                    m_BitMask = 0x80;
+                }
+                else if (!FillBuffer())
+                {
+                    return -1;
+                }
+            }
+
+            if (m_BitMask == 0)
+            {
+                m_CurrentByte = m_Buffer[m_BufferOffset++];
+                m_BitMask = 0x80;
+            }
+        }
+
+        const i32 bit = (m_CurrentByte & m_BitMask) != 0;
+        m_BitMask >>= 1;
+        return bit;
+    }
+
+    bool ReadBits(i32 count, u32 *value)
+    {
+        *value = 0;
+        for (i32 bitIndex = count - 1; bitIndex >= 0; bitIndex--)
+        {
+            const i32 bit = ReadBit();
+            if (bit < 0)
+            {
+                return false;
+            }
+            if (bit != 0)
+            {
+                *value |= 1u << bitIndex;
+            }
+        }
+        return true;
+    }
+
+    bool FinishEntryRead()
+    {
+        // The old archive path read the complete compressed entry before
+        // decoding it.  Drain any bytes beyond an early end marker as well so
+        // a truncated or failed archive read is still propagated to callers.
+        while (m_Remaining != 0)
+        {
+            if (!FillBuffer())
+            {
+                return false;
+            }
+            m_BufferOffset = m_BufferSize;
+        }
+        return true;
+    }
+
+  private:
+    bool FillBuffer()
+    {
+        const u32 request =
+            m_Remaining < sizeof(m_Buffer) ? m_Remaining : static_cast<u32>(sizeof(m_Buffer));
+        const u32 bytesRead = m_File->Read(m_Buffer, request);
+        if (bytesRead == 0 || bytesRead > request)
+        {
+            return false;
+        }
+
+        m_Remaining -= bytesRead;
+        m_BufferOffset = 0;
+        m_BufferSize = bytesRead;
+        return true;
+    }
+
+    IPbgFile *m_File;
+    u32 m_Remaining;
+    u32 m_BufferOffset;
+    u32 m_BufferSize;
+    u8 m_CurrentByte;
+    u8 m_BitMask;
+    u8 m_Buffer[4096];
+};
+} // namespace
+
+u8 *Lzss::DecodeFile(IPbgFile *in, u32 inSize, u8 *out, u32 outSize)
+{
+    if (in == NULL)
+    {
+        return NULL;
+    }
+
+    bool allocatedOutput = false;
+    if (out == NULL)
+    {
+        out = (u8 *)MemAlloc(outSize);
+        if (out == NULL)
+        {
+            return NULL;
+        }
+        allocatedOutput = true;
+    }
+
+    LzssFileBitReader reader(in, inSize);
+    u8 *outCursor = out;
+    u32 dictHead = 1;
+    bool decodeSucceeded = false;
+
+    for (;;)
+    {
+        const i32 literal = reader.ReadBit();
+        if (literal < 0)
+        {
+            break;
+        }
+
+        u32 value;
+        if (literal != 0)
+        {
+            if (!reader.ReadBits(8, &value) || static_cast<u32>(outCursor - out) >= outSize)
+            {
+                break;
+            }
+
+            *outCursor++ = static_cast<u8>(value);
+            m_Dict[dictHead] = static_cast<u8>(value);
+            dictHead = LZSS_DICTPOS_MOD(dictHead, 1);
+            continue;
+        }
+
+        if (!reader.ReadBits(LZSS_OFFSET_BITS, &value))
+        {
+            break;
+        }
+        const u32 matchOffset = value;
+        if (matchOffset == 0)
+        {
+            decodeSucceeded = static_cast<u32>(outCursor - out) == outSize && reader.FinishEntryRead();
+            break;
+        }
+
+        if (!reader.ReadBits(LZSS_LENGTH_BITS, &value))
+        {
+            break;
+        }
+        const u32 matchLength = value + LZSS_BREAKEVEN;
+        const u32 produced = static_cast<u32>(outCursor - out);
+        if (matchLength > outSize - produced)
+        {
+            break;
+        }
+        for (u32 i = 0; i < matchLength; i++)
+        {
+            const u8 dictValue = m_Dict[LZSS_DICTPOS_MOD(matchOffset, i)];
+            *outCursor++ = dictValue;
+            m_Dict[dictHead] = dictValue;
+            dictHead = LZSS_DICTPOS_MOD(dictHead, 1);
+        }
+    }
+
+    if (!decodeSucceeded)
+    {
+        if (allocatedOutput)
+        {
+            MemFree(out);
+        }
+        return NULL;
+    }
+    return out;
+}
+
+namespace
+{
+class LzssStreamWriter
+{
+  public:
+    LzssStreamWriter(Lzss::StreamSinkWrite sink, void *sinkContext,
+                     Lzss::StreamWorkspace *workspace, u32 expectedSize)
+        : m_Sink(sink), m_SinkContext(sinkContext), m_Workspace(workspace),
+          m_ExpectedSize(expectedSize), m_Produced(0), m_BufferSize(0)
+    {
+        // A valid encoder never refers to dictionary bytes which have not
+        // already been produced by this stream.  Clearing the private copy
+        // also makes malformed-input behaviour deterministic and prevents one
+        // transaction from inheriting data from another.
+        for (u32 i = 0; i < LZSS_DICTSIZE; i++)
+        {
+            m_Workspace->dictionary[i] = 0;
+        }
+    }
+
+    Lzss::StreamResult WriteByte(u8 value, u32 *dictHead)
+    {
+        if (m_Produced >= m_ExpectedSize)
+        {
+            return Lzss::STREAM_OUTPUT_OVERFLOW;
+        }
+
+        m_Workspace->output[m_BufferSize++] = value;
+        m_Workspace->dictionary[*dictHead] = value;
+        *dictHead = LZSS_DICTPOS_MOD(*dictHead, 1);
+        m_Produced++;
+
+        if (m_BufferSize == Lzss::STREAM_OUTPUT_BUFFER_SIZE)
+        {
+            return Flush();
+        }
+        return Lzss::STREAM_SUCCESS;
+    }
+
+    Lzss::StreamResult Finish()
+    {
+        if (m_Produced != m_ExpectedSize)
+        {
+            return Lzss::STREAM_OUTPUT_SIZE_MISMATCH;
+        }
+        return Flush();
+    }
+
+    u32 Produced() const
+    {
+        return m_Produced;
+    }
+
+  private:
+    Lzss::StreamResult Flush()
+    {
+        if (m_BufferSize == 0)
+        {
+            return Lzss::STREAM_SUCCESS;
+        }
+
+        const u32 consumed = m_Sink(m_SinkContext, m_Workspace->output, m_BufferSize);
+        if (consumed != m_BufferSize)
+        {
+            return Lzss::STREAM_SINK_WRITE_FAILED;
+        }
+        m_BufferSize = 0;
+        return Lzss::STREAM_SUCCESS;
+    }
+
+    Lzss::StreamSinkWrite m_Sink;
+    void *m_SinkContext;
+    Lzss::StreamWorkspace *m_Workspace;
+    u32 m_ExpectedSize;
+    u32 m_Produced;
+    u32 m_BufferSize;
+};
+} // namespace
+
+Lzss::StreamResult Lzss::DecodeFileToSink(IPbgFile *in, u32 inSize, u32 outSize,
+                                          StreamSinkWrite sink, void *sinkContext,
+                                          StreamWorkspace *workspace)
+{
+    if (in == NULL || sink == NULL || workspace == NULL)
+    {
+        return STREAM_INVALID_ARGUMENT;
+    }
+
+    LzssFileBitReader reader(in, inSize);
+    LzssStreamWriter writer(sink, sinkContext, workspace, outSize);
+    u32 dictHead = 1;
+
+    for (;;)
+    {
+        const i32 literal = reader.ReadBit();
+        if (literal < 0)
+        {
+            return STREAM_INPUT_READ_FAILED;
+        }
+
+        u32 value;
+        if (literal != 0)
+        {
+            if (!reader.ReadBits(8, &value))
+            {
+                return STREAM_INPUT_READ_FAILED;
+            }
+
+            const StreamResult writeResult = writer.WriteByte(static_cast<u8>(value), &dictHead);
+            if (writeResult != STREAM_SUCCESS)
+            {
+                return writeResult;
+            }
+            continue;
+        }
+
+        if (!reader.ReadBits(LZSS_OFFSET_BITS, &value))
+        {
+            return STREAM_INPUT_READ_FAILED;
+        }
+        const u32 matchOffset = value;
+        if (matchOffset == 0)
+        {
+            if (writer.Produced() != outSize)
+            {
+                return STREAM_OUTPUT_SIZE_MISMATCH;
+            }
+            if (!reader.FinishEntryRead())
+            {
+                return STREAM_INPUT_READ_FAILED;
+            }
+            return writer.Finish();
+        }
+
+        if (!reader.ReadBits(LZSS_LENGTH_BITS, &value))
+        {
+            return STREAM_INPUT_READ_FAILED;
+        }
+        const u32 matchLength = value + LZSS_BREAKEVEN;
+        if (matchLength > outSize - writer.Produced())
+        {
+            return STREAM_OUTPUT_OVERFLOW;
+        }
+
+        for (u32 i = 0; i < matchLength; i++)
+        {
+            const u8 dictValue = workspace->dictionary[LZSS_DICTPOS_MOD(matchOffset, i)];
+            const StreamResult writeResult = writer.WriteByte(dictValue, &dictHead);
+            if (writeResult != STREAM_SUCCESS)
+            {
+                return writeResult;
+            }
+        }
+    }
+}
+#endif
 
 void Lzss::InitTree(i32 root)
 {

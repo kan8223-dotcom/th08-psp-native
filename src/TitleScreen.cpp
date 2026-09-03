@@ -193,13 +193,46 @@ static bool StartDeveloperReplayIfRequested()
         return false;
     requestConsumed = true;
 
+    // Cross-platform replay oracles normally start as an ordinary replay.
+    // An opt-in demo index reproduces the built-in title-demo control state as
+    // well, so isDemoMode/demoFrameCount do not create a launcher-only hash
+    // difference against PSP.  The variable is absent in production runs.
+    bool autoplayAsDemo = false;
+    int autoplayDemoIndex = -1;
+    const char *demoIndexValue = getenv("TH08_AUTOPLAY_DEMO_INDEX");
+    if (demoIndexValue != NULL && demoIndexValue[0] != '\0')
+    {
+        char *end = NULL;
+        const long parsed = strtol(demoIndexValue, &end, 10);
+        if (end == demoIndexValue || *end != '\0' || parsed < 0 ||
+            parsed >= ARRAY_SIZE_SIGNED(g_DemoReplayFiles))
+        {
+            utils::DebugPrint(
+                "error : developer demo index is out of range: %s\r\n",
+                demoIndexValue);
+            g_Supervisor.curState = SupervisorState_ExitGame;
+            return true;
+        }
+        autoplayAsDemo = true;
+        autoplayDemoIndex = static_cast<int>(parsed);
+    }
+
+    // Demo-mode playback must reopen the replay from the PBG archive later
+    // (ReplayManager passes useGameDirectory=FALSE).  Use that same canonical
+    // archive path for this validation load, rather than retaining the loose
+    // developer file path and creating a launcher-only playback failure.
+    const char *replayOpenPath = autoplayAsDemo
+                                     ? g_DemoReplayFiles[autoplayDemoIndex]
+                                     : replayPath;
+    const BOOL useGameDirectory = autoplayAsDemo ? FALSE : TRUE;
     i32 fileSize = 0;
     ReplayData *replay = reinterpret_cast<ReplayData *>(
-        FileSystem::OpenFile(replayPath, &fileSize, TRUE));
+        FileSystem::OpenFile(replayOpenPath, &fileSize, useGameDirectory));
     replay = ReplayManager::LoadReplayData(replay, fileSize);
     if (replay == NULL)
     {
-        utils::DebugPrint("error : developer replay could not be loaded: %s\r\n", replayPath);
+        utils::DebugPrint("error : developer replay could not be loaded: %s\r\n",
+                          replayOpenPath);
         g_Supervisor.curState = SupervisorState_ExitGame;
         return true;
     }
@@ -228,21 +261,47 @@ static bool StartDeveloperReplayIfRequested()
     }
 
     g_GameManager.SetIsReplayWeird(TRUE);
-    strncpy(g_GameManager.replayFilename, replayPath,
+    strncpy(g_GameManager.replayFilename, replayOpenPath,
             sizeof(g_GameManager.replayFilename) - 1);
     g_GameManager.replayFilename[sizeof(g_GameManager.replayFilename) - 1] = '\0';
     g_GameManager.difficulty = replay->difficulty;
+    if (autoplayAsDemo)
+    {
+        // Preserve the built-in title-demo setup order.  GameManager derives
+        // characterListIndex before ReplayManager reopens the stage data.
+        g_GameManager.shotType = replay->shotType / 2;
+        g_GameManager.fullShotType = replay->shotType % 2;
+    }
     g_GameManager.shotType = replay->shotType;
-    g_GameManager.flags.isDemoMode = FALSE;
+    g_GameManager.flags.isDemoMode = autoplayAsDemo ? TRUE : FALSE;
+    if (autoplayAsDemo)
+    {
+        g_GameManager.currentDemoReplay =
+            static_cast<u8>(autoplayDemoIndex);
+        g_GameManager.demoFrameCount = 0;
+    }
     g_GameManager.flags.isPracticeMode = FALSE;
-    g_GameManager.flags.isSpellPractice = replay->spellcardNumber >= 0;
-    g_GameManager.currentSpellCardNumber = replay->spellcardNumber;
+    if (autoplayAsDemo)
+    {
+        // The retail title-demo path clears only the mode flag.  Writing -1
+        // into currentSpellCardNumber here creates a launcher-only core hash
+        // difference even though spell practice is disabled.
+        g_GameManager.flags.isSpellPractice = FALSE;
+    }
+    else
+    {
+        g_GameManager.flags.isSpellPractice = replay->spellcardNumber >= 0;
+        g_GameManager.currentSpellCardNumber = replay->spellcardNumber;
+    }
     g_GameManager.currentStage = stage;
     g_GameManager.replayMode = REPLAY_MODE_NORMAL;
     g_ZunMemory.Free(replay);
 
     g_Supervisor.curState = SupervisorState_GameManager;
-    g_Supervisor.StopAudio();
+    if (!autoplayAsDemo)
+    {
+        g_Supervisor.StopAudio();
+    }
     return true;
 }
 #endif

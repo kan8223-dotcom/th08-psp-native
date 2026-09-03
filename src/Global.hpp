@@ -9,6 +9,12 @@
 #include <stddef.h>
 #include <windows.h>
 
+#if defined(PSP)
+extern "C" void *th08_psp_tracked_malloc(size_t size, const char *owner);
+extern "C" void *th08_psp_tracked_realloc(void *memory, size_t size, const char *owner);
+extern "C" void th08_psp_tracked_free(void *memory);
+#endif
+
 // Serialized file structures keep their original byte contract on every
 // target. The Linux compatibility header supplies a distinct assertion in
 // native-layout builds; VC7 can use its normal compile-time C_ASSERT.
@@ -199,8 +205,14 @@ namespace FileSystem
 {
 LPBYTE Decrypt(LPBYTE inData, i32 size, u8 xorValue, u8 xorValueInc, i32 chunkSize, i32 maxBytes);
 LPBYTE TryDecryptFromTable(LPBYTE inData, LPINT unused, i32 size);
-LPBYTE Encrypt(LPBYTE inData, i32 size, u8 xorValue, u8 xorValueInc, i32 chunkSize, i32 maxBytes);
+LPBYTE Encrypt(LPBYTE inData, i32 size, u8 xorValue, u8 xorValueInc, i32 chunkSize,
+               i32 maxBytes, LPBYTE outBuffer = NULL, i32 outCapacity = 0);
 LPBYTE OpenFile(LPCSTR path, i32 *fileSize, BOOL isExternalResource);
+#if defined(PSP)
+DWORD GetArchiveEntrySize(LPCSTR path);
+LPBYTE OpenArchiveFileInto(LPCSTR path, i32 *fileSize, LPBYTE destination,
+                           size_t destinationCapacity);
+#endif
 BOOL CheckIfFileAlreadyExists(LPCSTR path);
 int WriteDataToFile(LPCSTR path, LPVOID data, size_t size);
 }; // namespace FileSystem
@@ -252,6 +264,11 @@ class Rng
     void ResetGenerationCount();
     void SetSeed(u16 newSeed);
     u16 GetSeed();
+    u16 GetSavedSeed() const
+    {
+        return this->seedBackup;
+    }
+    u32 GetGenerationCount() const;
 
     void SaveSeed()
     {
@@ -297,12 +314,20 @@ class ZunMemory
     // NOTE: the default parameter for debugText is probably just __FILE__
     void *Alloc(size_t size, const char *debugText = "d:\\cygwin\\home\\zun\\prog\\th08\\global.h")
     {
+#if defined(PSP)
+        return th08_psp_tracked_malloc(size, debugText);
+#else
         return malloc(size);
+#endif
     }
 
     void Free(void *ptr)
     {
+#if defined(PSP)
+        th08_psp_tracked_free(ptr);
+#else
         free(ptr);
+#endif
     }
 
     void *AddToRegistry(void *ptr, size_t size, char *name)

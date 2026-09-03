@@ -10,9 +10,15 @@
 #define WINAPI
 #define CALLBACK
 #define APIENTRY
+#ifndef __stdcall
 #define __stdcall
+#endif
+#ifndef __cdecl
 #define __cdecl
+#endif
+#ifndef __fastcall
 #define __fastcall
+#endif
 #define __int64 long long
 #define CONST const
 #define FAR
@@ -162,7 +168,18 @@ typedef struct _WIN32_FIND_DATAA {
     CHAR cAlternateFileName[14];
 } WIN32_FIND_DATAA, WIN32_FIND_DATA;
 
+#if defined(PSP)
+// Win32 CRITICAL_SECTION is 24 bytes in the original 32-bit TH08 layouts.
+// PSPSDK's pthread_mutex_t has a different representation, so retain only a
+// pointer to the native mutex inside an ABI-compatible owner object.
+typedef struct _CRITICAL_SECTION {
+    pthread_mutex_t *native;
+    BYTE reserved[20];
+} CRITICAL_SECTION;
+typedef char __PSP_CRITICAL_SECTION_SIZE_CHECK[(sizeof(CRITICAL_SECTION) == 24) ? 1 : -1];
+#else
 typedef pthread_mutex_t CRITICAL_SECTION;
+#endif
 typedef DWORD(WINAPI *LPTHREAD_START_ROUTINE)(LPVOID);
 
 typedef struct _GUID {
@@ -353,6 +370,10 @@ int SetBkMode(HDC, int);
 COLORREF SetTextColor(HDC, COLORREF);
 HFONT CreateFontA(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCSTR);
 HBITMAP CreateDIBSection(HDC, const void *, UINT, VOID **, HANDLE, DWORD);
+#if defined(PSP)
+BOOL th08_psp_gdi_text_initialize(void);
+void th08_psp_gdi_text_shutdown(void);
+#endif
 
 HRESULT CoInitialize(LPVOID);
 void CoUninitialize(void);

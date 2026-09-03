@@ -2,35 +2,1830 @@ export PATH := /usr/local/pspdev/bin:$(PATH)
 export PSPDEV := /usr/local/pspdev
 
 TARGET := TH08PSP
-OBJS := \
-	psp/main.o \
-	psp/platform.o \
-	psp/fileio.o \
-	psp/video.o
 
-PSP_EBOOT_TITLE := Touhou 8 PSP SC Bootstrap
+# Diagnostic builds retain the full frame/memory/audio observers.  Product
+# candidates set this to 0, which removes their translation units and replaces
+# the tracked allocator with an ownership-only implementation.
+TH08_PSP_RUNTIME_TELEMETRY ?= 1
+
+# Default-off attribution probe for hardware-only performance diagnosis.  It
+# is independent of the heavyweight runtime telemetry switch, keeps only
+# fixed aggregate counters, and writes one buffered line per 600 stage ticks.
+# A zero build does not compile the observer or wrap GE/display wait symbols.
+TH08_PSP_PERF_ATTRIBUTION ?= 0
+
+# Default-off 1/16 presented-frame sampler which decomposes DrawChain by its
+# canonical priority callbacks.  It is a child of PERF_ATTRIBUTION so both
+# reports share exactly the same 600-stage-tick window boundaries.
+TH08_PSP_DRAW_PRIORITY_SUBPROFILE ?= 0
+
+# Default-off Item update sub-profile.  Every simulation tick it counts the
+# whole active item population by state/branch and times a rotating 1-of-32
+# list-position sample (whole/autocollect/collision/script).  It is a child of
+# PERF_ATTRIBUTION and emits one ITEM_UPD V1 line per parent window.
+TH08_PSP_ITEM_UPDATE_SUBPROFILE ?= 0
+
+# Item autocollect atan2 fast path.  AUDIT keeps the canonical
+# Player::AngleToPoint result and shadow-runs the double-float fast path on
+# every call (bit compare, raw-delta/angle repeat rates, sampled timing).
+# The product switch uses the fast path when it accepts and falls back to the
+# canonical call otherwise.  Both default OFF and are mutually exclusive.
+TH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT ?= 0
+TH08_PSP_ITEM_ATAN2_FASTPATH ?= 0
+
+# Item autocollect velocity sin/cos-multiply fast path (same contract as the
+# atan2 switches): AUDIT shadow-compares against FromAngleMagnitude, the
+# product switch substitutes identical binary32 products when accepted.
+TH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT ?= 0
+TH08_PSP_ITEM_SINCOS_FASTPATH ?= 0
+
+# Default-off soft-float census: linker-wraps the libgcc binary64 helpers and
+# the libm entry points to count calls per PERF_ATTR phase and per operation
+# class (one SOFTFLOAT V1 line per parent window).  Child of PERF_ATTRIBUTION.
+TH08_PSP_SOFTFLOAT_CENSUS ?= 0
+
+# SC audio mixer resampling cursor.  AUDIT keeps the canonical binary64 cursor
+# and shadow-runs the exact fixed-point cursor per output frame (frame index,
+# wrap and final cursor compared); the product switch uses the fixed-point
+# cursor whenever 44100 / rate is a power of two and falls back otherwise.
+# The PC oracle build never sees these switches.  Mutually exclusive.
+TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT ?= 0
+TH08_PSP_AUDIO_FIXED_CURSOR ?= 0
+
+# x87-compatible trig helpers (ZunMath.hpp) on the Item double-float fast
+# paths: FromAngleMagnitude/FromRotatedVec2, X87CompatibleSin/Cos(+Mul) and
+# X87CompatibleAtan2 for every caller (Bullet/Enemy/ECL/Player/Effect).
+# AUDIT shadow-compares, the product switch replaces accepted calls.
+# Mutually exclusive, default OFF; the PC oracle build never sees them.
+TH08_PSP_TRIG_DF_FASTPATH_AUDIT ?= 0
+TH08_PSP_TRIG_DF_FASTPATH ?= 0
+
+# Execution-environment record per PERF_ATTR window (R-038): effective CPU/bus
+# clock at window start/end, a fresh timer calibration, main-thread kernel run
+# clocks and preemption counts, and sceGeListSync waits reached outside the
+# swap context attributed to the innermost phase (and, with the draw-priority
+# sub-profile, to the running draw priority).  Child of PERF_ATTRIBUTION.
+TH08_PSP_PERF_ENV ?= 0
+
+# Present without the PSPGL VBlank wait (swap interval 0); the cadence wait
+# owns the 60 Hz pacing and the compat device waits for the pending flip before
+# the next frame's first GE write.  Default OFF.
+TH08_PSP_SWAP_NOWAIT ?= 0
+
+# Asynchronous flip thread on top of SWAP_NOWAIT: Present hands the finished
+# buffer to a flip thread (sceGeDrawSync + sceDisplaySetFrameBuf) so the GE
+# tail overlaps the next simulation ticks.  Requires SWAP_NOWAIT=1.  Default OFF.
+TH08_PSP_SWAP_ASYNC ?= 0
+
+# Child of SWAP_NOWAIT: apply the flip guard only before GE writes that reach
+# the colour buffer (BeginScene, Draw, DrawIndexed, Clear with TARGET or
+# STENCIL).  GameManager's depth-only Clear inside the calc chain no longer
+# waits for the display to show the previous frame; the wait moves to the draw
+# chain's first colour write, which the simulation ticks in between have
+# usually already covered.  Requires SWAP_NOWAIT=1.  Default OFF.
+TH08_PSP_FLIP_GUARD_COLOR_ONLY ?= 0
+
+# Run a simulation tick on every Render call instead of spinning on the retail
+# 1/60 wall-clock gate; the PSP render cadence (VBlank) paces the loop.
+# Timing only: input, RNG and replay bytes are unchanged.  Default OFF.
+TH08_PSP_TICK_GATE_BYPASS ?= 0
+
+# Diagnostic-only PSP Go storage activity lamp.  The build gate is default
+# OFF; an ON build still enables at runtime only when kuKernelGetModel()==4.
+# Ordinary/recent syscalls draw amber and >=100 ms syscalls latch red after
+# return, making ef0 driver stalls attributable without changing I/O policy.
+TH08_PSP_GO_IO_LAMP ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_GO_IO_LAMP)),)
+$(error TH08_PSP_GO_IO_LAMP must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_GO_IO_LAMP),1)
+PSP_GO_IO_LAMP_SRCS := psp/io_activity_lamp.cpp
+else
+PSP_GO_IO_LAMP_SRCS :=
+endif
+
+# Third colour buffer on top of SWAP_NOWAIT: Present rotates buffers without
+# waiting for the GE, the flip is issued from the main thread once the frame's
+# display lists are done (list-submission hook / loop head / next Present), and
+# the next frame draws into a buffer that is neither displayed nor pending.
+# Requires SWAP_NOWAIT=1, exclusive with SWAP_ASYNC.  Default OFF.
+TH08_PSP_SWAP_TRIPLE ?= 0
+
+# HUD border tile replay (Gui::DrawGameScene): AUDIT keeps the canonical
+# loops and compares their vertices with the stored record; the product switch
+# replays the record when the sprite/manager key is unchanged.  Exclusive.
+TH08_PSP_GUI_BORDER_REPLAY_AUDIT ?= 0
+TH08_PSP_GUI_BORDER_REPLAY ?= 0
+
+# Product bullet collision negative gate proven by TH08_PSP_BULLET_COLLISION_GATE_AUDIT
+# (Codex handoff section 10): a bullet strictly separated from the canonical
+# first-call box with an empty cancel set skips the graze/lethal scan and
+# reproduces bulletCancelItemType=6.  Requires PLAYER_SCAN_SIDECAR=1; exclusive
+# with the audit.  Default OFF.
+TH08_PSP_BULLET_COLLISION_GATE ?= 0
+
+# Shadow audit of the Effect occupancy sidecar (canonical visits, bit compared).
+# Exclusive with TH08_PSP_EFFECT_OCCUPANCY_FASTPATH.  Default OFF.
+TH08_PSP_EFFECT_OCCUPANCY_AUDIT ?= 0
+comma := ,
+
+# Product builds retain the established 60-present default (mode 0).
+# Hardware diagnostics may opt into mode 2 (20 presents) or mode 1 (30
+# presents, the 2026-09-03 target) so a run starts directly at that cadence
+# without requiring an uncertain SELECT press.
+TH08_PSP_RENDER_CADENCE_INITIAL_MODE ?= 0
+ifneq ($(filter-out 0 1 2,$(TH08_PSP_RENDER_CADENCE_INITIAL_MODE)),)
+$(error TH08_PSP_RENDER_CADENCE_INITIAL_MODE must be 0, 1 or 2)
+endif
+
+# The frozen TH07 wrapper was originally model-3-only. TH07 later proved on
+# real PSP Go hardware that changing only that wrapper predicate to Slim+
+# (model >= 1), while retaining the physical-size/base/visible-size/readback
+# gates, safely exposes the same 4 MiB GE aperture. Model 0 keeps the ordinary
+# 2 MiB fallback.
+TH08_PSP_SLIMPLUS_GE4 ?= 1
+
+ifeq ($(TH08_PSP_RUNTIME_TELEMETRY),1)
+PSP_RUNTIME_TELEMETRY_SRCS := \
+	psp/audio_telemetry.cpp \
+	psp/memory_telemetry.cpp \
+	psp/radial_trail_telemetry.cpp \
+	psp/render_perf_telemetry.cpp
+else ifeq ($(TH08_PSP_RUNTIME_TELEMETRY),0)
+PSP_RUNTIME_TELEMETRY_SRCS := psp/memory_runtime.cpp
+else
+$(error TH08_PSP_RUNTIME_TELEMETRY must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+PSP_PERF_ATTRIBUTION_SRCS := psp/perf_attribution.cpp
+else ifeq ($(TH08_PSP_PERF_ATTRIBUTION),0)
+PSP_PERF_ATTRIBUTION_SRCS :=
+else
+$(error TH08_PSP_PERF_ATTRIBUTION must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_DRAW_PRIORITY_SUBPROFILE),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_DRAW_PRIORITY_SUBPROFILE=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+PSP_DRAW_PRIORITY_SUBPROFILE_SRCS := psp/draw_priority_subprofile.cpp
+else ifeq ($(TH08_PSP_DRAW_PRIORITY_SUBPROFILE),0)
+PSP_DRAW_PRIORITY_SUBPROFILE_SRCS :=
+else
+$(error TH08_PSP_DRAW_PRIORITY_SUBPROFILE must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_UPDATE_SUBPROFILE),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_ITEM_UPDATE_SUBPROFILE=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+PSP_ITEM_UPDATE_SUBPROFILE_SRCS := psp/item_update_subprofile.cpp
+else ifeq ($(TH08_PSP_ITEM_UPDATE_SUBPROFILE),0)
+PSP_ITEM_UPDATE_SUBPROFILE_SRCS :=
+else
+$(error TH08_PSP_ITEM_UPDATE_SUBPROFILE must be 0 or 1)
+endif
+
+ifneq ($(filter-out 0 1,$(TH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT)),)
+$(error TH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_ITEM_ATAN2_FASTPATH)),)
+$(error TH08_PSP_ITEM_ATAN2_FASTPATH must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT)$(TH08_PSP_ITEM_ATAN2_FASTPATH),11)
+$(error TH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT and TH08_PSP_ITEM_ATAN2_FASTPATH are mutually exclusive)
+endif
+ifeq ($(TH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+endif
+ifeq ($(TH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT)$(TH08_PSP_ITEM_ATAN2_FASTPATH),00)
+PSP_ITEM_ATAN2_SRCS :=
+else
+PSP_ITEM_ATAN2_SRCS := psp/item_atan2_audit.cpp
+endif
+
+ifneq ($(filter-out 0 1,$(TH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT)),)
+$(error TH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_ITEM_SINCOS_FASTPATH)),)
+$(error TH08_PSP_ITEM_SINCOS_FASTPATH must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT)$(TH08_PSP_ITEM_SINCOS_FASTPATH),11)
+$(error TH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT and TH08_PSP_ITEM_SINCOS_FASTPATH are mutually exclusive)
+endif
+ifeq ($(TH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+endif
+ifeq ($(TH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT)$(TH08_PSP_ITEM_SINCOS_FASTPATH),00)
+PSP_ITEM_SINCOS_SRCS :=
+else
+PSP_ITEM_SINCOS_SRCS := psp/item_sincos_audit.cpp
+endif
+
+ifeq ($(TH08_PSP_SOFTFLOAT_CENSUS),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_SOFTFLOAT_CENSUS=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+PSP_SOFTFLOAT_CENSUS_SRCS := psp/softfloat_census.cpp
+else ifeq ($(TH08_PSP_SOFTFLOAT_CENSUS),0)
+PSP_SOFTFLOAT_CENSUS_SRCS :=
+else
+$(error TH08_PSP_SOFTFLOAT_CENSUS must be 0 or 1)
+endif
+
+ifneq ($(filter-out 0 1,$(TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT)),)
+$(error TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_AUDIO_FIXED_CURSOR)),)
+$(error TH08_PSP_AUDIO_FIXED_CURSOR must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT)$(TH08_PSP_AUDIO_FIXED_CURSOR),11)
+$(error TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT and TH08_PSP_AUDIO_FIXED_CURSOR are mutually exclusive)
+endif
+ifeq ($(TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+endif
+ifeq ($(TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT)$(TH08_PSP_AUDIO_FIXED_CURSOR),00)
+PSP_AUDIO_CURSOR_SRCS :=
+else
+PSP_AUDIO_CURSOR_SRCS := psp/audio_cursor_audit.cpp
+endif
+
+ifneq ($(filter-out 0 1,$(TH08_PSP_TRIG_DF_FASTPATH_AUDIT)),)
+$(error TH08_PSP_TRIG_DF_FASTPATH_AUDIT must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_TRIG_DF_FASTPATH)),)
+$(error TH08_PSP_TRIG_DF_FASTPATH must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_TRIG_DF_FASTPATH_AUDIT)$(TH08_PSP_TRIG_DF_FASTPATH),11)
+$(error TH08_PSP_TRIG_DF_FASTPATH_AUDIT and TH08_PSP_TRIG_DF_FASTPATH are mutually exclusive)
+endif
+ifeq ($(TH08_PSP_TRIG_DF_FASTPATH_AUDIT),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_TRIG_DF_FASTPATH_AUDIT=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+endif
+ifeq ($(TH08_PSP_TRIG_DF_FASTPATH_AUDIT)$(TH08_PSP_TRIG_DF_FASTPATH),00)
+PSP_TRIG_DF_SRCS :=
+else
+PSP_TRIG_DF_SRCS := psp/trig_df_fastpath.cpp
+endif
+
+ifeq ($(TH08_PSP_PERF_ENV),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_PERF_ENV=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+PSP_PERF_ENV_SRCS := psp/perf_env.cpp
+else ifeq ($(TH08_PSP_PERF_ENV),0)
+PSP_PERF_ENV_SRCS :=
+else
+$(error TH08_PSP_PERF_ENV must be 0 or 1)
+endif
+
+ifneq ($(filter-out 0 1,$(TH08_PSP_SWAP_NOWAIT)),)
+$(error TH08_PSP_SWAP_NOWAIT must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_SWAP_ASYNC),1)
+ifneq ($(TH08_PSP_SWAP_NOWAIT),1)
+$(error TH08_PSP_SWAP_ASYNC=1 requires TH08_PSP_SWAP_NOWAIT=1)
+endif
+else ifneq ($(TH08_PSP_SWAP_ASYNC),0)
+$(error TH08_PSP_SWAP_ASYNC must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_FLIP_GUARD_COLOR_ONLY),1)
+ifneq ($(TH08_PSP_SWAP_NOWAIT),1)
+$(error TH08_PSP_FLIP_GUARD_COLOR_ONLY=1 requires TH08_PSP_SWAP_NOWAIT=1)
+endif
+else ifneq ($(TH08_PSP_FLIP_GUARD_COLOR_ONLY),0)
+$(error TH08_PSP_FLIP_GUARD_COLOR_ONLY must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_TICK_GATE_BYPASS)),)
+$(error TH08_PSP_TICK_GATE_BYPASS must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_SWAP_TRIPLE),1)
+ifneq ($(TH08_PSP_SWAP_NOWAIT),1)
+$(error TH08_PSP_SWAP_TRIPLE=1 requires TH08_PSP_SWAP_NOWAIT=1)
+endif
+ifeq ($(TH08_PSP_SWAP_ASYNC),1)
+$(error TH08_PSP_SWAP_TRIPLE and TH08_PSP_SWAP_ASYNC are mutually exclusive)
+endif
+PSP_SWAP_TRIPLE_SRCS := psp/swap_triple.cpp
+else ifeq ($(TH08_PSP_SWAP_TRIPLE),0)
+PSP_SWAP_TRIPLE_SRCS :=
+else
+$(error TH08_PSP_SWAP_TRIPLE must be 0 or 1)
+endif
+# Single owner of the sceGeListEnQueue wrap (PERF_ENV observer, SWAP_TRIPLE poll).
+ifeq ($(TH08_PSP_PERF_ENV)$(TH08_PSP_SWAP_TRIPLE),00)
+PSP_GE_LIST_HOOK_SRCS :=
+else
+PSP_GE_LIST_HOOK_SRCS := psp/ge_list_hook.cpp
+endif
+# The module also hosts the display-identity flip guard used by SWAP_NOWAIT.
+ifeq ($(TH08_PSP_SWAP_NOWAIT)$(TH08_PSP_SWAP_ASYNC),00)
+PSP_SWAP_ASYNC_SRCS :=
+else
+PSP_SWAP_ASYNC_SRCS := psp/swap_async.cpp
+endif
+
+ifneq ($(filter-out 0 1,$(TH08_PSP_GUI_BORDER_REPLAY_AUDIT)),)
+$(error TH08_PSP_GUI_BORDER_REPLAY_AUDIT must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_GUI_BORDER_REPLAY)),)
+$(error TH08_PSP_GUI_BORDER_REPLAY must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_GUI_BORDER_REPLAY_AUDIT)$(TH08_PSP_GUI_BORDER_REPLAY),11)
+$(error TH08_PSP_GUI_BORDER_REPLAY_AUDIT and TH08_PSP_GUI_BORDER_REPLAY are mutually exclusive)
+endif
+ifeq ($(TH08_PSP_GUI_BORDER_REPLAY_AUDIT),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_GUI_BORDER_REPLAY_AUDIT=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+endif
+ifeq ($(TH08_PSP_GUI_BORDER_REPLAY_AUDIT)$(TH08_PSP_GUI_BORDER_REPLAY),00)
+PSP_GUI_BORDER_SRCS :=
+else
+PSP_GUI_BORDER_SRCS := psp/gui_border_replay.cpp
+endif
+
+ifeq ($(TH08_PSP_BULLET_COLLISION_GATE),1)
+ifneq ($(TH08_PSP_PLAYER_SCAN_SIDECAR),1)
+$(error TH08_PSP_BULLET_COLLISION_GATE=1 requires TH08_PSP_PLAYER_SCAN_SIDECAR=1)
+endif
+ifeq ($(TH08_PSP_BULLET_COLLISION_GATE_AUDIT),1)
+$(error TH08_PSP_BULLET_COLLISION_GATE and TH08_PSP_BULLET_COLLISION_GATE_AUDIT are mutually exclusive)
+endif
+PSP_BULLET_GATE_SRCS := psp/bullet_gate_stats.cpp
+else ifeq ($(TH08_PSP_BULLET_COLLISION_GATE),0)
+PSP_BULLET_GATE_SRCS :=
+else
+$(error TH08_PSP_BULLET_COLLISION_GATE must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_EFFECT_OCCUPANCY_AUDIT),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_EFFECT_OCCUPANCY_AUDIT=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+ifeq ($(TH08_PSP_EFFECT_OCCUPANCY_FASTPATH),1)
+$(error TH08_PSP_EFFECT_OCCUPANCY_AUDIT and TH08_PSP_EFFECT_OCCUPANCY_FASTPATH are mutually exclusive)
+endif
+PSP_EFFECT_OCCUPANCY_AUDIT_SRCS := psp/effect_occupancy_audit.cpp
+else ifeq ($(TH08_PSP_EFFECT_OCCUPANCY_AUDIT),0)
+PSP_EFFECT_OCCUPANCY_AUDIT_SRCS :=
+else
+$(error TH08_PSP_EFFECT_OCCUPANCY_AUDIT must be 0 or 1)
+endif
+
+# Keep the complete authored game closure in one explicit list.  The PSP host
+# enters the same WinMain/game loop as the portable desktop target once the
+# original 1.00d archives have passed the bootstrap probes.
+TH08_GAME_SRCS := \
+	src/AnmManager.cpp \
+	src/AsciiManager.cpp \
+	src/AsciiManagerBossMarker.cpp \
+	src/AsciiManagerGauge.cpp \
+	src/AsciiManagerGuiMode.cpp \
+	src/AsciiManagerScale.cpp \
+	src/Background.cpp \
+	src/BulletManager.cpp \
+	src/EclDependencies.cpp \
+	src/EclExIns.cpp \
+	src/EclGlobals.cpp \
+	src/EclHelpers.cpp \
+	src/EclManager.cpp \
+	src/EclOperandsFloat.cpp \
+	src/EclOperandsInt.cpp \
+	src/EclRun.cpp \
+	src/EffectManager.cpp \
+	src/Ending.cpp \
+	src/EnemyManager.cpp \
+	src/EnemyManagerUpdate.cpp \
+	src/EnemyTimeline.cpp \
+	src/GameManager.cpp \
+	src/Global.cpp \
+	src/Gui.cpp \
+	src/ItemManager.cpp \
+	src/Midi.cpp \
+	src/MusicRoom.cpp \
+	src/Player.cpp \
+	src/PlayerBomb.cpp \
+	src/ReplaySyncAudit.cpp \
+	src/ReplayManager.cpp \
+	src/ResultScreen.cpp \
+	src/ScoreDat.cpp \
+	src/ScreenEffect.cpp \
+	src/SoundPlayer.cpp \
+	src/Spellcard.cpp \
+	src/Supervisor.cpp \
+	src/TextHelper.cpp \
+	src/TitleScreen.cpp \
+	src/main.cpp \
+	src/utils.cpp \
+	src/zwave.cpp \
+	src/pbg/Lzss.cpp \
+	src/pbg/PbgArchive.cpp \
+	src/pbg/PbgFile.cpp
+
+TH08_PORTABLE_SRCS := \
+	src/modern/linux/d3d8_compat.cpp \
+	src/modern/linux/d3dx8_compat.cpp \
+	src/modern/linux/linux_compat.cpp \
+	src/modern/linux/linux_runtime.cpp
+
+PSP_HOST_SRCS := \
+	$(PSP_RUNTIME_TELEMETRY_SRCS) \
+	$(PSP_PERF_ATTRIBUTION_SRCS) \
+	$(PSP_DRAW_PRIORITY_SUBPROFILE_SRCS) \
+	$(PSP_ITEM_UPDATE_SUBPROFILE_SRCS) \
+	$(PSP_ITEM_ATAN2_SRCS) \
+	$(PSP_ITEM_SINCOS_SRCS) \
+	$(PSP_SOFTFLOAT_CENSUS_SRCS) \
+	$(PSP_AUDIO_CURSOR_SRCS) \
+	$(PSP_TRIG_DF_SRCS) \
+	$(PSP_PERF_ENV_SRCS) \
+	$(PSP_SWAP_ASYNC_SRCS) \
+	$(PSP_SWAP_TRIPLE_SRCS) \
+	$(PSP_GE_LIST_HOOK_SRCS) \
+	$(PSP_GUI_BORDER_SRCS) \
+	$(PSP_EFFECT_OCCUPANCY_AUDIT_SRCS) \
+	$(PSP_BULLET_GATE_SRCS) \
+	$(PSP_GO_IO_LAMP_SRCS) \
+	psp/anm_scratch.cpp \
+	psp/ecl_child_memory.cpp \
+	psp/enemy_active_bitmap_audit.cpp \
+	psp/ge4_bridge.cpp \
+	psp/newlib_heap_geometry.cpp \
+	psp/render_cadence.cpp \
+	psp/render_resource_arena.cpp \
+	psp/stage_pool_arena.cpp \
+	psp/x87_trig_cache.cpp \
+	psp/main.cpp \
+	psp/platform.cpp \
+	psp/fileio.cpp \
+	psp/sdl_renderer_disabled.cpp \
+	psp/video.cpp \
+	psp/runtime_support.cpp
+
+SRCS := $(PSP_HOST_SRCS) $(TH08_GAME_SRCS) $(TH08_PORTABLE_SRCS)
+OBJS := $(patsubst %.cpp,%.o,$(SRCS))
+
+PSP_EBOOT_TITLE := Touhou 8 PSP SC Engine Bring-up
 PSP_FW_VERSION := 660
 BUILD_PRX := 0
-EXTRA_TARGETS := EBOOT.PBP
-EXTRA_CLEAN := TH08PSP.map
+GE4_PROVEN_PRX_SOURCE := deps/ge4wrap_texv1.prx
+GE4_PROVEN_PRX := ge4wrap_texv1.prx
+GE4_PROVEN_PRX_SIZE := 2150
+GE4_SLIMPLUS_PRX_BUILDER := tools/build_ge4_slimplus_wrapper.py
+GE4_SLIMPLUS_PRX_SHA256 := 3dc5c753497349d6fb0ab5ae2a819b240cc51e8aa412ded10bb52daa540d841d
+ifeq ($(TH08_PSP_SLIMPLUS_GE4),1)
+GE4_PROVEN_PRX_SHA256 := $(GE4_SLIMPLUS_PRX_SHA256)
+else ifeq ($(TH08_PSP_SLIMPLUS_GE4),0)
+GE4_PROVEN_PRX_SHA256 := 411e71b3ffb31bd91024cc0221481a787e693276c0899e05da08c3cd91dc1ab8
+else
+$(error TH08_PSP_SLIMPLUS_GE4 must be 0 or 1)
+endif
+PSPGL_GE4_ARCHIVE := deps/pspgl-ge4/libGL_th08_ge4.a
+PSPGL_GE4_ARCHIVE_SIZE := 1679664
+PSPGL_GE4_ARCHIVE_SHA256 := 3711ea969b85c839e6d1b36e7faf3ea5922e339a5f1b800ac50f25a45aa226ce
+PSPGL_GE4_MIXED_ARCHIVE := deps/pspgl-ge4/libGL_th08_ge4_mixed_v1.a
+PSPGL_GE4_MIXED_ARCHIVE_SIZE := 1683644
+PSPGL_GE4_MIXED_ARCHIVE_SHA256 := b401e0f924ffdaffca62ac62e16f58000dd7b0b7d862675124f5289252ead530
+PSPGL_GE4_INDEXED_COPY_ARCHIVE := deps/pspgl-ge4/libGL_th08_ge4_indexed_copy_v1.a
+PSPGL_GE4_INDEXED_COPY_ARCHIVE_SIZE := 1685392
+PSPGL_GE4_INDEXED_COPY_ARCHIVE_SHA256 := 3d63366aa076ee44627bcd5121cdb305c6816015b192943eaa22a9a818179607
+PSPGL_GE4_STREAM_ARENA_ARCHIVE := deps/pspgl-ge4/libGL_th08_ge4_streamarena_v1.a
+PSPGL_GE4_STREAM_ARENA_ARCHIVE_SIZE := 1680912
+PSPGL_GE4_STREAM_ARENA_ARCHIVE_SHA256 := a66904358c6449317ca2ca06a511c432a7b697db9021af3b0a4acf6b4319eb96
+PSPGL_GE4_PATCH := deps/pspgl-ge4/pspgl-th08-ge4-v1.patch
+PSPGL_GE4_PATCH_SHA256 := b3f146b3c10c13424a386441726b11311a8b483627466aec0961de803184adb1
+PSPGL_NATIVE_SUBMIT_PATCH := deps/pspgl-ge4/pspgl-th08-native-submit-v3.patch
+PSPGL_NATIVE_SUBMIT_PATCH_SHA256 := ae70bc1a492212989a87fa1656ff002c6b6f5d8f2ade2b2efa50983dc77aaf47
+PSPGL_NATIVE_MIXED_PATCH := deps/pspgl-ge4/pspgl-th08-native-mixed-submit-v1.patch
+PSPGL_NATIVE_MIXED_PATCH_SHA256 := 26e76be666d31e9adea5660edcf67290cf747e8104260484345c596cca4e828a
+PSPGL_NATIVE_INDEXED_COPY_PATCH := deps/pspgl-ge4/pspgl-th08-native-indexed-copy-v1.patch
+PSPGL_NATIVE_INDEXED_COPY_PATCH_SHA256 := a045436e26fafc7212ce5ec2699d841d1a19afcd1ff4f0156de78f66404c518f
+PSPGL_STREAM_ARENA_PATCH := deps/pspgl-ge4/pspgl-th08-stream-arena-v1.patch
+PSPGL_STREAM_ARENA_PATCH_SHA256 := 917b92e380c2582865144e2069e3869fc6472065a6b0e96fe3377a7975ebadfa
+PSPGL_STREAM_ARENA_MARKER := pspGL TH08 stream arena v1 frame-parity GL_STREAM_DRAW upstream de4260adf56d06516ec46018d404ca77e0b61748 base native-submit-v3
+PSPGL_GE4_LICENSE := licenses/PSPGL-LICENSE.txt
+PSPGL_GE4_LICENSE_SHA256 := 707474f35d89b556e080aa21766fe5689fd55829b28b267bcbc0d13e1a418941
+PSPGL_GE4_MARKER := pspGL TH08 GE4 fork v1 upstream de4260adf56d06516ec46018d404ca77e0b61748
+PSPGL_NATIVE_SUBMIT_MARKER := pspGL TH08 native submit v3 indexed-no-copy sprite-copy upstream de4260adf56d06516ec46018d404ca77e0b61748 base ge4-v1
+PSPGL_NATIVE_INDEXED_COPY_MARKER := pspGL TH08 native indexed-quad copy v1 upstream de4260adf56d06516ec46018d404ca77e0b61748 base native-submit-v3
+PSPGL_GE4_ARCHIVE_STAMP := build/psp-generated/pspgl_ge4_archive.ok
+PSPGL_GE4_MIXED_ARCHIVE_STAMP := build/psp-generated/pspgl_ge4_mixed_archive.ok
+PSPGL_GE4_INDEXED_COPY_ARCHIVE_STAMP := build/psp-generated/pspgl_ge4_indexed_copy_archive.ok
+PSPGL_GE4_STREAM_ARENA_ARCHIVE_STAMP := build/psp-generated/pspgl_ge4_stream_arena_archive.ok
+PSPGL_GE4_LINK_STAMP := build/psp-generated/pspgl_ge4_link.ok
+NEWLIB_HEAP_ABI_STAMP := build/psp-generated/newlib_heap_abi.ok
+EXTRA_TARGETS := EBOOT.PBP $(NEWLIB_HEAP_ABI_STAMP) $(GE4_PROVEN_PRX)
+EXTRA_CLEAN := TH08PSP.map build/psp-generated/i18n.hpp \
+	$(NEWLIB_HEAP_ABI_STAMP) $(PSPGL_GE4_ARCHIVE_STAMP) \
+	$(PSPGL_GE4_MIXED_ARCHIVE_STAMP) \
+	$(PSPGL_GE4_INDEXED_COPY_ARCHIVE_STAMP) \
+	$(PSPGL_GE4_STREAM_ARENA_ARCHIVE_STAMP) \
+	$(PSPGL_GE4_LINK_STAMP) $(GE4_PROVEN_PRX)
 
 TH08_UPSTREAM_COMMIT := a940881f97024c99ff387d2cb4c6650fb2bad97f
 TH08_ORACLE_COMMIT := 50077aca0ed17d3bb7fee9f69a336636e2474639
 TH07_BACKEND_COMMIT := c11c4368bc969f98b731f46fb79067f3528511e7
-TH08_PSP_BUILD_ID ?= bootstrap-20260831-a940881f
+TH07_GE4_BRIDGE_COMMIT := 202eb1c1fd780bf3db6f55cd8066e174641c6c41
+TH08_PSP_BUILD_ID ?= r022-ge4-pspgl-v1-20260901
+# Correctness builds keep the full schema-8 replay audit.  Set to 0 only for
+# production-load FPS runs; the config stamp prevents stale mixed objects.
+TH08_REPLAY_SYNC_AUDIT ?= 1
+# Presentation-only Allegrex VFPU path. Set to 0 for the pixel/FPS A/B; game
+# simulation, collision, RNG, and replay calculations never use this switch.
+TH08_PSP_RENDER_VFPU ?= 1
+# PSP-only memoization of the exact binary64 libm values used by the x87
+# compatibility gameplay wrappers.  It never substitutes approximate VFPU
+# math and remains default-off until replay, surface, hit-rate and FPS gates.
+TH08_PSP_X87_TRIG_CACHE ?= 0
+# PSP-only word/SWAR implementation of the fixed five-range anti-tamper byte
+# checksum. It preserves both RNG calls and applies the canonical per-byte
+# uint32 increment as one modulo-2^32 advance. Keep default-off until replay
+# and isolated ITEM_TIME/FPS gates pass.
+TH08_PSP_ANTITAMPER_SWAR ?= 0
+# PSP-only, presentation-only reuse of one canonical binary64 sin/cos pair for
+# the outer and inner vertices of zero-secondary-radius radial trails.  It has
+# no runtime storage and remains default-off until replay/surface/FPS gates.
+TH08_PSP_RADIAL_TRAIL_TRIG_REUSE ?= 0
+# PSP-only callback2 scan bound for Reimu/Yukari's Fantasy Seal deathbomb.
+# BeginBombSpell still resets all 128 slots; only the update/draw scans use the
+# statically proven 0..17 live range. Keep default-off until replay/FPS gates.
+TH08_PSP_FANTASY_SEAL_WORK_BOUNDS ?= 0
+# PSP-only 653-slot Effect occupancy sidecar.  The original Effect array and
+# ascending update order remain authoritative; a bit only avoids touching a
+# known-empty 864-byte slot.  Keep default-off until replay/pixel/FPS gates.
+TH08_PSP_EFFECT_OCCUPANCY_FASTPATH ?= 0
+# PSP-only M0 observer for a future ordinary-Effect GE_SPRITES frontend.  It
+# always executes the canonical six-vertex Draw2D path and only compares a
+# shadow two-endpoint representation.  Keep default-off outside audit runs.
+TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT ?= 0
+# PSP-only product selected from the exact M0-proven ordinary Effect set.  It
+# emits two final corners through PSPGL's owned current-list GE_SPRITES hook;
+# every rejection replays the untouched canonical Draw2D path. Default off
+# until replay, pixel, workload, FPS, and hardware gates pass.
+TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH ?= 0
+# PSP-only 4V indexed staging for ordinary Effect sprites.  Draw groups and
+# state boundaries are unchanged; radial trails retain their canonical strip.
+# It reuses the Bullet index table but not Bullet's native/direct-GE owner.
+TH08_PSP_EFFECT_INDEXED_QUADS ?= 0
+# Set to 0 for the legacy five-VM Bullet runtime A/B.  A layout stamp below
+# invalidates every object automatically when this ABI-affecting flag changes.
+TH08_PSP_COMPACT_BULLET_VM ?= 1
+# PSP-only Bullet occupancy and render-angle sidecar.  The arena reservation
+# remains fixed in both variants; this switch changes only the hot-path use so
+# replay/pixel/FPS A/B builds have identical gameplay-pool addresses.
+TH08_PSP_BULLET_FASTPATH ?= 1
+# PSP-only live occupancy enumeration layered on the accepted Bullet sidecar.
+# It preserves the canonical 0,1535..1 order and re-reads the bitmap after each
+# live Bullet so same-frame child spawns retain the original traversal rules.
+# Keep default-off until replay, workload, FPS, pixel, and hardware gates pass.
+TH08_PSP_BULLET_LIVE_ENUM ?= 0
+# Counter-only observer for the canonical Bullet transform interpreter.  It
+# measures terminal/no-op calls and every transform-program writer without
+# skipping work or changing Bullet/replay state.  Keep off outside audit runs.
+TH08_PSP_BULLET_TRANSFORM_AUDIT ?= 0
+# PSP-only 1-bit-per-slot transform-terminal sidecar.  It skips only the
+# canonical FIRED-frame interpreter call after that immutable program has
+# already returned at index>=18 or NONE.  The initial spawn call always runs.
+# Keep default-off until replay, workload, FPS, pixel, and hardware gates pass.
+TH08_PSP_BULLET_TRANSFORM_TERMINAL_FASTPATH ?= 0
+# PSPGL/D3D8 fixed-function state cache.  Keep this independently switchable
+# so replay/pixel/FPS A/B runs change no gameplay code or pool layout.
+TH08_PSP_PREPARE_STATE_CACHE ?= 0
+# PSP-only enemy-bullet indexed quad submission.  It changes only the vertex
+# staging representation inside BulletManager's six draw buckets and remains
+# an isolated, default-off replay/pixel/FPS A/B candidate.
+TH08_PSP_BULLET_UNIFIED_QUADS ?= 0
+# PSPGL-fork native packed submit for the isolated unified enemy-bullet
+# batches.  It never starts a raw sceGu list; PSPGL retains list/state/texture
+# ownership.  Keep default-off until replay, pixel, FPS, and hardware gates.
+TH08_PSP_BULLET_DIRECT_GE ?= 0
+# Canonical-authoritative M0 for TH08's fired rotated Bullet frontend.  It
+# builds the proposed final 4V quad, then lets Draw2D remain authoritative and
+# compares all 112 bytes plus buffer/state/VM effects.  No candidate is drawn.
+TH08_PSP_BULLET_ONEPASS_4V_AUDIT ?= 0
+# Product gate for the M0-proven frontend.  It retains the existing indexed
+# 4V/direct-GE backend and only bypasses generic per-Bullet ANM traversal when
+# owner, state, generated-endpoint finite, and typed cursor-capacity proofs
+# all hold (the M0 mode additionally verifies the full cursor invariant).
+TH08_PSP_BULLET_ONEPASS_4V_FASTPATH ?= 0
+# Audit-only proof for a future packed-once Bullet frontend.  The accepted
+# indexed 4V direct-GE vertices remain the sole draw authority; this gate
+# builds one local final-24B shadow quad and compares it byte-for-byte with the
+# canonical backend output.  It never submits candidate geometry.
+TH08_PSP_BULLET_PACKED_VERTEX_AUDIT ?= 0
+# M1 product for the M0-proven Bullet layout.  The final 24-byte PSP vertices
+# are packed once into the existing Present-fenced direct-GE arena at the
+# canonical AddSprite boundary, then submitted by the unchanged 4V indexed
+# Flush.  Keep independently default-off until replay/pixel/FPS/hardware gates.
+TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH ?= 0
+# Canonical-authoritative classifier/count audit for a mixed two-corner
+# GE_SPRITES prefix followed by the untouched four-corner indexed suffix.
+# It keeps the existing v3 PSPGL archive and never substitutes draw output.
+TH08_PSP_BULLET_MIXED_QUADS_AUDIT ?= 0
+# PSP-only atomic mixed-submit product candidate.  Only this mode selects the
+# separately frozen mixed-v1 PSPGL archive; keep default-off until hardware,
+# replay, pixel, and stage-relative FPS gates pass.
+TH08_PSP_BULLET_MIXED_QUADS_FASTPATH ?= 0
+# Canonical-authoritative all-Item classifier audit.  It brackets exactly the
+# existing ItemManager traversal and retains its six-vertex renderer.
+TH08_PSP_ITEM_MIXED_QUADS_AUDIT ?= 0
+# All-Item mixed two-corner prefix/four-corner suffix product candidate.  It
+# reuses the fixed Bullet native arena under a disjoint owner token and stays
+# default-off pending replay, pixel, FPS, and hardware gates.
+TH08_PSP_ITEM_MIXED_QUADS_FASTPATH ?= 0
+# PSPGL-fork native packed submit for ItemManager's isolated draw pass.  This
+# owns a separate fixed arena/cursor and may not consume the accepted Bullet
+# arena.  Keep independently switchable for replay/pixel/FPS A/B.
+TH08_PSP_ITEM_DIRECT_GE ?= 0
+# ITEM_TIME-triggered natural canonical batches remain 6V in the frontend,
+# but an already-existing Flush may pack every quad in that same state/texture
+# batch to final 4V client vertices. No Item pass bracket or new flush exists.
+TH08_PSP_ITEM_NATURAL_QUADS ?= 0
+# PSPGL-owned same-call copy for Item natural 4V batches.  This removes the
+# public glDrawElements index scan/generic conversion without retaining either
+# caller pointer.  It selects a separately frozen post-v3 archive and remains
+# default-off until replay/surface/FPS/hardware gates pass.
+TH08_PSP_ITEM_NATURAL_NATIVE_COPY ?= 0
 
+# Link the stream-arena PSPGL archive and lease its parity-0 half only for the
+# current synchronous render frame.  Present fences every PSPGL list
+# before the lease returns to the render arena, so stage/image decoding sees
+# zero resident bytes.  Async/triple Present paths need a separate retirement
+# queue and are deliberately excluded.  Default OFF.
+TH08_PSP_PSPGL_STREAM_ARENA ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_PSPGL_STREAM_ARENA)),)
+$(error TH08_PSP_PSPGL_STREAM_ARENA must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_PSPGL_STREAM_ARENA),1)
+ifeq ($(TH08_PSP_SWAP_ASYNC),1)
+$(error TH08_PSP_PSPGL_STREAM_ARENA and TH08_PSP_SWAP_ASYNC are mutually exclusive)
+endif
+ifeq ($(TH08_PSP_SWAP_TRIPLE),1)
+$(error TH08_PSP_PSPGL_STREAM_ARENA and TH08_PSP_SWAP_TRIPLE are mutually exclusive)
+endif
+endif
+# PSP-only Player shot/damage-region occupancy sidecar.  Keep the correctness
+# baseline off; set to 1 only for an isolated replay/pixel/FPS A/B run.  The
+# cache lives outside Player, so neither the gameplay ABI nor replay state
+# changes between variants.
+TH08_PSP_PLAYER_SCAN_SIDECAR ?= 0
+# PSP-only M0 observer for a future TH07-style active-enemy iterator.  It
+# compares a producer-maintained 15-word bitmap against the authoritative
+# 480-slot loop and never skips gameplay work.
+TH08_PSP_ENEMY_ACTIVE_BITMAP_AUDIT ?= 0
+# Counter-only proof for a future Player/Bullet collision negative gate.  It
+# observes the existing canonical calls and requires the exact Player scan
+# sidecar snapshot; no collision result is skipped in this audit generation.
+TH08_PSP_BULLET_COLLISION_GATE_AUDIT ?= 0
+# PSP-only O(1) empty-cancel-region reject layered on the Player scan
+# sidecar.  It is independently default-off so replay/FPS A/B builds can
+# isolate the added metadata from the already accepted sidecar candidate.
+TH08_PSP_CANCEL_EMPTY_FASTPATH ?= 0
+# PSP-only conservative cancel-region coverage gate for Bullet positions.
+# It requires both accepted owner sidecars; every uncertain query executes the
+# original ascending region scan. Keep default-off until replay/FPS gates pass.
+TH08_PSP_BULLET_CANCEL_SPATIAL ?= 0
+# Audit-only observer for deciding whether an exact-bit Item autocollect
+# velocity cache has enough repeat hits to justify a later optimization.  It
+# always executes the canonical atan2/cos/sin path and must stay off in FPS
+# production builds.
+TH08_PSP_ITEM_AUTOCOLLECT_CACHE_AUDIT ?= 0
+# PSP-only exact-bit Item autocollect velocity cache.  It preserves atan2 and
+# only reuses previously canonical cos/sin output after a full raw-bit key
+# match.  Keep independently default-off for replay/FPS A/B validation.
+TH08_PSP_ITEM_AUTOCOLLECT_CACHE ?= 0
+# Audit-only full-VM shadow for the stock ITEM_TIME script-68 spawn
+# initializer.  The canonical initializer remains authoritative; this gate
+# only measures exact replaceable work and must stay off in production/FPS
+# builds.
+TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT ?= 0
+# PSP-only product initializer for the stock ITEM_TIME script 68.  A complete
+# VM shadow audit must precede each generation-scoped use; all owner/load/
+# table/range/fingerprint mismatches execute the canonical dispatcher.
+# Keep independently default-off for replay/FPS A/B validation.
+TH08_PSP_ITEM_TIME_SPAWN_INIT_FASTPATH ?= 0
+# Audit-only byte-for-byte proof for a future stock ITEM_TIME script-68 idle
+# fast path.  The authoritative VM still runs the canonical interpreter; the
+# shadow result is observational and this must remain off in FPS builds.
+TH08_PSP_ITEM_TIME_ANM_IDLE_AUDIT ?= 0
+# PSP-only exact stock-script fast path for the ITEM_TIME idle interval proven
+# by the audit above.  All non-matching script/owner/VM states fall back to the
+# canonical interpreter; keep independently switchable for replay/FPS A/B.
+TH08_PSP_ITEM_TIME_ANM_IDLE_FASTPATH ?= 0
+# Canonical-authoritative proof that stock ITEM_TIME Draw2D output is an
+# axis-aligned two-corner GE_SPRITES candidate.  It never substitutes output.
+TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT ?= 0
+# PSP-only M0 product. Consecutive eligible ITEM_TIME sprites are submitted as
+# one PSPGL-owned GL_SPRITES_PSP run; every failed proof remains canonical.
+TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH ?= 0
+# Canonical-authoritative M0 for the stock axis-aligned ITEM_TIME frontend.
+# It builds and byte-compares the proposed four-corner/final-6V output while
+# the existing Draw2D path remains the sole draw authority.
+TH08_PSP_ITEM_TIME_INLINE_DRAW_AUDIT ?= 0
+# PSP-only exact frontend specialization proven by the audit above.  It feeds
+# the existing AddSpriteToDrawBuffer boundary, so draw order and the selected
+# canonical 6V or separately gated 4V backend remain unchanged.
+TH08_PSP_ITEM_TIME_INLINE_DRAW_FASTPATH ?= 0
+# PSP-only presentation sidecar for score/time popup active slots.  The fixed
+# retail arrays and ascending slot order remain authoritative; this gate only
+# skips known-empty entries in update/draw and is independently A/B-able.
+TH08_PSP_ASCII_POPUP_OCCUPANCY ?= 0
+# Score-popup-only frontend batch ported from the hardware-proven TH07 idea,
+# but re-derived for TH08's glyph-10 animation and nearbyintf pixel contract.
+# It remains default-off until replay, pixel, FPS, and hardware gates pass.
+TH08_PSP_ASCII_POPUP_BATCH ?= 0
+# PSP-only second-stage score-popup frontend.  The accepted pair batch remains
+# the owner/backend; this independently gated path replaces its validation
+# quad plus generation quad with metadata-only proof and one direct two-corner
+# generation pass.  Keep default-off until replay/pixel/FPS/hardware gates.
+TH08_PSP_ASCII_POPUP_DIRECT_PAIR ?= 0
+# M0 score-popup-only native GE_SPRITES submit. PSPGL copies the already
+# packed two-corner stream into its own immediate stream buffer, so the
+# existing staging allocation remains reusable and no delayed arena is added.
+# timePopups and Item's ITEM_TIME emitter remain separate and untouched.
+TH08_PSP_SCORE_POPUP_NATIVE_GE ?= 0
+# Diagnostic-only stage-relative 300-frame sampler used to make performance
+# A/B windows independent of host-side startup jitter.  It does not change
+# game, replay, render, or audio state and remains off in shipped builds.
+TH08_PSP_STAGE_RELATIVE_PERF_SAMPLING ?= 0
+# Exact module/thread/newlib declaration parity with the hardware-proven TH07
+# port. Set to 0 only for the former TH08 startup-contract hardware A/B.
+TH08_PSP_TH07_BOOT_PARITY ?= 1
+# Prefer the user-local TH08 font subset after the generated canonical CP932
+# decoder and the 1,531-codepoint authority both pass their runtime gates.
+# Missing, incomplete, or mismatched candidates fall back to full MS Gothic,
+# the redistributable OFL stock-profile subset, and then full Noto without
+# changing the required game-text coverage.
+TH08_PSP_LOCAL_FONT_SUBSET ?= 1
+# Default-off TH07 export: keep SDL_ttf glyphs across same-face/same-size
+# descriptor releases only on runtime model > 0 (Slim+/Go).  Model 0 and a
+# failed model query retain the established per-row flush.
+TH08_PSP_FONT_GLYPH_CACHE_RETAIN ?= 0
+
+GENERATED_DIR := build/psp-generated
+GENERATED_I18N := $(GENERATED_DIR)/i18n.hpp
+GE4_MODEL_GATE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/ge4-slimplus-0.stamp \
+	$(GENERATED_DIR)/ge4-slimplus-1.stamp
+GE4_MODEL_GATE_CONFIG_STAMP := $(GENERATED_DIR)/ge4-slimplus-$(TH08_PSP_SLIMPLUS_GE4).stamp
+BULLET_VM_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-vm-layout-0.stamp \
+	$(GENERATED_DIR)/bullet-vm-layout-1.stamp
+BULLET_VM_CONFIG_STAMP := $(GENERATED_DIR)/bullet-vm-layout-$(TH08_PSP_COMPACT_BULLET_VM).stamp
+REPLAY_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/replay-audit-0.stamp \
+	$(GENERATED_DIR)/replay-audit-1.stamp
+REPLAY_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/replay-audit-$(TH08_REPLAY_SYNC_AUDIT).stamp
+RENDER_VFPU_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/render-vfpu-0.stamp \
+	$(GENERATED_DIR)/render-vfpu-1.stamp
+RENDER_VFPU_CONFIG_STAMP := $(GENERATED_DIR)/render-vfpu-$(TH08_PSP_RENDER_VFPU).stamp
+X87_TRIG_CACHE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/x87-trig-cache-0.stamp \
+	$(GENERATED_DIR)/x87-trig-cache-1.stamp
+X87_TRIG_CACHE_CONFIG_STAMP := $(GENERATED_DIR)/x87-trig-cache-$(TH08_PSP_X87_TRIG_CACHE).stamp
+ANTITAMPER_SWAR_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/antitamper-swar-0.stamp \
+	$(GENERATED_DIR)/antitamper-swar-1.stamp
+ANTITAMPER_SWAR_CONFIG_STAMP := $(GENERATED_DIR)/antitamper-swar-$(TH08_PSP_ANTITAMPER_SWAR).stamp
+RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/radial-trail-trig-reuse-0.stamp \
+	$(GENERATED_DIR)/radial-trail-trig-reuse-1.stamp
+RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMP := $(GENERATED_DIR)/radial-trail-trig-reuse-$(TH08_PSP_RADIAL_TRAIL_TRIG_REUSE).stamp
+FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/fantasy-seal-work-bounds-0.stamp \
+	$(GENERATED_DIR)/fantasy-seal-work-bounds-1.stamp
+FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMP := $(GENERATED_DIR)/fantasy-seal-work-bounds-$(TH08_PSP_FANTASY_SEAL_WORK_BOUNDS).stamp
+EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/effect-occupancy-fastpath-0.stamp \
+	$(GENERATED_DIR)/effect-occupancy-fastpath-1.stamp
+EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/effect-occupancy-fastpath-$(TH08_PSP_EFFECT_OCCUPANCY_FASTPATH).stamp
+EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/effect-occupancy-audit-0.stamp \
+	$(GENERATED_DIR)/effect-occupancy-audit-1.stamp
+EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/effect-occupancy-audit-$(TH08_PSP_EFFECT_OCCUPANCY_AUDIT).stamp
+EFFECT_SPRITE_PAIR_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/effect-sprite-pair-audit-0.stamp \
+	$(GENERATED_DIR)/effect-sprite-pair-audit-1.stamp
+EFFECT_SPRITE_PAIR_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/effect-sprite-pair-audit-$(TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT).stamp
+EFFECT_SPRITE_PAIR_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/effect-sprite-pair-fastpath-0.stamp \
+	$(GENERATED_DIR)/effect-sprite-pair-fastpath-1.stamp
+EFFECT_SPRITE_PAIR_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/effect-sprite-pair-fastpath-$(TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH).stamp
+EFFECT_INDEXED_QUADS_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/effect-indexed-quads-0.stamp \
+	$(GENERATED_DIR)/effect-indexed-quads-1.stamp
+EFFECT_INDEXED_QUADS_CONFIG_STAMP := $(GENERATED_DIR)/effect-indexed-quads-$(TH08_PSP_EFFECT_INDEXED_QUADS).stamp
+BULLET_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-fastpath-0.stamp \
+	$(GENERATED_DIR)/bullet-fastpath-1.stamp
+BULLET_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/bullet-fastpath-$(TH08_PSP_BULLET_FASTPATH).stamp
+BULLET_LIVE_ENUM_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-live-enum-0.stamp \
+	$(GENERATED_DIR)/bullet-live-enum-1.stamp
+BULLET_LIVE_ENUM_CONFIG_STAMP := $(GENERATED_DIR)/bullet-live-enum-$(TH08_PSP_BULLET_LIVE_ENUM).stamp
+BULLET_TRANSFORM_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-transform-audit-0.stamp \
+	$(GENERATED_DIR)/bullet-transform-audit-1.stamp
+BULLET_TRANSFORM_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/bullet-transform-audit-$(TH08_PSP_BULLET_TRANSFORM_AUDIT).stamp
+BULLET_TRANSFORM_TERMINAL_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-transform-terminal-fastpath-0.stamp \
+	$(GENERATED_DIR)/bullet-transform-terminal-fastpath-1.stamp
+BULLET_TRANSFORM_TERMINAL_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/bullet-transform-terminal-fastpath-$(TH08_PSP_BULLET_TRANSFORM_TERMINAL_FASTPATH).stamp
+PREPARE_STATE_CACHE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/prepare-state-cache-0.stamp \
+	$(GENERATED_DIR)/prepare-state-cache-1.stamp
+PREPARE_STATE_CACHE_CONFIG_STAMP := $(GENERATED_DIR)/prepare-state-cache-$(TH08_PSP_PREPARE_STATE_CACHE).stamp
+BULLET_UNIFIED_QUADS_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-unified-quads-0.stamp \
+	$(GENERATED_DIR)/bullet-unified-quads-1.stamp
+BULLET_UNIFIED_QUADS_CONFIG_STAMP := $(GENERATED_DIR)/bullet-unified-quads-$(TH08_PSP_BULLET_UNIFIED_QUADS).stamp
+BULLET_DIRECT_GE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-direct-ge-0.stamp \
+	$(GENERATED_DIR)/bullet-direct-ge-1.stamp
+BULLET_DIRECT_GE_CONFIG_STAMP := $(GENERATED_DIR)/bullet-direct-ge-$(TH08_PSP_BULLET_DIRECT_GE).stamp
+BULLET_ONEPASS_4V_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-onepass-4v-audit-0.stamp \
+	$(GENERATED_DIR)/bullet-onepass-4v-audit-1.stamp
+BULLET_ONEPASS_4V_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/bullet-onepass-4v-audit-$(TH08_PSP_BULLET_ONEPASS_4V_AUDIT).stamp
+BULLET_ONEPASS_4V_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-onepass-4v-fastpath-0.stamp \
+	$(GENERATED_DIR)/bullet-onepass-4v-fastpath-1.stamp
+BULLET_ONEPASS_4V_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/bullet-onepass-4v-fastpath-$(TH08_PSP_BULLET_ONEPASS_4V_FASTPATH).stamp
+BULLET_PACKED_VERTEX_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-packed-vertex-audit-0.stamp \
+	$(GENERATED_DIR)/bullet-packed-vertex-audit-1.stamp
+BULLET_PACKED_VERTEX_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/bullet-packed-vertex-audit-$(TH08_PSP_BULLET_PACKED_VERTEX_AUDIT).stamp
+BULLET_PACKED_VERTEX_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-packed-vertex-fastpath-0.stamp \
+	$(GENERATED_DIR)/bullet-packed-vertex-fastpath-1.stamp
+BULLET_PACKED_VERTEX_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/bullet-packed-vertex-fastpath-$(TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH).stamp
+BULLET_MIXED_QUADS_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-mixed-quads-audit-0.stamp \
+	$(GENERATED_DIR)/bullet-mixed-quads-audit-1.stamp
+BULLET_MIXED_QUADS_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/bullet-mixed-quads-audit-$(TH08_PSP_BULLET_MIXED_QUADS_AUDIT).stamp
+BULLET_MIXED_QUADS_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-mixed-quads-fastpath-0.stamp \
+	$(GENERATED_DIR)/bullet-mixed-quads-fastpath-1.stamp
+BULLET_MIXED_QUADS_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/bullet-mixed-quads-fastpath-$(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH).stamp
+ITEM_MIXED_QUADS_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-mixed-quads-audit-0.stamp \
+	$(GENERATED_DIR)/item-mixed-quads-audit-1.stamp
+ITEM_MIXED_QUADS_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/item-mixed-quads-audit-$(TH08_PSP_ITEM_MIXED_QUADS_AUDIT).stamp
+ITEM_MIXED_QUADS_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-mixed-quads-fastpath-0.stamp \
+	$(GENERATED_DIR)/item-mixed-quads-fastpath-1.stamp
+ITEM_MIXED_QUADS_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/item-mixed-quads-fastpath-$(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH).stamp
+ITEM_DIRECT_GE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-direct-ge-0.stamp \
+	$(GENERATED_DIR)/item-direct-ge-1.stamp
+ITEM_DIRECT_GE_CONFIG_STAMP := $(GENERATED_DIR)/item-direct-ge-$(TH08_PSP_ITEM_DIRECT_GE).stamp
+ITEM_NATURAL_QUADS_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-natural-quads-0.stamp \
+	$(GENERATED_DIR)/item-natural-quads-1.stamp
+ITEM_NATURAL_QUADS_CONFIG_STAMP := $(GENERATED_DIR)/item-natural-quads-$(TH08_PSP_ITEM_NATURAL_QUADS).stamp
+ITEM_NATURAL_NATIVE_COPY_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-natural-native-copy-0.stamp \
+	$(GENERATED_DIR)/item-natural-native-copy-1.stamp
+ITEM_NATURAL_NATIVE_COPY_CONFIG_STAMP := $(GENERATED_DIR)/item-natural-native-copy-$(TH08_PSP_ITEM_NATURAL_NATIVE_COPY).stamp
+PSPGL_STREAM_ARENA_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/pspgl-stream-arena-0.stamp \
+	$(GENERATED_DIR)/pspgl-stream-arena-1.stamp
+PSPGL_STREAM_ARENA_CONFIG_STAMP := $(GENERATED_DIR)/pspgl-stream-arena-$(TH08_PSP_PSPGL_STREAM_ARENA).stamp
+PLAYER_SCAN_SIDECAR_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/player-scan-sidecar-0.stamp \
+	$(GENERATED_DIR)/player-scan-sidecar-1.stamp
+PLAYER_SCAN_SIDECAR_CONFIG_STAMP := $(GENERATED_DIR)/player-scan-sidecar-$(TH08_PSP_PLAYER_SCAN_SIDECAR).stamp
+ENEMY_ACTIVE_BITMAP_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/enemy-active-bitmap-audit-0.stamp \
+	$(GENERATED_DIR)/enemy-active-bitmap-audit-1.stamp
+ENEMY_ACTIVE_BITMAP_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/enemy-active-bitmap-audit-$(TH08_PSP_ENEMY_ACTIVE_BITMAP_AUDIT).stamp
+BULLET_COLLISION_GATE_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-collision-gate-audit-0.stamp \
+	$(GENERATED_DIR)/bullet-collision-gate-audit-1.stamp
+BULLET_COLLISION_GATE_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/bullet-collision-gate-audit-$(TH08_PSP_BULLET_COLLISION_GATE_AUDIT).stamp
+BULLET_COLLISION_GATE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-collision-gate-0.stamp \
+	$(GENERATED_DIR)/bullet-collision-gate-1.stamp
+BULLET_COLLISION_GATE_CONFIG_STAMP := $(GENERATED_DIR)/bullet-collision-gate-$(TH08_PSP_BULLET_COLLISION_GATE).stamp
+CANCEL_EMPTY_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/cancel-empty-fastpath-0.stamp \
+	$(GENERATED_DIR)/cancel-empty-fastpath-1.stamp
+CANCEL_EMPTY_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/cancel-empty-fastpath-$(TH08_PSP_CANCEL_EMPTY_FASTPATH).stamp
+BULLET_CANCEL_SPATIAL_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bullet-cancel-spatial-0.stamp \
+	$(GENERATED_DIR)/bullet-cancel-spatial-1.stamp
+BULLET_CANCEL_SPATIAL_CONFIG_STAMP := $(GENERATED_DIR)/bullet-cancel-spatial-$(TH08_PSP_BULLET_CANCEL_SPATIAL).stamp
+ITEM_AUTOCOLLECT_CACHE_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-autocollect-cache-audit-0.stamp \
+	$(GENERATED_DIR)/item-autocollect-cache-audit-1.stamp
+ITEM_AUTOCOLLECT_CACHE_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/item-autocollect-cache-audit-$(TH08_PSP_ITEM_AUTOCOLLECT_CACHE_AUDIT).stamp
+ITEM_AUTOCOLLECT_CACHE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-autocollect-cache-0.stamp \
+	$(GENERATED_DIR)/item-autocollect-cache-1.stamp
+ITEM_AUTOCOLLECT_CACHE_CONFIG_STAMP := $(GENERATED_DIR)/item-autocollect-cache-$(TH08_PSP_ITEM_AUTOCOLLECT_CACHE).stamp
+ITEM_TIME_SPAWN_INIT_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-time-spawn-init-audit-0.stamp \
+	$(GENERATED_DIR)/item-time-spawn-init-audit-1.stamp
+ITEM_TIME_SPAWN_INIT_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/item-time-spawn-init-audit-$(TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT).stamp
+ITEM_TIME_SPAWN_INIT_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-time-spawn-init-fastpath-0.stamp \
+	$(GENERATED_DIR)/item-time-spawn-init-fastpath-1.stamp
+ITEM_TIME_SPAWN_INIT_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/item-time-spawn-init-fastpath-$(TH08_PSP_ITEM_TIME_SPAWN_INIT_FASTPATH).stamp
+ITEM_TIME_ANM_IDLE_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-time-anm-idle-audit-0.stamp \
+	$(GENERATED_DIR)/item-time-anm-idle-audit-1.stamp
+ITEM_TIME_ANM_IDLE_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/item-time-anm-idle-audit-$(TH08_PSP_ITEM_TIME_ANM_IDLE_AUDIT).stamp
+ITEM_TIME_ANM_IDLE_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-time-anm-idle-fastpath-0.stamp \
+	$(GENERATED_DIR)/item-time-anm-idle-fastpath-1.stamp
+ITEM_TIME_ANM_IDLE_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/item-time-anm-idle-fastpath-$(TH08_PSP_ITEM_TIME_ANM_IDLE_FASTPATH).stamp
+ITEM_TIME_DRAW_PAIR_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-time-draw-pair-audit-0.stamp \
+	$(GENERATED_DIR)/item-time-draw-pair-audit-1.stamp
+ITEM_TIME_DRAW_PAIR_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/item-time-draw-pair-audit-$(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT).stamp
+ITEM_TIME_DRAW_PAIR_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-time-draw-pair-fastpath-0.stamp \
+	$(GENERATED_DIR)/item-time-draw-pair-fastpath-1.stamp
+ITEM_TIME_DRAW_PAIR_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/item-time-draw-pair-fastpath-$(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH).stamp
+ITEM_TIME_INLINE_DRAW_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-time-inline-draw-audit-0.stamp \
+	$(GENERATED_DIR)/item-time-inline-draw-audit-1.stamp
+ITEM_TIME_INLINE_DRAW_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/item-time-inline-draw-audit-$(TH08_PSP_ITEM_TIME_INLINE_DRAW_AUDIT).stamp
+ITEM_TIME_INLINE_DRAW_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-time-inline-draw-fastpath-0.stamp \
+	$(GENERATED_DIR)/item-time-inline-draw-fastpath-1.stamp
+ITEM_TIME_INLINE_DRAW_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/item-time-inline-draw-fastpath-$(TH08_PSP_ITEM_TIME_INLINE_DRAW_FASTPATH).stamp
+ASCII_POPUP_OCCUPANCY_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/ascii-popup-occupancy-0.stamp \
+	$(GENERATED_DIR)/ascii-popup-occupancy-1.stamp
+ASCII_POPUP_OCCUPANCY_CONFIG_STAMP := $(GENERATED_DIR)/ascii-popup-occupancy-$(TH08_PSP_ASCII_POPUP_OCCUPANCY).stamp
+ASCII_POPUP_BATCH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/ascii-popup-batch-0.stamp \
+	$(GENERATED_DIR)/ascii-popup-batch-1.stamp
+ASCII_POPUP_BATCH_CONFIG_STAMP := $(GENERATED_DIR)/ascii-popup-batch-$(TH08_PSP_ASCII_POPUP_BATCH).stamp
+ASCII_POPUP_DIRECT_PAIR_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/ascii-popup-direct-pair-0.stamp \
+	$(GENERATED_DIR)/ascii-popup-direct-pair-1.stamp
+ASCII_POPUP_DIRECT_PAIR_CONFIG_STAMP := $(GENERATED_DIR)/ascii-popup-direct-pair-$(TH08_PSP_ASCII_POPUP_DIRECT_PAIR).stamp
+SCORE_POPUP_NATIVE_GE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/score-popup-native-ge-0.stamp \
+	$(GENERATED_DIR)/score-popup-native-ge-1.stamp
+SCORE_POPUP_NATIVE_GE_CONFIG_STAMP := $(GENERATED_DIR)/score-popup-native-ge-$(TH08_PSP_SCORE_POPUP_NATIVE_GE).stamp
+STAGE_RELATIVE_PERF_SAMPLING_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/stage-relative-perf-sampling-0.stamp \
+	$(GENERATED_DIR)/stage-relative-perf-sampling-1.stamp
+STAGE_RELATIVE_PERF_SAMPLING_CONFIG_STAMP := $(GENERATED_DIR)/stage-relative-perf-sampling-$(TH08_PSP_STAGE_RELATIVE_PERF_SAMPLING).stamp
+RUNTIME_TELEMETRY_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/runtime-telemetry-0.stamp \
+	$(GENERATED_DIR)/runtime-telemetry-1.stamp
+RUNTIME_TELEMETRY_CONFIG_STAMP := $(GENERATED_DIR)/runtime-telemetry-$(TH08_PSP_RUNTIME_TELEMETRY).stamp
+PERF_ATTRIBUTION_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/perf-attribution-0.stamp \
+	$(GENERATED_DIR)/perf-attribution-1.stamp
+PERF_ATTRIBUTION_CONFIG_STAMP := $(GENERATED_DIR)/perf-attribution-$(TH08_PSP_PERF_ATTRIBUTION).stamp
+DRAW_PRIORITY_SUBPROFILE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/draw-priority-subprofile-0.stamp \
+	$(GENERATED_DIR)/draw-priority-subprofile-1.stamp
+DRAW_PRIORITY_SUBPROFILE_CONFIG_STAMP := $(GENERATED_DIR)/draw-priority-subprofile-$(TH08_PSP_DRAW_PRIORITY_SUBPROFILE).stamp
+ITEM_UPDATE_SUBPROFILE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-update-subprofile-0.stamp \
+	$(GENERATED_DIR)/item-update-subprofile-1.stamp
+ITEM_UPDATE_SUBPROFILE_CONFIG_STAMP := $(GENERATED_DIR)/item-update-subprofile-$(TH08_PSP_ITEM_UPDATE_SUBPROFILE).stamp
+ITEM_ATAN2_FASTPATH_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-atan2-fastpath-audit-0.stamp \
+	$(GENERATED_DIR)/item-atan2-fastpath-audit-1.stamp
+ITEM_ATAN2_FASTPATH_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/item-atan2-fastpath-audit-$(TH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT).stamp
+ITEM_ATAN2_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-atan2-fastpath-0.stamp \
+	$(GENERATED_DIR)/item-atan2-fastpath-1.stamp
+ITEM_ATAN2_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/item-atan2-fastpath-$(TH08_PSP_ITEM_ATAN2_FASTPATH).stamp
+ITEM_SINCOS_FASTPATH_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-sincos-fastpath-audit-0.stamp \
+	$(GENERATED_DIR)/item-sincos-fastpath-audit-1.stamp
+ITEM_SINCOS_FASTPATH_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/item-sincos-fastpath-audit-$(TH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT).stamp
+ITEM_SINCOS_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/item-sincos-fastpath-0.stamp \
+	$(GENERATED_DIR)/item-sincos-fastpath-1.stamp
+ITEM_SINCOS_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/item-sincos-fastpath-$(TH08_PSP_ITEM_SINCOS_FASTPATH).stamp
+SOFTFLOAT_CENSUS_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/softfloat-census-0.stamp \
+	$(GENERATED_DIR)/softfloat-census-1.stamp
+SOFTFLOAT_CENSUS_CONFIG_STAMP := $(GENERATED_DIR)/softfloat-census-$(TH08_PSP_SOFTFLOAT_CENSUS).stamp
+AUDIO_FIXED_CURSOR_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/audio-fixed-cursor-audit-0.stamp \
+	$(GENERATED_DIR)/audio-fixed-cursor-audit-1.stamp
+AUDIO_FIXED_CURSOR_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/audio-fixed-cursor-audit-$(TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT).stamp
+AUDIO_FIXED_CURSOR_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/audio-fixed-cursor-0.stamp \
+	$(GENERATED_DIR)/audio-fixed-cursor-1.stamp
+AUDIO_FIXED_CURSOR_CONFIG_STAMP := $(GENERATED_DIR)/audio-fixed-cursor-$(TH08_PSP_AUDIO_FIXED_CURSOR).stamp
+TRIG_DF_FASTPATH_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/trig-df-fastpath-audit-0.stamp \
+	$(GENERATED_DIR)/trig-df-fastpath-audit-1.stamp
+TRIG_DF_FASTPATH_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/trig-df-fastpath-audit-$(TH08_PSP_TRIG_DF_FASTPATH_AUDIT).stamp
+TRIG_DF_FASTPATH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/trig-df-fastpath-0.stamp \
+	$(GENERATED_DIR)/trig-df-fastpath-1.stamp
+TRIG_DF_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/trig-df-fastpath-$(TH08_PSP_TRIG_DF_FASTPATH).stamp
+PERF_ENV_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/perf-env-0.stamp \
+	$(GENERATED_DIR)/perf-env-1.stamp
+PERF_ENV_CONFIG_STAMP := $(GENERATED_DIR)/perf-env-$(TH08_PSP_PERF_ENV).stamp
+SWAP_NOWAIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/swap-nowait-0.stamp \
+	$(GENERATED_DIR)/swap-nowait-1.stamp
+SWAP_NOWAIT_CONFIG_STAMP := $(GENERATED_DIR)/swap-nowait-$(TH08_PSP_SWAP_NOWAIT).stamp
+SWAP_ASYNC_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/swap-async-0.stamp \
+	$(GENERATED_DIR)/swap-async-1.stamp
+SWAP_ASYNC_CONFIG_STAMP := $(GENERATED_DIR)/swap-async-$(TH08_PSP_SWAP_ASYNC).stamp
+FLIP_GUARD_COLOR_ONLY_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/flip-guard-color-only-0.stamp \
+	$(GENERATED_DIR)/flip-guard-color-only-1.stamp
+FLIP_GUARD_COLOR_ONLY_CONFIG_STAMP := $(GENERATED_DIR)/flip-guard-color-only-$(TH08_PSP_FLIP_GUARD_COLOR_ONLY).stamp
+TICK_GATE_BYPASS_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/tick-gate-bypass-0.stamp \
+	$(GENERATED_DIR)/tick-gate-bypass-1.stamp
+TICK_GATE_BYPASS_CONFIG_STAMP := $(GENERATED_DIR)/tick-gate-bypass-$(TH08_PSP_TICK_GATE_BYPASS).stamp
+SWAP_TRIPLE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/swap-triple-0.stamp \
+	$(GENERATED_DIR)/swap-triple-1.stamp
+SWAP_TRIPLE_CONFIG_STAMP := $(GENERATED_DIR)/swap-triple-$(TH08_PSP_SWAP_TRIPLE).stamp
+GUI_BORDER_REPLAY_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/gui-border-replay-audit-0.stamp \
+	$(GENERATED_DIR)/gui-border-replay-audit-1.stamp
+GUI_BORDER_REPLAY_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/gui-border-replay-audit-$(TH08_PSP_GUI_BORDER_REPLAY_AUDIT).stamp
+GUI_BORDER_REPLAY_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/gui-border-replay-0.stamp \
+	$(GENERATED_DIR)/gui-border-replay-1.stamp
+GUI_BORDER_REPLAY_CONFIG_STAMP := $(GENERATED_DIR)/gui-border-replay-$(TH08_PSP_GUI_BORDER_REPLAY).stamp
+RENDER_CADENCE_INITIAL_MODE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/render-cadence-initial-mode-0.stamp \
+	$(GENERATED_DIR)/render-cadence-initial-mode-1.stamp \
+	$(GENERATED_DIR)/render-cadence-initial-mode-2.stamp
+RENDER_CADENCE_INITIAL_MODE_CONFIG_STAMP := $(GENERATED_DIR)/render-cadence-initial-mode-$(TH08_PSP_RENDER_CADENCE_INITIAL_MODE).stamp
+BOOT_PARITY_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/th07-boot-parity-0.stamp \
+	$(GENERATED_DIR)/th07-boot-parity-1.stamp
+BOOT_PARITY_CONFIG_STAMP := $(GENERATED_DIR)/th07-boot-parity-$(TH08_PSP_TH07_BOOT_PARITY).stamp
+FONT_SUBSET_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/local-font-subset-0.stamp \
+	$(GENERATED_DIR)/local-font-subset-1.stamp
+FONT_SUBSET_CONFIG_STAMP := $(GENERATED_DIR)/local-font-subset-$(TH08_PSP_LOCAL_FONT_SUBSET).stamp
+FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/font-glyph-cache-retain-0.stamp \
+	$(GENERATED_DIR)/font-glyph-cache-retain-1.stamp
+FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMP := $(GENERATED_DIR)/font-glyph-cache-retain-$(TH08_PSP_FONT_GLYPH_CACHE_RETAIN).stamp
+GO_IO_LAMP_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/go-io-lamp-0.stamp \
+	$(GENERATED_DIR)/go-io-lamp-1.stamp
+GO_IO_LAMP_CONFIG_STAMP := $(GENERATED_DIR)/go-io-lamp-$(TH08_PSP_GO_IO_LAMP).stamp
+EXTRA_CLEAN += $(GE4_MODEL_GATE_CONFIG_STAMPS) \
+	$(BULLET_VM_CONFIG_STAMPS) $(REPLAY_AUDIT_CONFIG_STAMPS) \
+	$(RENDER_VFPU_CONFIG_STAMPS) $(BULLET_FASTPATH_CONFIG_STAMPS) \
+	$(X87_TRIG_CACHE_CONFIG_STAMPS) \
+	$(ANTITAMPER_SWAR_CONFIG_STAMPS) \
+	$(RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMPS) \
+	$(FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMPS) \
+	$(EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMPS) \
+	$(EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMPS) \
+	$(EFFECT_SPRITE_PAIR_AUDIT_CONFIG_STAMPS) \
+	$(EFFECT_SPRITE_PAIR_FASTPATH_CONFIG_STAMPS) \
+	$(EFFECT_INDEXED_QUADS_CONFIG_STAMPS) \
+	$(BULLET_LIVE_ENUM_CONFIG_STAMPS) \
+	$(BULLET_TRANSFORM_AUDIT_CONFIG_STAMPS) \
+	$(BULLET_TRANSFORM_TERMINAL_FASTPATH_CONFIG_STAMPS) \
+	$(PREPARE_STATE_CACHE_CONFIG_STAMPS) $(BULLET_UNIFIED_QUADS_CONFIG_STAMPS) \
+	$(BULLET_DIRECT_GE_CONFIG_STAMPS) \
+	$(BULLET_ONEPASS_4V_AUDIT_CONFIG_STAMPS) \
+	$(BULLET_ONEPASS_4V_FASTPATH_CONFIG_STAMPS) \
+	$(BULLET_PACKED_VERTEX_AUDIT_CONFIG_STAMPS) \
+	$(BULLET_PACKED_VERTEX_FASTPATH_CONFIG_STAMPS) \
+	$(BULLET_MIXED_QUADS_AUDIT_CONFIG_STAMPS) \
+	$(BULLET_MIXED_QUADS_FASTPATH_CONFIG_STAMPS) \
+	$(ITEM_MIXED_QUADS_AUDIT_CONFIG_STAMPS) \
+	$(ITEM_MIXED_QUADS_FASTPATH_CONFIG_STAMPS) \
+	$(ITEM_DIRECT_GE_CONFIG_STAMPS) \
+	$(ITEM_NATURAL_QUADS_CONFIG_STAMPS) \
+	$(ITEM_NATURAL_NATIVE_COPY_CONFIG_STAMPS) \
+	$(PSPGL_STREAM_ARENA_CONFIG_STAMPS) \
+	$(PLAYER_SCAN_SIDECAR_CONFIG_STAMPS) \
+	$(ENEMY_ACTIVE_BITMAP_AUDIT_CONFIG_STAMPS) \
+	$(BULLET_COLLISION_GATE_AUDIT_CONFIG_STAMPS) \
+	$(BULLET_COLLISION_GATE_CONFIG_STAMPS) \
+	$(CANCEL_EMPTY_FASTPATH_CONFIG_STAMPS) \
+	$(BULLET_CANCEL_SPATIAL_CONFIG_STAMPS) \
+	$(ITEM_AUTOCOLLECT_CACHE_AUDIT_CONFIG_STAMPS) \
+	$(ITEM_AUTOCOLLECT_CACHE_CONFIG_STAMPS) \
+	$(ITEM_TIME_SPAWN_INIT_AUDIT_CONFIG_STAMPS) \
+	$(ITEM_TIME_SPAWN_INIT_FASTPATH_CONFIG_STAMPS) \
+	$(ITEM_TIME_ANM_IDLE_AUDIT_CONFIG_STAMPS) \
+	$(ITEM_TIME_ANM_IDLE_FASTPATH_CONFIG_STAMPS) \
+	$(ITEM_TIME_DRAW_PAIR_AUDIT_CONFIG_STAMPS) \
+	$(ITEM_TIME_DRAW_PAIR_FASTPATH_CONFIG_STAMPS) \
+	$(ITEM_TIME_INLINE_DRAW_AUDIT_CONFIG_STAMPS) \
+	$(ITEM_TIME_INLINE_DRAW_FASTPATH_CONFIG_STAMPS) \
+	$(ASCII_POPUP_OCCUPANCY_CONFIG_STAMPS) \
+	$(ASCII_POPUP_BATCH_CONFIG_STAMPS) \
+	$(ASCII_POPUP_DIRECT_PAIR_CONFIG_STAMPS) \
+	$(SCORE_POPUP_NATIVE_GE_CONFIG_STAMPS) \
+	$(STAGE_RELATIVE_PERF_SAMPLING_CONFIG_STAMPS) \
+	$(RUNTIME_TELEMETRY_CONFIG_STAMPS) \
+	$(PERF_ATTRIBUTION_CONFIG_STAMPS) \
+	$(DRAW_PRIORITY_SUBPROFILE_CONFIG_STAMPS) \
+	$(ITEM_UPDATE_SUBPROFILE_CONFIG_STAMPS) \
+	$(ITEM_ATAN2_FASTPATH_AUDIT_CONFIG_STAMPS) \
+	$(ITEM_ATAN2_FASTPATH_CONFIG_STAMPS) \
+	$(ITEM_SINCOS_FASTPATH_AUDIT_CONFIG_STAMPS) \
+	$(ITEM_SINCOS_FASTPATH_CONFIG_STAMPS) \
+	$(SOFTFLOAT_CENSUS_CONFIG_STAMPS) \
+	$(AUDIO_FIXED_CURSOR_AUDIT_CONFIG_STAMPS) \
+	$(AUDIO_FIXED_CURSOR_CONFIG_STAMPS) \
+	$(TRIG_DF_FASTPATH_AUDIT_CONFIG_STAMPS) \
+	$(TRIG_DF_FASTPATH_CONFIG_STAMPS) \
+	$(PERF_ENV_CONFIG_STAMPS) \
+	$(SWAP_NOWAIT_CONFIG_STAMPS) \
+	$(SWAP_ASYNC_CONFIG_STAMPS) \
+	$(FLIP_GUARD_COLOR_ONLY_CONFIG_STAMPS) \
+	$(TICK_GATE_BYPASS_CONFIG_STAMPS) \
+	$(SWAP_TRIPLE_CONFIG_STAMPS) \
+	$(GUI_BORDER_REPLAY_AUDIT_CONFIG_STAMPS) \
+	$(GUI_BORDER_REPLAY_CONFIG_STAMPS) \
+	$(RENDER_CADENCE_INITIAL_MODE_CONFIG_STAMPS) \
+	$(BOOT_PARITY_CONFIG_STAMPS) \
+	$(FONT_SUBSET_CONFIG_STAMPS) \
+	$(FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMPS) \
+	$(GO_IO_LAMP_CONFIG_STAMPS) psp/io_activity_lamp.o
+SDL_CFLAGS := $(shell psp-pkg-config --cflags sdl2 SDL2_image SDL2_ttf)
+
+# Heap-geometry telemetry is pinned to PSPSDK/newlib 4.5.0 classic
+# dlmalloc: 16-byte request rounding and final-ELF __malloc_av_ size 0x408.
+# Re-audit those facts before changing either contract define.
 CXXFLAGS := -std=gnu++17 -O2 -G0 -march=allegrex -mtune=allegrex \
-	-Wall -Wextra -Wconversion -Wshadow \
+	-Wall -Wextra -Wconversion -Wshadow -Wno-unused-parameter \
+	-Wno-write-strings -fpermissive \
 	-fno-exceptions -fno-rtti -fno-pic -MMD -MP \
-	-DPSP -DTH08_PSP_PORT=1 -DTH08_PSP_SC_ONLY=1 \
+	-DPSP -DTH08_PSP_PORT=1 -DTH08_PSP_SC_ONLY=1 -DTH08_PSP_STAGE_POOL_ARENA=1 \
+	-DTH08_PSP_RUNTIME_TELEMETRY=$(TH08_PSP_RUNTIME_TELEMETRY) \
+	-DTH08_PSP_PERF_ATTRIBUTION=$(TH08_PSP_PERF_ATTRIBUTION) \
+	-DTH08_PSP_RENDER_CADENCE_INITIAL_MODE=$(TH08_PSP_RENDER_CADENCE_INITIAL_MODE) \
+	-DTH08_PSP_NEWLIB_4_5_0_DLMALLOC=1 -DTH08_PSP_NEWLIB_MALLOC_ALIGNMENT=16 \
+	-DTH08_MODERN_PORT -DTH08_MODERN_LINUX -DWIN32_LEAN_AND_MEAN \
+	-DSDL_MAIN_HANDLED \
 	-DTH08_UPSTREAM_COMMIT=\"$(TH08_UPSTREAM_COMMIT)\" \
 	-DTH08_ORACLE_COMMIT=\"$(TH08_ORACLE_COMMIT)\" \
 	-DTH07_BACKEND_COMMIT=\"$(TH07_BACKEND_COMMIT)\" \
+	-DTH07_GE4_BRIDGE_COMMIT=\"$(TH07_GE4_BRIDGE_COMMIT)\" \
 	-DTH08_PSP_BUILD_ID=\"$(TH08_PSP_BUILD_ID)\" \
-	-Ipsp
+	-Ipsp -Isrc -I$(GENERATED_DIR) -Isrc/modern/linux/include \
+	-include src/modern/linux/linux_compat.hpp $(SDL_CFLAGS)
 
-LDFLAGS := -Wl,-Map,TH08PSP.map
-LIBS := -lpspgu -lpsppower -lm -lstdc++ -lsupc++
+ifeq ($(TH08_PSP_DRAW_PRIORITY_SUBPROFILE),1)
+CXXFLAGS += -DTH08_PSP_DRAW_PRIORITY_SUBPROFILE=1
+endif
+
+ifeq ($(TH08_PSP_ITEM_UPDATE_SUBPROFILE),1)
+CXXFLAGS += -DTH08_PSP_ITEM_UPDATE_SUBPROFILE=1
+endif
+
+ifeq ($(TH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_ITEM_ATAN2_FASTPATH_AUDIT=1
+endif
+ifeq ($(TH08_PSP_ITEM_ATAN2_FASTPATH),1)
+CXXFLAGS += -DTH08_PSP_ITEM_ATAN2_FASTPATH=1
+endif
+ifeq ($(TH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_ITEM_SINCOS_FASTPATH_AUDIT=1
+endif
+ifeq ($(TH08_PSP_ITEM_SINCOS_FASTPATH),1)
+CXXFLAGS += -DTH08_PSP_ITEM_SINCOS_FASTPATH=1
+endif
+ifeq ($(TH08_PSP_SOFTFLOAT_CENSUS),1)
+CXXFLAGS += -DTH08_PSP_SOFTFLOAT_CENSUS=1
+endif
+ifeq ($(TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_AUDIO_FIXED_CURSOR_AUDIT=1
+endif
+ifeq ($(TH08_PSP_AUDIO_FIXED_CURSOR),1)
+CXXFLAGS += -DTH08_PSP_AUDIO_FIXED_CURSOR=1
+endif
+ifeq ($(TH08_PSP_TRIG_DF_FASTPATH_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_TRIG_DF_FASTPATH_AUDIT=1
+endif
+ifeq ($(TH08_PSP_TRIG_DF_FASTPATH),1)
+CXXFLAGS += -DTH08_PSP_TRIG_DF_FASTPATH=1
+endif
+ifeq ($(TH08_PSP_PERF_ENV),1)
+CXXFLAGS += -DTH08_PSP_PERF_ENV=1
+endif
+ifeq ($(TH08_PSP_SWAP_NOWAIT),1)
+CXXFLAGS += -DTH08_PSP_SWAP_NOWAIT=1
+endif
+ifeq ($(TH08_PSP_SWAP_ASYNC),1)
+CXXFLAGS += -DTH08_PSP_SWAP_ASYNC=1
+endif
+ifeq ($(TH08_PSP_FLIP_GUARD_COLOR_ONLY),1)
+CXXFLAGS += -DTH08_PSP_FLIP_GUARD_COLOR_ONLY=1
+endif
+ifeq ($(TH08_PSP_TICK_GATE_BYPASS),1)
+CXXFLAGS += -DTH08_PSP_TICK_GATE_BYPASS=1
+endif
+ifeq ($(TH08_PSP_SWAP_TRIPLE),1)
+CXXFLAGS += -DTH08_PSP_SWAP_TRIPLE=1
+endif
+ifeq ($(TH08_PSP_PSPGL_STREAM_ARENA),1)
+CXXFLAGS += -DTH08_PSP_PSPGL_STREAM_ARENA=1
+endif
+ifeq ($(TH08_PSP_GO_IO_LAMP),1)
+CXXFLAGS += -DTH08_PSP_GO_IO_LAMP=1
+endif
+ifeq ($(TH08_PSP_GUI_BORDER_REPLAY_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_GUI_BORDER_REPLAY_AUDIT=1
+endif
+ifeq ($(TH08_PSP_GUI_BORDER_REPLAY),1)
+CXXFLAGS += -DTH08_PSP_GUI_BORDER_REPLAY=1
+endif
+# The flip thread reads PSPGL's surface through the vendored internal headers.
+psp/swap_async.o: CXXFLAGS += -Ideps/pspgl-ge4/include
+psp/swap_triple.o: CXXFLAGS += -Ideps/pspgl-ge4/include
+# The double-float atan2 and sin/cos rely on exact IEEE binary32 add/mul
+# rounding.  Allegrex has no fused multiply-add, but pin the contract on the
+# objects that instantiate the headers so a toolchain change cannot silently fuse.
+src/ItemManager.o psp/item_atan2_audit.o psp/item_sincos_audit.o: CXXFLAGS += -ffp-contract=off
+psp/trig_df_fastpath.o: CXXFLAGS += -ffp-contract=off
+
+ifeq ($(TH08_PSP_SLIMPLUS_GE4),1)
+CXXFLAGS += -DTH08_PSP_SLIMPLUS_GE4=1
+endif
+
+ifeq ($(TH08_REPLAY_SYNC_AUDIT),1)
+CXXFLAGS += -DTH08_REPLAY_SYNC_AUDIT=1
+else ifneq ($(TH08_REPLAY_SYNC_AUDIT),0)
+$(error TH08_REPLAY_SYNC_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_RENDER_VFPU),1)
+CXXFLAGS += -DTH08_PSP_RENDER_VFPU=1
+else ifneq ($(TH08_PSP_RENDER_VFPU),0)
+$(error TH08_PSP_RENDER_VFPU must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_X87_TRIG_CACHE),1)
+CXXFLAGS += -DTH08_PSP_X87_TRIG_CACHE=1
+else ifneq ($(TH08_PSP_X87_TRIG_CACHE),0)
+$(error TH08_PSP_X87_TRIG_CACHE must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ANTITAMPER_SWAR),1)
+CXXFLAGS += -DTH08_PSP_ANTITAMPER_SWAR=1
+else ifneq ($(TH08_PSP_ANTITAMPER_SWAR),0)
+$(error TH08_PSP_ANTITAMPER_SWAR must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_RADIAL_TRAIL_TRIG_REUSE),1)
+CXXFLAGS += -DTH08_PSP_RADIAL_TRAIL_TRIG_REUSE=1
+else ifneq ($(TH08_PSP_RADIAL_TRAIL_TRIG_REUSE),0)
+$(error TH08_PSP_RADIAL_TRAIL_TRIG_REUSE must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_FANTASY_SEAL_WORK_BOUNDS),1)
+CXXFLAGS += -DTH08_PSP_FANTASY_SEAL_WORK_BOUNDS=1
+else ifneq ($(TH08_PSP_FANTASY_SEAL_WORK_BOUNDS),0)
+$(error TH08_PSP_FANTASY_SEAL_WORK_BOUNDS must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_EFFECT_OCCUPANCY_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_EFFECT_OCCUPANCY_AUDIT=1
+endif
+ifeq ($(TH08_PSP_EFFECT_OCCUPANCY_FASTPATH),1)
+CXXFLAGS += -DTH08_PSP_EFFECT_OCCUPANCY_FASTPATH=1
+else ifneq ($(TH08_PSP_EFFECT_OCCUPANCY_FASTPATH),0)
+$(error TH08_PSP_EFFECT_OCCUPANCY_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT),1)
+ifeq ($(TH08_PSP_EFFECT_INDEXED_QUADS),1)
+$(error TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT requires the canonical six-vertex Effect path)
+endif
+CXXFLAGS += -DTH08_PSP_EFFECT_SPRITE_PAIR_AUDIT=1
+else ifneq ($(TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT),0)
+$(error TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH),1)
+ifeq ($(TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT),1)
+$(error TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH and TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT are mutually exclusive)
+endif
+ifeq ($(TH08_PSP_EFFECT_INDEXED_QUADS),1)
+$(error TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH requires the canonical Effect frontend)
+endif
+CXXFLAGS += -DTH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH=1
+else ifneq ($(TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH),0)
+$(error TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_EFFECT_INDEXED_QUADS),1)
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_EFFECT_INDEXED_QUADS=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+CXXFLAGS += -DTH08_PSP_EFFECT_INDEXED_QUADS=1
+else ifneq ($(TH08_PSP_EFFECT_INDEXED_QUADS),0)
+$(error TH08_PSP_EFFECT_INDEXED_QUADS must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_COMPACT_BULLET_VM),1)
+CXXFLAGS += -DTH08_PSP_COMPACT_BULLET_VM=1
+else ifneq ($(TH08_PSP_COMPACT_BULLET_VM),0)
+$(error TH08_PSP_COMPACT_BULLET_VM must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_TH07_BOOT_PARITY),1)
+CXXFLAGS += -DTH08_PSP_TH07_BOOT_PARITY=1
+else ifeq ($(TH08_PSP_TH07_BOOT_PARITY),0)
+CXXFLAGS += -DTH08_PSP_TH07_BOOT_PARITY=0
+else
+$(error TH08_PSP_TH07_BOOT_PARITY must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_FASTPATH),1)
+CXXFLAGS += -DTH08_PSP_BULLET_FASTPATH=1
+else ifneq ($(TH08_PSP_BULLET_FASTPATH),0)
+$(error TH08_PSP_BULLET_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_LIVE_ENUM),1)
+ifneq ($(TH08_PSP_BULLET_FASTPATH),1)
+$(error TH08_PSP_BULLET_LIVE_ENUM=1 requires TH08_PSP_BULLET_FASTPATH=1)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_LIVE_ENUM=1
+else ifneq ($(TH08_PSP_BULLET_LIVE_ENUM),0)
+$(error TH08_PSP_BULLET_LIVE_ENUM must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_TRANSFORM_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_BULLET_TRANSFORM_AUDIT=1
+else ifneq ($(TH08_PSP_BULLET_TRANSFORM_AUDIT),0)
+$(error TH08_PSP_BULLET_TRANSFORM_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_TRANSFORM_TERMINAL_FASTPATH),1)
+ifneq ($(TH08_PSP_BULLET_FASTPATH),1)
+$(error TH08_PSP_BULLET_TRANSFORM_TERMINAL_FASTPATH=1 requires TH08_PSP_BULLET_FASTPATH=1)
+endif
+ifeq ($(TH08_PSP_BULLET_TRANSFORM_AUDIT),1)
+$(error TH08_PSP_BULLET_TRANSFORM_TERMINAL_FASTPATH and TH08_PSP_BULLET_TRANSFORM_AUDIT are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_TRANSFORM_TERMINAL_FASTPATH=1
+else ifneq ($(TH08_PSP_BULLET_TRANSFORM_TERMINAL_FASTPATH),0)
+$(error TH08_PSP_BULLET_TRANSFORM_TERMINAL_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_PREPARE_STATE_CACHE),1)
+CXXFLAGS += -DTH08_PSP_PREPARE_STATE_CACHE=1
+else ifneq ($(TH08_PSP_PREPARE_STATE_CACHE),0)
+$(error TH08_PSP_PREPARE_STATE_CACHE must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+CXXFLAGS += -DTH08_PSP_BULLET_UNIFIED_QUADS=1
+else ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),0)
+$(error TH08_PSP_BULLET_UNIFIED_QUADS must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_DIRECT_GE),1)
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_BULLET_DIRECT_GE=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_DIRECT_GE=1
+else ifneq ($(TH08_PSP_BULLET_DIRECT_GE),0)
+$(error TH08_PSP_BULLET_DIRECT_GE must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_ONEPASS_4V_AUDIT),1)
+ifeq ($(TH08_PSP_BULLET_ONEPASS_4V_FASTPATH),1)
+$(error TH08_PSP_BULLET_ONEPASS_4V_AUDIT and TH08_PSP_BULLET_ONEPASS_4V_FASTPATH are mutually exclusive)
+endif
+ifneq ($(TH08_PSP_BULLET_FASTPATH),1)
+$(error TH08_PSP_BULLET_ONEPASS_4V_AUDIT=1 requires TH08_PSP_BULLET_FASTPATH=1)
+endif
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_BULLET_ONEPASS_4V_AUDIT=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+ifneq ($(TH08_PSP_BULLET_DIRECT_GE),1)
+$(error TH08_PSP_BULLET_ONEPASS_4V_AUDIT=1 requires TH08_PSP_BULLET_DIRECT_GE=1)
+endif
+ifneq ($(filter 1,$(TH08_PSP_BULLET_PACKED_VERTEX_AUDIT) $(TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH) $(TH08_PSP_BULLET_MIXED_QUADS_AUDIT) $(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH)),)
+$(error TH08_PSP_BULLET_ONEPASS_4V_AUDIT is isolated from packed/mixed Bullet experiments)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_ONEPASS_4V_AUDIT=1
+else ifneq ($(TH08_PSP_BULLET_ONEPASS_4V_AUDIT),0)
+$(error TH08_PSP_BULLET_ONEPASS_4V_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_ONEPASS_4V_FASTPATH),1)
+ifneq ($(TH08_PSP_BULLET_FASTPATH),1)
+$(error TH08_PSP_BULLET_ONEPASS_4V_FASTPATH=1 requires TH08_PSP_BULLET_FASTPATH=1)
+endif
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_BULLET_ONEPASS_4V_FASTPATH=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+ifneq ($(TH08_PSP_BULLET_DIRECT_GE),1)
+$(error TH08_PSP_BULLET_ONEPASS_4V_FASTPATH=1 requires TH08_PSP_BULLET_DIRECT_GE=1)
+endif
+ifneq ($(filter 1,$(TH08_PSP_BULLET_PACKED_VERTEX_AUDIT) $(TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH) $(TH08_PSP_BULLET_MIXED_QUADS_AUDIT) $(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH)),)
+$(error TH08_PSP_BULLET_ONEPASS_4V_FASTPATH is isolated from packed/mixed Bullet experiments)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_ONEPASS_4V_FASTPATH=1
+else ifneq ($(TH08_PSP_BULLET_ONEPASS_4V_FASTPATH),0)
+$(error TH08_PSP_BULLET_ONEPASS_4V_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_PACKED_VERTEX_AUDIT),1)
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_BULLET_PACKED_VERTEX_AUDIT=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+
+ifneq ($(TH08_PSP_BULLET_DIRECT_GE),1)
+$(error TH08_PSP_BULLET_PACKED_VERTEX_AUDIT=1 requires TH08_PSP_BULLET_DIRECT_GE=1)
+endif
+ifneq ($(filter 1,$(TH08_PSP_BULLET_MIXED_QUADS_AUDIT) $(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH)),)
+$(error TH08_PSP_BULLET_PACKED_VERTEX_AUDIT and BULLET_MIXED_QUADS are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_PACKED_VERTEX_AUDIT=1
+else ifneq ($(TH08_PSP_BULLET_PACKED_VERTEX_AUDIT),0)
+$(error TH08_PSP_BULLET_PACKED_VERTEX_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH),1)
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+ifneq ($(TH08_PSP_BULLET_DIRECT_GE),1)
+$(error TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH=1 requires TH08_PSP_BULLET_DIRECT_GE=1)
+endif
+ifeq ($(TH08_PSP_BULLET_PACKED_VERTEX_AUDIT),1)
+$(error TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH and TH08_PSP_BULLET_PACKED_VERTEX_AUDIT are mutually exclusive)
+endif
+ifneq ($(filter 1,$(TH08_PSP_BULLET_MIXED_QUADS_AUDIT) $(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH) $(TH08_PSP_ITEM_MIXED_QUADS_AUDIT) $(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH)),)
+$(error TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH and mixed 2V quad modes are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_PACKED_VERTEX_FASTPATH=1
+else ifneq ($(TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH),0)
+$(error TH08_PSP_BULLET_PACKED_VERTEX_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_MIXED_QUADS_AUDIT),1)
+ifeq ($(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH),1)
+$(error TH08_PSP_BULLET_MIXED_QUADS_AUDIT and TH08_PSP_BULLET_MIXED_QUADS_FASTPATH are mutually exclusive)
+endif
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_BULLET_MIXED_QUADS_AUDIT=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_MIXED_QUADS_AUDIT=1
+else ifneq ($(TH08_PSP_BULLET_MIXED_QUADS_AUDIT),0)
+$(error TH08_PSP_BULLET_MIXED_QUADS_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH),1)
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_BULLET_MIXED_QUADS_FASTPATH=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+ifneq ($(TH08_PSP_BULLET_DIRECT_GE),1)
+$(error TH08_PSP_BULLET_MIXED_QUADS_FASTPATH=1 requires TH08_PSP_BULLET_DIRECT_GE=1)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_MIXED_QUADS_FASTPATH=1
+else ifneq ($(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH),0)
+$(error TH08_PSP_BULLET_MIXED_QUADS_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_MIXED_QUADS_AUDIT),1)
+ifeq ($(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH),1)
+$(error TH08_PSP_ITEM_MIXED_QUADS_AUDIT and TH08_PSP_ITEM_MIXED_QUADS_FASTPATH are mutually exclusive)
+endif
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_ITEM_MIXED_QUADS_AUDIT=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+ifeq ($(TH08_PSP_ITEM_DIRECT_GE),1)
+$(error TH08_PSP_ITEM_MIXED_QUADS_AUDIT and TH08_PSP_ITEM_DIRECT_GE are mutually exclusive)
+endif
+ifneq ($(filter 1,$(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) $(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH)),)
+$(error TH08_PSP_ITEM_MIXED_QUADS_AUDIT and ITEM_TIME_DRAW_PAIR are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_MIXED_QUADS_AUDIT=1
+else ifneq ($(TH08_PSP_ITEM_MIXED_QUADS_AUDIT),0)
+$(error TH08_PSP_ITEM_MIXED_QUADS_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH),1)
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_ITEM_MIXED_QUADS_FASTPATH=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+ifneq ($(TH08_PSP_BULLET_DIRECT_GE),1)
+$(error TH08_PSP_ITEM_MIXED_QUADS_FASTPATH=1 requires TH08_PSP_BULLET_DIRECT_GE=1)
+endif
+ifeq ($(TH08_PSP_ITEM_DIRECT_GE),1)
+$(error TH08_PSP_ITEM_MIXED_QUADS_FASTPATH and TH08_PSP_ITEM_DIRECT_GE are mutually exclusive)
+endif
+ifneq ($(filter 1,$(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) $(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH)),)
+$(error TH08_PSP_ITEM_MIXED_QUADS_FASTPATH and ITEM_TIME_DRAW_PAIR are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_MIXED_QUADS_FASTPATH=1
+else ifneq ($(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH),0)
+$(error TH08_PSP_ITEM_MIXED_QUADS_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_DIRECT_GE),1)
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_ITEM_DIRECT_GE=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_DIRECT_GE=1
+else ifneq ($(TH08_PSP_ITEM_DIRECT_GE),0)
+$(error TH08_PSP_ITEM_DIRECT_GE must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_NATURAL_QUADS),1)
+ifneq ($(TH08_PSP_BULLET_UNIFIED_QUADS),1)
+$(error TH08_PSP_ITEM_NATURAL_QUADS=1 requires TH08_PSP_BULLET_UNIFIED_QUADS=1)
+endif
+ifneq ($(filter 1,$(TH08_PSP_ITEM_DIRECT_GE) $(TH08_PSP_ITEM_MIXED_QUADS_AUDIT) $(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH) $(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) $(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH)),)
+$(error TH08_PSP_ITEM_NATURAL_QUADS is isolated from prior Item topology experiments)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_NATURAL_QUADS=1
+else ifneq ($(TH08_PSP_ITEM_NATURAL_QUADS),0)
+$(error TH08_PSP_ITEM_NATURAL_QUADS must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_NATURAL_NATIVE_COPY),1)
+ifneq ($(TH08_PSP_ITEM_NATURAL_QUADS),1)
+$(error TH08_PSP_ITEM_NATURAL_NATIVE_COPY=1 requires TH08_PSP_ITEM_NATURAL_QUADS=1)
+endif
+ifneq ($(filter 1,$(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH) $(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH)),)
+$(error TH08_PSP_ITEM_NATURAL_NATIVE_COPY is isolated from mixed PSPGL product archives)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_NATURAL_NATIVE_COPY=1
+else ifneq ($(TH08_PSP_ITEM_NATURAL_NATIVE_COPY),0)
+$(error TH08_PSP_ITEM_NATURAL_NATIVE_COPY must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_PLAYER_SCAN_SIDECAR),1)
+CXXFLAGS += -DTH08_PSP_PLAYER_SCAN_SIDECAR=1
+else ifneq ($(TH08_PSP_PLAYER_SCAN_SIDECAR),0)
+$(error TH08_PSP_PLAYER_SCAN_SIDECAR must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ENEMY_ACTIVE_BITMAP_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_ENEMY_ACTIVE_BITMAP_AUDIT=1
+else ifneq ($(TH08_PSP_ENEMY_ACTIVE_BITMAP_AUDIT),0)
+$(error TH08_PSP_ENEMY_ACTIVE_BITMAP_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_COLLISION_GATE),1)
+CXXFLAGS += -DTH08_PSP_BULLET_COLLISION_GATE=1
+endif
+ifeq ($(TH08_PSP_BULLET_COLLISION_GATE_AUDIT),1)
+ifneq ($(TH08_PSP_PLAYER_SCAN_SIDECAR),1)
+$(error TH08_PSP_BULLET_COLLISION_GATE_AUDIT=1 requires TH08_PSP_PLAYER_SCAN_SIDECAR=1)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_COLLISION_GATE_AUDIT=1
+else ifneq ($(TH08_PSP_BULLET_COLLISION_GATE_AUDIT),0)
+$(error TH08_PSP_BULLET_COLLISION_GATE_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_CANCEL_EMPTY_FASTPATH),1)
+ifneq ($(TH08_PSP_PLAYER_SCAN_SIDECAR),1)
+$(error TH08_PSP_CANCEL_EMPTY_FASTPATH=1 requires TH08_PSP_PLAYER_SCAN_SIDECAR=1)
+endif
+CXXFLAGS += -DTH08_PSP_CANCEL_EMPTY_FASTPATH=1
+else ifneq ($(TH08_PSP_CANCEL_EMPTY_FASTPATH),0)
+$(error TH08_PSP_CANCEL_EMPTY_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_BULLET_CANCEL_SPATIAL),1)
+ifneq ($(TH08_PSP_PLAYER_SCAN_SIDECAR),1)
+$(error TH08_PSP_BULLET_CANCEL_SPATIAL=1 requires TH08_PSP_PLAYER_SCAN_SIDECAR=1)
+endif
+ifneq ($(TH08_PSP_BULLET_FASTPATH),1)
+$(error TH08_PSP_BULLET_CANCEL_SPATIAL=1 requires TH08_PSP_BULLET_FASTPATH=1)
+endif
+CXXFLAGS += -DTH08_PSP_BULLET_CANCEL_SPATIAL=1
+else ifneq ($(TH08_PSP_BULLET_CANCEL_SPATIAL),0)
+$(error TH08_PSP_BULLET_CANCEL_SPATIAL must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_AUTOCOLLECT_CACHE_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_ITEM_AUTOCOLLECT_CACHE_AUDIT=1
+else ifneq ($(TH08_PSP_ITEM_AUTOCOLLECT_CACHE_AUDIT),0)
+$(error TH08_PSP_ITEM_AUTOCOLLECT_CACHE_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_AUTOCOLLECT_CACHE),1)
+ifeq ($(TH08_PSP_ITEM_AUTOCOLLECT_CACHE_AUDIT),1)
+$(error TH08_PSP_ITEM_AUTOCOLLECT_CACHE and TH08_PSP_ITEM_AUTOCOLLECT_CACHE_AUDIT are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_AUTOCOLLECT_CACHE=1
+else ifneq ($(TH08_PSP_ITEM_AUTOCOLLECT_CACHE),0)
+$(error TH08_PSP_ITEM_AUTOCOLLECT_CACHE must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT=1
+else ifneq ($(TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT),0)
+$(error TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_TIME_SPAWN_INIT_FASTPATH),1)
+ifeq ($(TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT),1)
+$(error TH08_PSP_ITEM_TIME_SPAWN_INIT_FASTPATH and TH08_PSP_ITEM_TIME_SPAWN_INIT_AUDIT are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_TIME_SPAWN_INIT_FASTPATH=1
+else ifneq ($(TH08_PSP_ITEM_TIME_SPAWN_INIT_FASTPATH),0)
+$(error TH08_PSP_ITEM_TIME_SPAWN_INIT_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_TIME_ANM_IDLE_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_ITEM_TIME_ANM_IDLE_AUDIT=1
+else ifneq ($(TH08_PSP_ITEM_TIME_ANM_IDLE_AUDIT),0)
+$(error TH08_PSP_ITEM_TIME_ANM_IDLE_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_TIME_ANM_IDLE_FASTPATH),1)
+ifeq ($(TH08_PSP_ITEM_TIME_ANM_IDLE_AUDIT),1)
+$(error TH08_PSP_ITEM_TIME_ANM_IDLE_FASTPATH and TH08_PSP_ITEM_TIME_ANM_IDLE_AUDIT are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_TIME_ANM_IDLE_FASTPATH=1
+else ifneq ($(TH08_PSP_ITEM_TIME_ANM_IDLE_FASTPATH),0)
+$(error TH08_PSP_ITEM_TIME_ANM_IDLE_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT),1)
+ifeq ($(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH),1)
+$(error TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT and TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH are mutually exclusive)
+endif
+ifeq ($(TH08_PSP_ITEM_DIRECT_GE),1)
+$(error TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT and TH08_PSP_ITEM_DIRECT_GE are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT=1
+else ifneq ($(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT),0)
+$(error TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH),1)
+ifeq ($(TH08_PSP_ITEM_DIRECT_GE),1)
+$(error TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH and TH08_PSP_ITEM_DIRECT_GE are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH=1
+else ifneq ($(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH),0)
+$(error TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_TIME_INLINE_DRAW_AUDIT),1)
+ifeq ($(TH08_PSP_ITEM_TIME_INLINE_DRAW_FASTPATH),1)
+$(error TH08_PSP_ITEM_TIME_INLINE_DRAW_AUDIT and TH08_PSP_ITEM_TIME_INLINE_DRAW_FASTPATH are mutually exclusive)
+endif
+ifneq ($(filter 1,$(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) $(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH) $(TH08_PSP_ITEM_NATURAL_QUADS)),)
+$(error TH08_PSP_ITEM_TIME_INLINE_DRAW_AUDIT is isolated from pair-run and natural-quad owners)
+endif
+ifneq ($(filter 1,$(TH08_PSP_ITEM_DIRECT_GE) $(TH08_PSP_ITEM_MIXED_QUADS_AUDIT) $(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH)),)
+$(error TH08_PSP_ITEM_TIME_INLINE_DRAW_AUDIT requires the canonical 6V Item backend)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_TIME_INLINE_DRAW_AUDIT=1
+else ifneq ($(TH08_PSP_ITEM_TIME_INLINE_DRAW_AUDIT),0)
+$(error TH08_PSP_ITEM_TIME_INLINE_DRAW_AUDIT must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ITEM_TIME_INLINE_DRAW_FASTPATH),1)
+ifneq ($(filter 1,$(TH08_PSP_ITEM_TIME_DRAW_PAIR_AUDIT) $(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH) $(TH08_PSP_ITEM_NATURAL_QUADS)),)
+$(error TH08_PSP_ITEM_TIME_INLINE_DRAW_FASTPATH is isolated from pair-run and natural-quad owners)
+endif
+CXXFLAGS += -DTH08_PSP_ITEM_TIME_INLINE_DRAW_FASTPATH=1
+else ifneq ($(TH08_PSP_ITEM_TIME_INLINE_DRAW_FASTPATH),0)
+$(error TH08_PSP_ITEM_TIME_INLINE_DRAW_FASTPATH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ASCII_POPUP_OCCUPANCY),1)
+CXXFLAGS += -DTH08_PSP_ASCII_POPUP_OCCUPANCY=1
+else ifneq ($(TH08_PSP_ASCII_POPUP_OCCUPANCY),0)
+$(error TH08_PSP_ASCII_POPUP_OCCUPANCY must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ASCII_POPUP_BATCH),1)
+ifeq ($(TH08_PSP_ASCII_POPUP_OCCUPANCY),1)
+$(error TH08_PSP_ASCII_POPUP_BATCH and TH08_PSP_ASCII_POPUP_OCCUPANCY are mutually exclusive)
+endif
+CXXFLAGS += -DTH08_PSP_ASCII_POPUP_BATCH=1
+else ifneq ($(TH08_PSP_ASCII_POPUP_BATCH),0)
+$(error TH08_PSP_ASCII_POPUP_BATCH must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_ASCII_POPUP_DIRECT_PAIR),1)
+ifneq ($(TH08_PSP_ASCII_POPUP_BATCH),1)
+$(error TH08_PSP_ASCII_POPUP_DIRECT_PAIR=1 requires TH08_PSP_ASCII_POPUP_BATCH=1)
+endif
+CXXFLAGS += -DTH08_PSP_ASCII_POPUP_DIRECT_PAIR=1
+else ifneq ($(TH08_PSP_ASCII_POPUP_DIRECT_PAIR),0)
+$(error TH08_PSP_ASCII_POPUP_DIRECT_PAIR must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_SCORE_POPUP_NATIVE_GE),1)
+ifneq ($(TH08_PSP_ASCII_POPUP_BATCH),1)
+$(error TH08_PSP_SCORE_POPUP_NATIVE_GE=1 requires TH08_PSP_ASCII_POPUP_BATCH=1)
+endif
+CXXFLAGS += -DTH08_PSP_SCORE_POPUP_NATIVE_GE=1
+else ifneq ($(TH08_PSP_SCORE_POPUP_NATIVE_GE),0)
+$(error TH08_PSP_SCORE_POPUP_NATIVE_GE must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_STAGE_RELATIVE_PERF_SAMPLING),1)
+ifeq ($(TH08_PSP_RUNTIME_TELEMETRY),0)
+$(error TH08_PSP_STAGE_RELATIVE_PERF_SAMPLING=1 requires TH08_PSP_RUNTIME_TELEMETRY=1)
+endif
+CXXFLAGS += -DTH08_PSP_STAGE_RELATIVE_PERF_SAMPLING=1
+else ifneq ($(TH08_PSP_STAGE_RELATIVE_PERF_SAMPLING),0)
+$(error TH08_PSP_STAGE_RELATIVE_PERF_SAMPLING must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_LOCAL_FONT_SUBSET),1)
+CXXFLAGS += -DTH08_PSP_LOCAL_FONT_SUBSET=1
+else ifeq ($(TH08_PSP_LOCAL_FONT_SUBSET),0)
+CXXFLAGS += -DTH08_PSP_LOCAL_FONT_SUBSET=0
+else
+$(error TH08_PSP_LOCAL_FONT_SUBSET must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_FONT_GLYPH_CACHE_RETAIN),1)
+CXXFLAGS += -DTH08_PSP_FONT_GLYPH_CACHE_RETAIN=1
+else ifeq ($(TH08_PSP_FONT_GLYPH_CACHE_RETAIN),0)
+CXXFLAGS += -DTH08_PSP_FONT_GLYPH_CACHE_RETAIN=0
+else
+$(error TH08_PSP_FONT_GLYPH_CACHE_RETAIN must be 0 or 1)
+endif
+
+LDFLAGS := -Wl,-Map,TH08PSP.map -Wl,--wrap=memalign -Wl,--wrap=malloc \
+	-Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free \
+	-Wl,--require-defined=__malloc_av_ \
+	-Wl,--require-defined=__malloc_sbrk_base \
+	-Wl,--require-defined=__malloc_current_mallinfo \
+	-Wl,--require-defined=__malloc_lock -Wl,--require-defined=__malloc_unlock
+
+ifeq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+LDFLAGS += -Wl,--wrap=sceGeListSync -Wl,--wrap=sceDisplayWaitVblankStart
+endif
+ifneq ($(TH08_PSP_PERF_ENV)$(TH08_PSP_SWAP_TRIPLE),00)
+# GE queue observer / triple-buffer flip poll: every PSPGL list submission.
+LDFLAGS += -Wl,--wrap=sceGeListEnQueue
+endif
+ifeq ($(TH08_PSP_SOFTFLOAT_CENSUS),1)
+SOFTFLOAT_CENSUS_WRAPS := __adddf3 __subdf3 __muldf3 __divdf3 \
+	__eqdf2 __nedf2 __gtdf2 __gedf2 __ltdf2 __ledf2 __unorddf2 \
+	__extendsfdf2 __truncdfsf2 __fixdfsi __fixunsdfsi __fixdfdi __fixunsdfdi \
+	__floatsidf __floatunsidf __floatdidf \
+	sin cos atan2 atan sqrt floor ceil fmod pow exp log tan \
+	sinf cosf atan2f sqrtf floorf fmodf
+LDFLAGS += $(foreach sym,$(SOFTFLOAT_CENSUS_WRAPS),-Wl$(comma)--wrap=$(sym))
+endif
+
+# Audit/OFF retain the accepted v3 archive byte-for-byte.  Only the mixed
+# product experiment selects the separately fingerprinted archive containing
+# the atomic sprite-prefix/indexed-suffix hook.
+PSPGL_GE4_SELECTED_ARCHIVE := $(PSPGL_GE4_ARCHIVE)
+PSPGL_GE4_SELECTED_ARCHIVE_STAMP := $(PSPGL_GE4_ARCHIVE_STAMP)
+ifneq ($(filter 1,$(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH) $(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH)),)
+PSPGL_GE4_SELECTED_ARCHIVE := $(PSPGL_GE4_MIXED_ARCHIVE)
+PSPGL_GE4_SELECTED_ARCHIVE_STAMP := $(PSPGL_GE4_MIXED_ARCHIVE_STAMP)
+endif
+ifeq ($(TH08_PSP_ITEM_NATURAL_NATIVE_COPY),1)
+PSPGL_GE4_SELECTED_ARCHIVE := $(PSPGL_GE4_INDEXED_COPY_ARCHIVE)
+PSPGL_GE4_SELECTED_ARCHIVE_STAMP := $(PSPGL_GE4_INDEXED_COPY_ARCHIVE_STAMP)
+endif
+ifeq ($(TH08_PSP_PSPGL_STREAM_ARENA),1)
+ifneq ($(PSPGL_GE4_SELECTED_ARCHIVE),$(PSPGL_GE4_ARCHIVE))
+$(error TH08_PSP_PSPGL_STREAM_ARENA=1 is exclusive with the mixed and indexed-copy archive gates)
+endif
+PSPGL_GE4_SELECTED_ARCHIVE := $(PSPGL_GE4_STREAM_ARENA_ARCHIVE)
+PSPGL_GE4_SELECTED_ARCHIVE_STAMP := $(PSPGL_GE4_STREAM_ARENA_ARCHIVE_STAMP)
+endif
+
+# SC-only is an intentional link contract for the first playable target.  Do
+# not add me-core, MIST, ME task/audio, or any Media Engine support here.
+LIBS := -lSDL2_image -lSDL2_ttf -lSDL2main -lSDL2 $(PSPGL_GE4_SELECTED_ARCHIVE) \
+	-lharfbuzz -lfreetype -lbz2 -lpng16 -ljpeg -lz \
+	-lpspvram -lpspaudio -lpspvfpu -lpspgum_vfpu -lpspmath \
+	-lpspdisplay -lpspgu -lpspge -lpsphprm -lpspctrl -lpsppower \
+	-lpspkubridge -lpspsystemctrl_user \
+	-lpthread -latomic -lm -lstdc++ -lsupc++
 
 PSPSDK := $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
@@ -39,5 +1834,975 @@ include $(PSPSDK)/lib/build.mak
 # is used. Keep this bootstrap's import surface limited to its actual platform,
 # file, controller, display, GE, and power dependencies.
 LIBS := $(filter-out -lpspnet -lpspnet_apctl,$(LIBS))
+
+# The upper eDRAM contract lives below the public GL API, so a successful
+# compile against headers does not prove that the fork reached the final ELF.
+# First validate the frozen archive and source provenance, then gate EBOOT
+# packing on symbols, the exact marker, and the link-map archive origin.
+$(PSPGL_GE4_ARCHIVE_STAMP): $(PSPGL_GE4_ARCHIVE) $(PSPGL_GE4_PATCH) \
+		$(PSPGL_NATIVE_SUBMIT_PATCH) \
+		$(PSPGL_GE4_LICENSE) deps/pspgl-ge4/README.md
+	@mkdir -p $(dir $@)
+	@test "$$(wc -c < "$(PSPGL_GE4_ARCHIVE)")" -eq "$(PSPGL_GE4_ARCHIVE_SIZE)"
+	@test "$$(sha256sum "$(PSPGL_GE4_ARCHIVE)" | awk '{print $$1}')" = "$(PSPGL_GE4_ARCHIVE_SHA256)"
+	@test "$$(sha256sum "$(PSPGL_GE4_PATCH)" | awk '{print $$1}')" = "$(PSPGL_GE4_PATCH_SHA256)"
+	@test "$$(sha256sum "$(PSPGL_NATIVE_SUBMIT_PATCH)" | awk '{print $$1}')" = "$(PSPGL_NATIVE_SUBMIT_PATCH_SHA256)"
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_texobj_promote_upper$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_ge4_fork_marker$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_indexed_triangles$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_sprite_pairs_copy$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_native_submit_marker$$'
+	@strings $(PSPGL_GE4_ARCHIVE) | grep -Fxq '$(PSPGL_GE4_MARKER)'
+	@strings $(PSPGL_GE4_ARCHIVE) | grep -Fxq '$(PSPGL_NATIVE_SUBMIT_MARKER)'
+	@touch $@
+
+$(PSPGL_GE4_STREAM_ARENA_ARCHIVE_STAMP): \
+		$(PSPGL_GE4_STREAM_ARENA_ARCHIVE) \
+		$(PSPGL_STREAM_ARENA_PATCH) $(PSPGL_GE4_ARCHIVE_STAMP) \
+		$(PSPGL_GE4_LICENSE) deps/pspgl-ge4/README.md
+	@mkdir -p $(dir $@)
+	@test "$$(wc -c < "$(PSPGL_GE4_STREAM_ARENA_ARCHIVE)")" -eq "$(PSPGL_GE4_STREAM_ARENA_ARCHIVE_SIZE)"
+	@test "$$(sha256sum "$(PSPGL_GE4_STREAM_ARENA_ARCHIVE)" | awk '{print $$1}')" = "$(PSPGL_GE4_STREAM_ARENA_ARCHIVE_SHA256)"
+	@test "$$(sha256sum "$(PSPGL_STREAM_ARENA_PATCH)" | awk '{print $$1}')" = "$(PSPGL_STREAM_ARENA_PATCH_SHA256)"
+	@test "$$(sha256sum "$(PSPGL_GE4_LICENSE)" | awk '{print $$1}')" = "$(PSPGL_GE4_LICENSE_SHA256)"
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_texobj_promote_upper$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_ge4_fork_marker$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_indexed_triangles$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_sprite_pairs_copy$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_native_submit_marker$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_stream_arena_install$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_stream_arena_begin_frame$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_stream_arena_marker$$'
+	@strings $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | grep -Fxq '$(PSPGL_GE4_MARKER)'
+	@strings $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | grep -Fxq '$(PSPGL_NATIVE_SUBMIT_MARKER)'
+	@strings $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | grep -Fxq '$(PSPGL_STREAM_ARENA_MARKER)'
+	@touch $@
+
+$(PSPGL_GE4_MIXED_ARCHIVE_STAMP): $(PSPGL_GE4_MIXED_ARCHIVE) \
+		$(PSPGL_NATIVE_MIXED_PATCH) $(PSPGL_GE4_ARCHIVE_STAMP) \
+		$(PSPGL_GE4_LICENSE) deps/pspgl-ge4/README.md
+	@mkdir -p $(dir $@)
+	@test "$$(wc -c < "$(PSPGL_GE4_MIXED_ARCHIVE)")" -eq "$(PSPGL_GE4_MIXED_ARCHIVE_SIZE)"
+	@test "$$(sha256sum "$(PSPGL_GE4_MIXED_ARCHIVE)" | awk '{print $$1}')" = "$(PSPGL_GE4_MIXED_ARCHIVE_SHA256)"
+	@test "$$(sha256sum "$(PSPGL_NATIVE_MIXED_PATCH)" | awk '{print $$1}')" = "$(PSPGL_NATIVE_MIXED_PATCH_SHA256)"
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_MIXED_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_texobj_promote_upper$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_MIXED_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_ge4_fork_marker$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_MIXED_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_indexed_triangles$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_MIXED_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_sprite_pairs_copy$$'
+	@$(PSPDEV)/bin/psp-nm -S -g --defined-only $(PSPGL_GE4_MIXED_ARCHIVE) | \
+		grep -Eq '^[[:xdigit:]]+[[:space:]]+000002d8[[:space:]]+T[[:space:]]+__pspgl_th08_draw_native_mixed_quads$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_MIXED_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_native_submit_marker$$'
+	@strings $(PSPGL_GE4_MIXED_ARCHIVE) | grep -Fxq '$(PSPGL_GE4_MARKER)'
+	@strings $(PSPGL_GE4_MIXED_ARCHIVE) | grep -Fxq '$(PSPGL_NATIVE_SUBMIT_MARKER)'
+	@touch $@
+
+$(PSPGL_GE4_INDEXED_COPY_ARCHIVE_STAMP): \
+		$(PSPGL_GE4_INDEXED_COPY_ARCHIVE) \
+		$(PSPGL_NATIVE_INDEXED_COPY_PATCH) $(PSPGL_GE4_ARCHIVE_STAMP) \
+		$(PSPGL_GE4_LICENSE) deps/pspgl-ge4/README.md
+	@mkdir -p $(dir $@)
+	@test "$$(wc -c < "$(PSPGL_GE4_INDEXED_COPY_ARCHIVE)")" -eq "$(PSPGL_GE4_INDEXED_COPY_ARCHIVE_SIZE)"
+	@test "$$(sha256sum "$(PSPGL_GE4_INDEXED_COPY_ARCHIVE)" | awk '{print $$1}')" = "$(PSPGL_GE4_INDEXED_COPY_ARCHIVE_SHA256)"
+	@test "$$(sha256sum "$(PSPGL_NATIVE_INDEXED_COPY_PATCH)" | awk '{print $$1}')" = "$(PSPGL_NATIVE_INDEXED_COPY_PATCH_SHA256)"
+	@test "$$(sha256sum "$(PSPGL_GE4_LICENSE)" | awk '{print $$1}')" = "$(PSPGL_GE4_LICENSE_SHA256)"
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_INDEXED_COPY_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_texobj_promote_upper$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_INDEXED_COPY_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_ge4_fork_marker$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_INDEXED_COPY_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_indexed_triangles$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_INDEXED_COPY_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_sprite_pairs_copy$$'
+	@$(PSPDEV)/bin/psp-nm -S -g --defined-only $(PSPGL_GE4_INDEXED_COPY_ARCHIVE) | \
+		grep -Eq '^[[:xdigit:]]+[[:space:]]+000001b4[[:space:]]+T[[:space:]]+__pspgl_th08_draw_native_indexed_quads_copy$$'
+	@$(PSPDEV)/bin/psp-nm -S -g --defined-only $(PSPGL_GE4_INDEXED_COPY_ARCHIVE) | \
+		grep -Eq '^[[:xdigit:]]+[[:space:]]+0000006f[[:space:]]+R[[:space:]]+__pspgl_th08_native_indexed_copy_marker$$'
+	@strings $(PSPGL_GE4_INDEXED_COPY_ARCHIVE) | grep -Fxq '$(PSPGL_GE4_MARKER)'
+	@strings $(PSPGL_GE4_INDEXED_COPY_ARCHIVE) | grep -Fxq '$(PSPGL_NATIVE_SUBMIT_MARKER)'
+	@strings $(PSPGL_GE4_INDEXED_COPY_ARCHIVE) | grep -Fxq '$(PSPGL_NATIVE_INDEXED_COPY_MARKER)'
+	@touch $@
+
+$(TARGET).elf: | $(PSPGL_GE4_SELECTED_ARCHIVE_STAMP)
+
+$(PSPGL_GE4_LINK_STAMP): $(TARGET).elf $(PSPGL_GE4_SELECTED_ARCHIVE_STAMP)
+	@mkdir -p $(dir $@)
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(TARGET).elf | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_texobj_promote_upper$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(TARGET).elf | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_ge4_fork_marker$$'
+	@strings $(TARGET).elf | grep -Fxq '$(PSPGL_GE4_MARKER)'
+	@if test "$(TH08_PSP_BULLET_DIRECT_GE)" = "1" || \
+	   test "$(TH08_PSP_ITEM_DIRECT_GE)" = "1"; then \
+		$(PSPDEV)/bin/psp-nm -g --defined-only $(TARGET).elf | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_indexed_triangles$$'; \
+	fi
+	@if test "$(TH08_PSP_SCORE_POPUP_NATIVE_GE)" = "1"; then \
+		$(PSPDEV)/bin/psp-nm -g --defined-only $(TARGET).elf | \
+			grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_sprite_pairs_copy$$'; \
+	fi
+	@if test "$(TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH)" = "1"; then \
+		$(PSPDEV)/bin/psp-nm -g --defined-only $(TARGET).elf | \
+			grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_sprite_pairs_copy$$'; \
+	fi
+	@if test "$(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH)" = "1"; then \
+		$(PSPDEV)/bin/psp-nm -g --defined-only $(TARGET).elf | \
+			grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_sprite_pairs_copy$$'; \
+	fi
+	@if test "$(TH08_PSP_ITEM_NATURAL_NATIVE_COPY)" = "1"; then \
+		$(PSPDEV)/bin/psp-nm -S -g --defined-only $(TARGET).elf | \
+			grep -Eq '^[[:xdigit:]]+[[:space:]]+000001b4[[:space:]]+T[[:space:]]+__pspgl_th08_draw_native_indexed_quads_copy$$'; \
+		$(PSPDEV)/bin/psp-nm -S -g --defined-only $(TARGET).elf | \
+			grep -Eq '^[[:xdigit:]]+[[:space:]]+0000006f[[:space:]]+R[[:space:]]+__pspgl_th08_native_indexed_copy_marker$$'; \
+		strings $(TARGET).elf | grep -Fxq '$(PSPGL_NATIVE_INDEXED_COPY_MARKER)'; \
+	fi
+	@if test "$(TH08_PSP_BULLET_DIRECT_GE)" = "1" || \
+	   test "$(TH08_PSP_ITEM_DIRECT_GE)" = "1" || \
+	   test "$(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH)" = "1" || \
+	   test "$(TH08_PSP_SCORE_POPUP_NATIVE_GE)" = "1" || \
+	   test "$(TH08_PSP_ITEM_TIME_DRAW_PAIR_FASTPATH)" = "1" || \
+	   test "$(TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH)" = "1" || \
+	   test "$(TH08_PSP_ITEM_NATURAL_NATIVE_COPY)" = "1"; then \
+		$(PSPDEV)/bin/psp-nm -g --defined-only $(TARGET).elf | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_native_submit_marker$$'; \
+		strings $(TARGET).elf | grep -Fxq '$(PSPGL_NATIVE_SUBMIT_MARKER)'; \
+	fi
+	@if test "$(TH08_PSP_BULLET_MIXED_QUADS_FASTPATH)" = "1" || \
+	   test "$(TH08_PSP_ITEM_MIXED_QUADS_FASTPATH)" = "1"; then \
+		$(PSPDEV)/bin/psp-nm -S -g --defined-only $(TARGET).elf | \
+		grep -Eq '^[[:xdigit:]]+[[:space:]]+000002d8[[:space:]]+T[[:space:]]+__pspgl_th08_draw_native_mixed_quads$$'; \
+	fi
+	@grep -Fq '$(PSPGL_GE4_SELECTED_ARCHIVE)' TH08PSP.map
+	@touch $@
+
+.PHONY: FORCE_GE4_PROVEN_PRX
+FORCE_GE4_PROVEN_PRX:
+
+# Never package a rebuilt or similarly named wrapper.  The game-side bridge is
+# tied to the exact TH07 hardware-proven binary ABI and rejects every platform
+# which does not satisfy the runtime model/base/HW-size/visible-size gates.
+ifeq ($(TH08_PSP_SLIMPLUS_GE4),1)
+$(GE4_PROVEN_PRX): FORCE_GE4_PROVEN_PRX $(GE4_PROVEN_PRX_SOURCE) $(GE4_SLIMPLUS_PRX_BUILDER)
+	python3 "$(GE4_SLIMPLUS_PRX_BUILDER)" \
+		--input "$(GE4_PROVEN_PRX_SOURCE)" --output "$@"
+	@test "$$(wc -c < "$@")" -eq "$(GE4_PROVEN_PRX_SIZE)"
+	@test "$$(sha256sum "$@" | awk '{print $$1}')" = "$(GE4_PROVEN_PRX_SHA256)"
+else
+$(GE4_PROVEN_PRX): FORCE_GE4_PROVEN_PRX $(GE4_PROVEN_PRX_SOURCE)
+	@test "$$(wc -c < "$(GE4_PROVEN_PRX_SOURCE)")" -eq "$(GE4_PROVEN_PRX_SIZE)"
+	@test "$$(sha256sum "$(GE4_PROVEN_PRX_SOURCE)" | awk '{print $$1}')" = "$(GE4_PROVEN_PRX_SHA256)"
+	cp "$(GE4_PROVEN_PRX_SOURCE)" "$@"
+	@test "$$(wc -c < "$@")" -eq "$(GE4_PROVEN_PRX_SIZE)"
+	@test "$$(sha256sum "$@" | awk '{print $$1}')" = "$(GE4_PROVEN_PRX_SHA256)"
+endif
+
+$(GENERATED_I18N): config/i18n.csv scripts/generate_i18n.py
+	@mkdir -p $(GENERATED_DIR)
+	python3 scripts/generate_i18n.py -o $@ --shift-jis $<
+
+$(GE4_MODEL_GATE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(GE4_MODEL_GATE_CONFIG_STAMPS))
+	@touch $@
+
+# Exactly one ABI stamp is retained.  Switching the feature flag therefore
+# makes the requested stamp missing even when that variant was built earlier,
+# and forces the complete object closure to rebuild before linking.
+$(BULLET_VM_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_VM_CONFIG_STAMPS))
+	@touch $@
+
+$(REPLAY_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(REPLAY_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(RENDER_VFPU_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(RENDER_VFPU_CONFIG_STAMPS))
+	@touch $@
+
+$(X87_TRIG_CACHE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(X87_TRIG_CACHE_CONFIG_STAMPS))
+	@touch $@
+
+$(ANTITAMPER_SWAR_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ANTITAMPER_SWAR_CONFIG_STAMPS))
+	@touch $@
+
+$(RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMPS))
+	@touch $@
+
+$(FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMPS))
+	@touch $@
+
+$(EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(EFFECT_SPRITE_PAIR_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(EFFECT_SPRITE_PAIR_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(EFFECT_SPRITE_PAIR_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(EFFECT_SPRITE_PAIR_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(EFFECT_INDEXED_QUADS_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(EFFECT_INDEXED_QUADS_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_LIVE_ENUM_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_LIVE_ENUM_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_TRANSFORM_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_TRANSFORM_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_TRANSFORM_TERMINAL_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_TRANSFORM_TERMINAL_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(PREPARE_STATE_CACHE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(PREPARE_STATE_CACHE_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_UNIFIED_QUADS_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_UNIFIED_QUADS_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_DIRECT_GE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_DIRECT_GE_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_ONEPASS_4V_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_ONEPASS_4V_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_ONEPASS_4V_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_ONEPASS_4V_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_PACKED_VERTEX_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_PACKED_VERTEX_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_PACKED_VERTEX_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_PACKED_VERTEX_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_MIXED_QUADS_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_MIXED_QUADS_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_MIXED_QUADS_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_MIXED_QUADS_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_MIXED_QUADS_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_MIXED_QUADS_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_MIXED_QUADS_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_MIXED_QUADS_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_DIRECT_GE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_DIRECT_GE_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_NATURAL_QUADS_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_NATURAL_QUADS_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_NATURAL_NATIVE_COPY_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_NATURAL_NATIVE_COPY_CONFIG_STAMPS))
+	@touch $@
+
+$(PSPGL_STREAM_ARENA_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(PSPGL_STREAM_ARENA_CONFIG_STAMPS))
+	@touch $@
+
+$(PLAYER_SCAN_SIDECAR_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(PLAYER_SCAN_SIDECAR_CONFIG_STAMPS))
+	@touch $@
+
+$(ENEMY_ACTIVE_BITMAP_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ENEMY_ACTIVE_BITMAP_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_COLLISION_GATE_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_COLLISION_GATE_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_COLLISION_GATE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_COLLISION_GATE_CONFIG_STAMPS))
+	@touch $@
+
+$(CANCEL_EMPTY_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(CANCEL_EMPTY_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(BULLET_CANCEL_SPATIAL_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BULLET_CANCEL_SPATIAL_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_AUTOCOLLECT_CACHE_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_AUTOCOLLECT_CACHE_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_AUTOCOLLECT_CACHE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_AUTOCOLLECT_CACHE_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_TIME_SPAWN_INIT_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_TIME_SPAWN_INIT_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_TIME_SPAWN_INIT_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_TIME_SPAWN_INIT_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_TIME_ANM_IDLE_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_TIME_ANM_IDLE_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_TIME_ANM_IDLE_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_TIME_ANM_IDLE_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_TIME_DRAW_PAIR_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_TIME_DRAW_PAIR_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_TIME_DRAW_PAIR_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_TIME_DRAW_PAIR_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_TIME_INLINE_DRAW_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_TIME_INLINE_DRAW_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_TIME_INLINE_DRAW_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_TIME_INLINE_DRAW_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(ASCII_POPUP_OCCUPANCY_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ASCII_POPUP_OCCUPANCY_CONFIG_STAMPS))
+	@touch $@
+
+$(ASCII_POPUP_BATCH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ASCII_POPUP_BATCH_CONFIG_STAMPS))
+	@touch $@
+
+$(ASCII_POPUP_DIRECT_PAIR_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ASCII_POPUP_DIRECT_PAIR_CONFIG_STAMPS))
+	@touch $@
+
+$(SCORE_POPUP_NATIVE_GE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(SCORE_POPUP_NATIVE_GE_CONFIG_STAMPS))
+	@touch $@
+
+$(STAGE_RELATIVE_PERF_SAMPLING_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(STAGE_RELATIVE_PERF_SAMPLING_CONFIG_STAMPS))
+	@touch $@
+
+$(RUNTIME_TELEMETRY_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(RUNTIME_TELEMETRY_CONFIG_STAMPS))
+	@touch $@
+
+$(PERF_ATTRIBUTION_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(PERF_ATTRIBUTION_CONFIG_STAMPS))
+	@touch $@
+
+$(DRAW_PRIORITY_SUBPROFILE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(DRAW_PRIORITY_SUBPROFILE_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_UPDATE_SUBPROFILE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_UPDATE_SUBPROFILE_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_ATAN2_FASTPATH_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_ATAN2_FASTPATH_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_ATAN2_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_ATAN2_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_SINCOS_FASTPATH_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_SINCOS_FASTPATH_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ITEM_SINCOS_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ITEM_SINCOS_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(SOFTFLOAT_CENSUS_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(SOFTFLOAT_CENSUS_CONFIG_STAMPS))
+	@touch $@
+
+$(AUDIO_FIXED_CURSOR_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(AUDIO_FIXED_CURSOR_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(AUDIO_FIXED_CURSOR_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(AUDIO_FIXED_CURSOR_CONFIG_STAMPS))
+	@touch $@
+
+$(TRIG_DF_FASTPATH_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(TRIG_DF_FASTPATH_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(TRIG_DF_FASTPATH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(TRIG_DF_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(PERF_ENV_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(PERF_ENV_CONFIG_STAMPS))
+	@touch $@
+
+$(SWAP_NOWAIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(SWAP_NOWAIT_CONFIG_STAMPS))
+	@touch $@
+
+$(SWAP_ASYNC_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(SWAP_ASYNC_CONFIG_STAMPS))
+	@touch $@
+
+$(FLIP_GUARD_COLOR_ONLY_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(FLIP_GUARD_COLOR_ONLY_CONFIG_STAMPS))
+	@touch $@
+
+$(TICK_GATE_BYPASS_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(TICK_GATE_BYPASS_CONFIG_STAMPS))
+	@touch $@
+
+$(SWAP_TRIPLE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(SWAP_TRIPLE_CONFIG_STAMPS))
+	@touch $@
+
+$(GUI_BORDER_REPLAY_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(GUI_BORDER_REPLAY_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(GUI_BORDER_REPLAY_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(GUI_BORDER_REPLAY_CONFIG_STAMPS))
+	@touch $@
+
+$(RENDER_CADENCE_INITIAL_MODE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(RENDER_CADENCE_INITIAL_MODE_CONFIG_STAMPS))
+	@touch $@
+
+$(BOOT_PARITY_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BOOT_PARITY_CONFIG_STAMPS))
+	@touch $@
+
+$(FONT_SUBSET_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(FONT_SUBSET_CONFIG_STAMPS))
+	@touch $@
+
+$(FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMPS))
+	@touch $@
+
+$(GO_IO_LAMP_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(GO_IO_LAMP_CONFIG_STAMPS))
+	@touch $@
+
+# psp-ld can require private symbols but cannot assert their ELF st_size.
+# Gate EBOOT packing on a post-link ABI/disassembly audit so an SDK allocator
+# replacement cannot silently turn the read-only heap scanner into an unsafe
+# metadata walk.
+$(NEWLIB_HEAP_ABI_STAMP): $(TARGET).elf scripts/check_psp_newlib_heap_abi.py
+	@mkdir -p $(dir $@)
+	python3 scripts/check_psp_newlib_heap_abi.py $(TARGET).elf \
+		--nm $(PSPDEV)/bin/psp-nm --objdump $(PSPDEV)/bin/psp-objdump
+	@touch $@
+
+EBOOT.PBP: $(NEWLIB_HEAP_ABI_STAMP) $(PSPGL_GE4_LINK_STAMP) \
+	$(GE4_PROVEN_PRX)
+
+$(OBJS): $(GENERATED_I18N) $(GE4_MODEL_GATE_CONFIG_STAMP) \
+	$(BULLET_VM_CONFIG_STAMP) \
+	$(REPLAY_AUDIT_CONFIG_STAMP) $(RENDER_VFPU_CONFIG_STAMP) \
+	$(RUNTIME_TELEMETRY_CONFIG_STAMP) \
+	$(X87_TRIG_CACHE_CONFIG_STAMP) \
+	$(BULLET_FASTPATH_CONFIG_STAMP) $(BULLET_UNIFIED_QUADS_CONFIG_STAMP) \
+	$(BULLET_DIRECT_GE_CONFIG_STAMP) $(ITEM_DIRECT_GE_CONFIG_STAMP)
+
+# The diagnostic exists in exactly these call-site owners.  Its source and
+# linker wrappers are absent in OFF builds; the stamp prevents stale ON/OFF
+# objects from surviving an incremental switch.
+src/main.o src/BulletManager.o src/ItemManager.o src/EffectManager.o \
+	src/EnemyManager.o src/EnemyManagerUpdate.o src/Player.o \
+	src/modern/linux/d3d8_compat.o psp/main.o psp/perf_attribution.o: \
+	$(PERF_ATTRIBUTION_CONFIG_STAMP)
+
+# The child sampler changes only the central draw dispatcher, one nested
+# Background callsite, its fixed observer, the parent window owner, and the
+# persisted boot identity.  OFF/ON switches invalidate that exact closure.
+src/Global.o src/Background.o psp/draw_priority_subprofile.o \
+	psp/perf_attribution.o psp/main.o: \
+	$(DRAW_PRIORITY_SUBPROFILE_CONFIG_STAMP)
+
+# The Item update sub-profile spans only ItemManager::OnUpdate, its fixed
+# observer, the parent window owner, and the persisted boot identity.
+src/ItemManager.o psp/item_update_subprofile.o psp/perf_attribution.o \
+	psp/main.o: $(ITEM_UPDATE_SUBPROFILE_CONFIG_STAMP)
+
+# The atan2 audit/product switches span the Item autocollect caller, the
+# statistics observer, the parent window owner, and the boot identity.
+src/ItemManager.o psp/item_atan2_audit.o psp/perf_attribution.o psp/main.o: \
+	$(ITEM_ATAN2_FASTPATH_AUDIT_CONFIG_STAMP) $(ITEM_ATAN2_FASTPATH_CONFIG_STAMP)
+
+# The sin/cos audit/product switches span the Item velocity helper, the
+# statistics observer, the parent window owner, and the boot identity.
+src/ItemManager.o psp/item_sincos_audit.o psp/perf_attribution.o psp/main.o: \
+	$(ITEM_SINCOS_FASTPATH_AUDIT_CONFIG_STAMP) $(ITEM_SINCOS_FASTPATH_CONFIG_STAMP)
+
+# The census changes only the phase bookkeeping in the attribution scope, its
+# own observer, the link-time wrappers, and the boot identity.
+psp/softfloat_census.o psp/perf_attribution.o psp/main.o: \
+	$(SOFTFLOAT_CENSUS_CONFIG_STAMP)
+
+# The audio cursor switches span the SC mixer, its observer, the parent
+# window owner, and the boot identity.
+src/modern/linux/linux_compat.o psp/audio_cursor_audit.o psp/perf_attribution.o psp/main.o: \
+	$(AUDIO_FIXED_CURSOR_AUDIT_CONFIG_STAMP) $(AUDIO_FIXED_CURSOR_CONFIG_STAMP)
+
+# The trig fast-path switches live in ZunMath.hpp, which every game object
+# includes, plus the observer, the parent window owner, and the boot identity.
+$(filter src/%.o,$(OBJS)) psp/trig_df_fastpath.o psp/perf_attribution.o psp/main.o: \
+	$(TRIG_DF_FASTPATH_AUDIT_CONFIG_STAMP) $(TRIG_DF_FASTPATH_CONFIG_STAMP)
+
+# The environment record spans its observer, the attribution scopes and
+# wrappers, the draw-priority GE-wait bins, and the boot identity.
+psp/perf_env.o psp/perf_attribution.o psp/draw_priority_subprofile.o psp/main.o: \
+	$(PERF_ENV_CONFIG_STAMP)
+
+# The no-wait swap spans the compat device (swap interval, flip guard), the
+# cadence wait in the game loop, and the boot identity.
+src/modern/linux/d3d8_compat.o src/main.o psp/main.o psp/swap_async.o: \
+	$(SWAP_NOWAIT_CONFIG_STAMP)
+
+# The async flip spans the compat device, its thread module, the environment
+# record (flip-guard wait), and the boot identity.
+src/modern/linux/d3d8_compat.o psp/swap_async.o psp/perf_env.o psp/main.o: \
+	$(SWAP_ASYNC_CONFIG_STAMP)
+
+# The colour-only flip guard spans the compat device (Clear entry) and the
+# boot identity.
+src/modern/linux/d3d8_compat.o psp/main.o: \
+	$(FLIP_GUARD_COLOR_ONLY_CONFIG_STAMP)
+
+# The PSPGL stream arena spans the compat device (synchronous frame lease) and
+# the boot identity.
+src/modern/linux/d3d8_compat.o psp/main.o: \
+	$(PSPGL_STREAM_ARENA_CONFIG_STAMP)
+
+# The Go storage diagnostic spans its fixed state module, the Win32/POSIX
+# bridge, the PSP-only archive-request stdio trace, the final overlay, and the
+# persisted feature fingerprint.  Switching OFF/ON rebuilds that exact set.
+psp/io_activity_lamp.o psp/fileio.o src/main.o \
+	src/modern/linux/linux_compat.o src/modern/linux/linux_runtime.o \
+	psp/main.o: \
+	$(GO_IO_LAMP_CONFIG_STAMP)
+
+# The tick gate bypass spans the game loop and the boot identity.
+src/main.o psp/main.o: \
+	$(TICK_GATE_BYPASS_CONFIG_STAMP)
+
+# The triple buffer spans the compat device (Present), the game loop (poll),
+# its module, the list hook, the display query module and the boot identity.
+src/modern/linux/d3d8_compat.o src/main.o psp/main.o psp/swap_triple.o \
+psp/swap_async.o psp/ge_list_hook.o psp/perf_env.o psp/stage_pool_arena.o: \
+	$(SWAP_TRIPLE_CONFIG_STAMP)
+psp/ge_list_hook.o: $(PERF_ENV_CONFIG_STAMP)
+
+# The border replay spans Gui::DrawGameScene, its observer, the parent window
+# owner, and the boot identity.
+src/Gui.o psp/gui_border_replay.o psp/perf_attribution.o psp/main.o: \
+	$(GUI_BORDER_REPLAY_AUDIT_CONFIG_STAMP) $(GUI_BORDER_REPLAY_CONFIG_STAMP)
+
+# Only the presentation scheduler consumes the diagnostic boot mode.  Its
+# public API and every game/replay object remain identical across mode 0/2.
+psp/render_cadence.o: $(RENDER_CADENCE_INITIAL_MODE_CONFIG_STAMP)
+
+# The one-pass switch spans only the fired-Bullet caller, its AnmManager
+# staging owner, and the persisted boot fingerprint.  OFF/AUDIT/PRODUCT share
+# the same fixed 80-byte stats reservation.
+src/BulletManager.o src/AnmManager.o psp/main.o: \
+	$(BULLET_ONEPASS_4V_AUDIT_CONFIG_STAMP) \
+	$(BULLET_ONEPASS_4V_FASTPATH_CONFIG_STAMP)
+
+# Only the compatibility renderer and boot fingerprint consume this toggle.
+src/modern/linux/d3d8_compat.o psp/main.o: $(PREPARE_STATE_CACHE_CONFIG_STAMP)
+
+# The radial candidate changes only EffectManager's draw-only zero-secondary
+# branch.  Rebuild it and the boot identity together for every OFF/ON switch.
+src/EffectManager.o psp/main.o: $(RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMP)
+src/PlayerBomb.o psp/main.o: $(FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMP)
+src/EffectManager.o psp/main.o: $(EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMP)
+src/EffectManager.o psp/effect_occupancy_audit.o psp/perf_attribution.o psp/main.o: \
+	$(EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMP)
+src/EffectManager.o psp/main.o: $(EFFECT_SPRITE_PAIR_AUDIT_CONFIG_STAMP)
+src/EffectManager.o src/modern/linux/d3d8_compat.o psp/main.o: \
+	$(EFFECT_SPRITE_PAIR_FASTPATH_CONFIG_STAMP)
+src/GameManager.o psp/main.o: $(ANTITAMPER_SWAR_CONFIG_STAMP)
+src/AnmManager.o src/EffectManager.o psp/memory_telemetry.o psp/main.o: \
+	$(EFFECT_INDEXED_QUADS_CONFIG_STAMP)
+
+# M0 is backend-only and observational.  Rebuild the canonical vertex owner,
+# its cumulative telemetry reader, and the boot identity as one configuration.
+src/modern/linux/d3d8_compat.o psp/memory_telemetry.o psp/main.o: \
+	$(BULLET_PACKED_VERTEX_AUDIT_CONFIG_STAMP)
+
+# M1 spans the final-quad frontend boundary, the compatibility renderer's
+# Present-fenced arena, cumulative telemetry, and the boot identity.
+src/AnmManager.o src/modern/linux/d3d8_compat.o psp/memory_telemetry.o \
+	psp/main.o: $(BULLET_PACKED_VERTEX_FASTPATH_CONFIG_STAMP)
+
+# Recompile one real linker input whenever the frozen PSPGL archive changes.
+# This turns archive provenance changes into a relink without injecting the
+# empty validation stamp itself into PSPSDK build.mak's `$^` link input list.
+src/modern/linux/d3d8_compat.o: $(PSPGL_GE4_ARCHIVE_STAMP)
+src/modern/linux/d3d8_compat.o: $(PSPGL_GE4_SELECTED_ARCHIVE_STAMP)
+
+# Mixed classification and submission span exactly these five translation
+# units: frontend/sidecar, PSPGL bridge, boot identity, interval telemetry, and
+# the BulletManager draw-chain owner.
+# Switching either bit invalidates them together without rebuilding gameplay
+# owners that do not consume the experiment macros.
+src/AnmManager.o src/modern/linux/d3d8_compat.o psp/main.o \
+	psp/memory_telemetry.o src/BulletManager.o: \
+	$(BULLET_MIXED_QUADS_AUDIT_CONFIG_STAMP) \
+	$(BULLET_MIXED_QUADS_FASTPATH_CONFIG_STAMP) \
+	$(ITEM_MIXED_QUADS_AUDIT_CONFIG_STAMP) \
+	$(ITEM_MIXED_QUADS_FASTPATH_CONFIG_STAMP)
+
+# Player owns this external scan cache and main emits its boot fingerprint.
+# Rebuild both consumers so an incremental OFF/ON A/B can never carry a stale
+# feature identity into the runtime log.
+src/Player.o psp/main.o: $(PLAYER_SCAN_SIDECAR_CONFIG_STAMP) \
+	$(CANCEL_EMPTY_FASTPATH_CONFIG_STAMP)
+
+src/EnemyManager.o src/EnemyManagerUpdate.o src/EnemyTimeline.o \
+	psp/enemy_active_bitmap_audit.o psp/main.o: \
+	$(ENEMY_ACTIVE_BITMAP_AUDIT_CONFIG_STAMP)
+
+# The all-frame cancel gate spans Player coverage, Bullet occupancy/duplicate
+# replay, interval telemetry, and the persisted boot fingerprint.
+src/Player.o src/BulletManager.o psp/memory_telemetry.o psp/main.o: \
+	$(BULLET_CANCEL_SPATIAL_CONFIG_STAMP)
+
+# The collision audit spans the canonical Bullet calls, Player's immutable
+# frame snapshot, interval telemetry, and the boot identity.  Rebuild every
+# consumer together while retaining BulletManager's unconditional audit BSS.
+src/BulletManager.o src/Player.o psp/memory_telemetry.o psp/main.o: \
+	$(BULLET_COLLISION_GATE_AUDIT_CONFIG_STAMP)
+src/BulletManager.o psp/bullet_gate_stats.o psp/perf_attribution.o psp/main.o: \
+	$(BULLET_COLLISION_GATE_CONFIG_STAMP)
+
+# BulletManager owns the dynamic enumerator, telemetry reads and resets its
+# interval counters, and main records the exact A/B identity.
+src/BulletManager.o psp/memory_telemetry.o psp/main.o: \
+	$(BULLET_LIVE_ENUM_CONFIG_STAMP) \
+	$(BULLET_TRANSFORM_AUDIT_CONFIG_STAMP) \
+	$(BULLET_TRANSFORM_TERMINAL_FASTPATH_CONFIG_STAMP)
+
+# The observer, telemetry reader, and boot fingerprint must switch together;
+# production builds retain the exact canonical Item path and no audit BSS.
+src/ItemManager.o src/AnmManager.o psp/memory_telemetry.o psp/main.o: \
+	$(ITEM_AUTOCOLLECT_CACHE_AUDIT_CONFIG_STAMP) \
+	$(ITEM_AUTOCOLLECT_CACHE_CONFIG_STAMP) \
+	$(ITEM_TIME_SPAWN_INIT_AUDIT_CONFIG_STAMP) \
+	$(ITEM_TIME_SPAWN_INIT_FASTPATH_CONFIG_STAMP) \
+	$(ITEM_TIME_ANM_IDLE_AUDIT_CONFIG_STAMP) \
+	$(ITEM_TIME_ANM_IDLE_FASTPATH_CONFIG_STAMP) \
+	$(ITEM_TIME_DRAW_PAIR_AUDIT_CONFIG_STAMP) \
+	$(ITEM_TIME_DRAW_PAIR_FASTPATH_CONFIG_STAMP) \
+	$(ITEM_NATURAL_QUADS_CONFIG_STAMP)
+
+# The inline experiment changes only ItemManager's stock ITEM_TIME frontend;
+# main persists the exact OFF/AUDIT/PRODUCT identity in every hardware log.
+src/ItemManager.o psp/main.o: \
+	$(ITEM_TIME_INLINE_DRAW_AUDIT_CONFIG_STAMP) \
+	$(ITEM_TIME_INLINE_DRAW_FASTPATH_CONFIG_STAMP)
+
+# Product additionally consumes the generic mutable in-place PSPGL pair
+# bridge.  Audit keeps the backend untouched but shares the same source stamp.
+src/modern/linux/d3d8_compat.o: \
+	$(ITEM_TIME_DRAW_PAIR_AUDIT_CONFIG_STAMP) \
+	$(ITEM_TIME_DRAW_PAIR_FASTPATH_CONFIG_STAMP) \
+	$(ITEM_NATURAL_QUADS_CONFIG_STAMP)
+
+# Native-copy changes only the natural frontend's submit result accounting,
+# the PSPGL compatibility backend, interval policy text, and boot identity.
+# The fixed 152-byte Item sidecar and gameplay owners remain unchanged.
+src/AnmManager.o src/modern/linux/d3d8_compat.o psp/memory_telemetry.o \
+	psp/main.o: $(ITEM_NATURAL_NATIVE_COPY_CONFIG_STAMP)
+
+# AsciiManager owns the derived popup occupancy; main logs the exact toggle.
+src/AsciiManager.o psp/main.o: $(ASCII_POPUP_OCCUPANCY_CONFIG_STAMP)
+
+# The score-only pair frontend spans AsciiManager, AnmManager and the PSPGL
+# compatibility submitter; rebuild all consumers plus the boot fingerprint.
+src/AsciiManager.o src/AnmManager.o src/modern/linux/d3d8_compat.o \
+	psp/main.o: $(ASCII_POPUP_BATCH_CONFIG_STAMP)
+
+# This path changes only AnmManager's score-batch frontend and boot identity;
+# the accepted PSPGL pair backend and AsciiManager owner are unchanged.
+src/AnmManager.o psp/main.o: $(ASCII_POPUP_DIRECT_PAIR_CONFIG_STAMP)
+
+# M0 changes the score-popup backend submit, its persisted runtime counters,
+# and the boot fingerprint.  The frontend batch stamp remains independent for
+# client-array/native A/B.
+src/modern/linux/d3d8_compat.o psp/memory_telemetry.o psp/main.o: \
+	$(SCORE_POPUP_NATIVE_GE_CONFIG_STAMP)
+
+# The sampler is diagnostic-only.  Rebuild its sole owner and the boot
+# fingerprint together so archived A/B evidence cannot have a stale identity.
+psp/memory_telemetry.o psp/main.o: \
+	$(STAGE_RELATIVE_PERF_SAMPLING_CONFIG_STAMP)
+
+src/modern/linux/linux_compat.o psp/main.o: $(FONT_SUBSET_CONFIG_STAMP)
+src/modern/linux/linux_compat.o psp/main.o: \
+	$(FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMP)
+
+# Only this translation unit owns module/newlib declarations. The dedicated
+# stamp makes the parity toggle rebuild it without invalidating the game ABI.
+psp/main.o: $(BOOT_PARITY_CONFIG_STAMP)
+
+# The accepted AnmVmBase::Initialize body is intentionally inline in the
+# original-owner TU.  GCC otherwise discards its out-of-line COMDAT even though
+# other reconstructed TUs reference it.
+src/AsciiManager.o: CXXFLAGS += -fkeep-inline-functions
+
+.PHONY: test-psp-ascii-popup-batch
+test-psp-ascii-popup-batch: scripts/test-psp-ascii-popup-batch.py
+	python3 scripts/test-psp-ascii-popup-batch.py
+
+.PHONY: test-psp-render-cadence
+test-psp-render-cadence: tools/test_psp_render_cadence.py \
+	tools/psp_render_cadence_harness.cpp psp/render_cadence.hpp \
+	psp/render_cadence.cpp
+	python3 tools/test_psp_render_cadence.py
+
+.PHONY: test-psp-go-io-lamp
+test-psp-go-io-lamp: tools/test_psp_go_io_lamp.py \
+	psp/io_activity_lamp.hpp psp/io_activity_lamp.cpp
+	python3 tools/test_psp_go_io_lamp.py
+
+.PHONY: test-psp-perf-attribution
+test-psp-perf-attribution: tools/test_psp_perf_attribution.py \
+	psp/perf_attribution.hpp psp/perf_attribution_math.hpp \
+	psp/perf_attribution.cpp
+	python3 tools/test_psp_perf_attribution.py
+
+.PHONY: test-psp-title-surface-return
+test-psp-title-surface-return: scripts/test-psp-title-surface-return.py
+	python3 scripts/test-psp-title-surface-return.py
+
+.PHONY: test-psp-ascii-popup-direct-pair
+test-psp-ascii-popup-direct-pair: tools/test_psp_ascii_popup_direct_pair.py
+	python3 tools/test_psp_ascii_popup_direct_pair.py
+
+.PHONY: test-compare-ascii-popup-direct-pair-perf
+test-compare-ascii-popup-direct-pair-perf: \
+	tools/test_compare_ascii_popup_direct_pair_perf.py \
+	tools/compare_ascii_popup_direct_pair_perf.py
+	python3 tools/test_compare_ascii_popup_direct_pair_perf.py
+
+.PHONY: test-psp-item-time-draw-pair
+test-psp-item-time-draw-pair: scripts/test-psp-item-time-draw-pair.py
+	python3 scripts/test-psp-item-time-draw-pair.py
+
+.PHONY: test-psp-item-time-inline-draw
+test-psp-item-time-inline-draw: tools/test_psp_item_time_inline_draw.py
+	python3 tools/test_psp_item_time_inline_draw.py
+
+.PHONY: test-psp-bullet-onepass-4v
+test-psp-bullet-onepass-4v: tools/test_psp_bullet_onepass_4v.py \
+	tools/psp_bullet_onepass_4v_harness.cpp psp/bullet_onepass_4v.hpp
+	python3 tools/test_psp_bullet_onepass_4v.py
+
+.PHONY: test-psp-radial-trig-reuse
+test-psp-radial-trig-reuse: tools/test_psp_radial_trig_reuse.py \
+	psp/radial_trig_reuse.hpp
+	python3 tools/test_psp_radial_trig_reuse.py
+
+.PHONY: test-psp-x87-trig-cache
+test-psp-x87-trig-cache: tools/test_psp_x87_trig_cache.py \
+	tools/psp_x87_trig_cache_harness.cpp psp/x87_trig_cache.hpp \
+	psp/x87_trig_cache.cpp psp/radial_trig_reuse.hpp src/ZunMath.hpp
+	python3 tools/test_psp_x87_trig_cache.py
+
+.PHONY: test-psp-radial-trail-telemetry
+test-psp-radial-trail-telemetry: tools/test_psp_radial_trail_telemetry.py \
+	psp/radial_trail_telemetry.hpp psp/radial_trail_telemetry.cpp
+	python3 tools/test_psp_radial_trail_telemetry.py
+
+.PHONY: test-psp-effect-occupancy-fastpath
+test-psp-effect-occupancy-fastpath: tools/test_psp_effect_occupancy_fastpath.py \
+	tools/psp_effect_occupancy_harness.cpp src/PspEffectOccupancy.hpp
+	python3 tools/test_psp_effect_occupancy_fastpath.py
+
+.PHONY: test-psp-effect-indexed-quads
+test-psp-effect-indexed-quads: tools/test_psp_effect_indexed_quads.py
+	python3 tools/test_psp_effect_indexed_quads.py
+
+.PHONY: test-psp-effect-sprite-pair-audit
+test-psp-effect-sprite-pair-audit: \
+	tools/test_psp_effect_sprite_pair_audit.py \
+	tools/psp_effect_sprite_pair_audit_harness.cpp \
+	psp/effect_sprite_pair_audit.hpp
+	python3 tools/test_psp_effect_sprite_pair_audit.py
+
+.PHONY: test-psp-effect-sprite-pair-fastpath
+test-psp-effect-sprite-pair-fastpath: \
+	tools/test_psp_effect_sprite_pair_fastpath.py \
+	tools/psp_effect_sprite_pair_fastpath_harness.cpp \
+	psp/effect_sprite_pair_audit.hpp
+	python3 tools/test_psp_effect_sprite_pair_fastpath.py
+
+.PHONY: test-psp-bullet-mixed-quads
+test-psp-bullet-mixed-quads: tools/test_psp_bullet_mixed_quads.py \
+	tools/test_psp_bullet_mixed_integration.py
+	python3 tools/test_psp_bullet_mixed_quads.py
+	python3 tools/test_psp_bullet_mixed_integration.py
+
+.PHONY: test-psp-item-mixed-quads
+test-psp-item-mixed-quads: tools/test_psp_item_mixed_quads.py
+	python3 tools/test_psp_item_mixed_quads.py
+
+.PHONY: test-psp-mixed-ge-backend-stats
+test-psp-mixed-ge-backend-stats: tools/test_psp_mixed_ge_backend_stats.py
+	python3 tools/test_psp_mixed_ge_backend_stats.py
+
+.PHONY: test-psp-mixed-quads
+test-psp-mixed-quads: test-psp-bullet-mixed-quads \
+		test-psp-item-mixed-quads test-psp-mixed-ge-backend-stats
+
+.PHONY: test-psp-bullet-collision-gate-audit
+test-psp-bullet-collision-gate-audit: tools/test_psp_bullet_collision_gate_audit.py \
+	tools/psp_bullet_collision_gate_harness.cpp src/PspBulletCollisionGate.hpp
+	python3 tools/test_psp_bullet_collision_gate_audit.py
+
+.PHONY: test-psp-score-popup-native-ge
+test-psp-score-popup-native-ge: tools/test_psp_score_popup_native_ge.py
+	python3 tools/test_psp_score_popup_native_ge.py
+
+.PHONY: test-psp-font-glyph-cache-retain
+test-psp-font-glyph-cache-retain: \
+	tools/test_psp_font_glyph_cache_retain.py \
+	tools/psp_font_glyph_cache_policy_harness.cpp \
+	psp/font_glyph_cache_policy.hpp
+	python3 tools/test_psp_font_glyph_cache_retain.py
 
 -include $(OBJS:.o=.d)

@@ -244,6 +244,38 @@ C_ASSERT(offsetof(BulletTypeSprites, spriteHeightPx) == 0xd41);
 C_ASSERT(offsetof(BulletTypeSprites, drawBucketIndex) == 0xd42);
 C_ASSERT(offsetof(BulletTypeSprites, trailingAlignmentD43) == 0xd43);
 
+#if defined(TH08_PSP_COMPACT_BULLET_VM)
+#if !defined(PSP) || !defined(TH08_PSP_STAGE_POOL_ARENA)
+#error TH08_PSP_COMPACT_BULLET_VM requires the PSP pointer-backed stage pool
+#endif
+
+// A bullet can be in only one of the three spawn states at a time.  Keep the
+// complete five-VM type templates above, but copy only the selected spawn VM
+// into each PSP runtime slot.  The primary VM must remain separate: TH08 ECL
+// instructions can mutate it while the spawn VM is visible.  The despawn VM
+// also remains separate so every existing one-way state transition keeps its
+// original preinitialized animation without transition-time reconstruction.
+struct PspCompactBulletSprites
+{
+    AnmVm bulletVm;
+    AnmVm selectedSpawnVm;
+    AnmVm despawnVm;
+    Float3 collisionSize;
+    u8 unconsumedTemplateByteD40;
+    u8 spriteHeightPx;
+    u8 drawBucketIndex;
+    u8 trailingAlignmentD43;
+};
+C_ASSERT(sizeof(PspCompactBulletSprites) == 0x7fc);
+C_ASSERT(offsetof(PspCompactBulletSprites, selectedSpawnVm) == 0x2a4);
+C_ASSERT(offsetof(PspCompactBulletSprites, despawnVm) == 0x548);
+C_ASSERT(offsetof(PspCompactBulletSprites, collisionSize) == 0x7ec);
+C_ASSERT(offsetof(PspCompactBulletSprites, unconsumedTemplateByteD40) == 0x7f8);
+C_ASSERT(offsetof(PspCompactBulletSprites, spriteHeightPx) == 0x7f9);
+C_ASSERT(offsetof(PspCompactBulletSprites, drawBucketIndex) == 0x7fa);
+C_ASSERT(offsetof(PspCompactBulletSprites, trailingAlignmentD43) == 0x7fb);
+#endif
+
 struct BulletExState
 {
     BulletExState();
@@ -371,6 +403,162 @@ enum BulletState
     BULLET_STATE_SENTINEL = 6,
 };
 
+#if defined(PSP)
+// Interval diagnostics for the all-frame Player cancel-region broad phase.
+// The spatial cache and duplicate-call replay remain external to Bullet/Player
+// and never enter replay or gameplay serialization.
+struct PspBulletCancelSpatialTelemetrySnapshot
+{
+    unsigned long long calls;
+    unsigned long long indexedQueries;
+    unsigned long long rejectedQueries;
+    unsigned long long circles;
+    unsigned long long rects;
+    unsigned long long rebuilds;
+    unsigned long long fullCandidates;
+    unsigned long long indexedCandidates;
+    unsigned long long fallbackCandidates;
+    unsigned long long exactTests;
+    unsigned long long falsePositives;
+    unsigned long long fallbacks;
+    unsigned long long occupancyOwnerFallbacks;
+    unsigned long long unsupportedRegionFallbacks;
+    unsigned long long nonfiniteFallbacks;
+    unsigned long long duplicatePairs;
+    unsigned long long duplicateReplays;
+    unsigned long long duplicateExactTestsSaved;
+    unsigned long long duplicateFallbacks;
+};
+
+PspBulletCancelSpatialTelemetrySnapshot
+PspPeekBulletCancelSpatialTelemetry();
+PspBulletCancelSpatialTelemetrySnapshot
+PspTakeBulletCancelSpatialTelemetry();
+void PspResetBulletCancelSpatialTelemetry();
+
+#if defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+// Fail-closed Bullet runtime-owner proof. Non-Bullet callers (for example
+// Enemy laser graze checks), invalid occupancy, and stale slots retain the
+// canonical full cancel-region scan.
+ZunBool PspBulletCancelSpatialValidatePosition(const Float3 *position);
+void PspBulletCancelSpatialNoteRebuild(u32 circles, u32 rects,
+                                       ZunBool nonfiniteFallback);
+void PspBulletCancelSpatialNoteQuery(u32 fullCandidates,
+                                     u32 selectedCandidates,
+                                     u32 exactTests,
+                                     ZunBool indexed,
+                                     ZunBool rejected,
+                                     ZunBool falsePositive,
+                                     ZunBool fallback,
+                                     ZunBool ownerFallback,
+                                     ZunBool nonfiniteFallback);
+void PspBulletCancelSpatialNoteDuplicate(ZunBool replayed,
+                                         ZunBool fallback);
+#endif
+
+// Interval counters are diagnostic only and live outside every reconstructed
+// gameplay object.  `slotProbes` is the number of individual occupancy/state
+// candidates inspected, `wordProbes` is the number of live-bitset word loads,
+// and `visited` is the number of authoritative non-unused Bullet bodies run.
+struct PspBulletLiveEnumTelemetrySnapshot
+{
+    unsigned long long frames;
+    unsigned long long slotProbes;
+    unsigned long long wordProbes;
+    unsigned long long visited;
+    unsigned long long fallbackFrames;
+};
+
+PspBulletLiveEnumTelemetrySnapshot PspPeekBulletLiveEnumTelemetry();
+PspBulletLiveEnumTelemetrySnapshot PspTakeBulletLiveEnumTelemetry();
+void PspResetBulletLiveEnumTelemetry();
+
+// Counter-only audit of the canonical transform interpreter.  These values
+// are diagnostic state outside Bullet and never participate in simulation,
+// collision, RNG, or replay serialization.
+struct PspBulletTransformAuditTelemetrySnapshot
+{
+    unsigned long long advanceCalls;
+    unsigned long long firedUpdateCalls;
+    unsigned long long terminalIndexReturns;
+    unsigned long long terminalNoneReturns;
+    unsigned long long activeBlockedReturns;
+    unsigned long long disabledRecordsSkipped;
+    unsigned long long recordsDispatched;
+    unsigned long long activeTransformStarts;
+    unsigned long long childSpawnRecords;
+    unsigned long long spawnProgramWrites;
+    unsigned long long wholeSlotResets;
+};
+
+PspBulletTransformAuditTelemetrySnapshot
+PspPeekBulletTransformAuditTelemetry();
+PspBulletTransformAuditTelemetrySnapshot
+PspTakeBulletTransformAuditTelemetry();
+void PspResetBulletTransformAuditTelemetry();
+
+// Product-gated transform-terminal sidecar counters.  The 192-byte bitset
+// itself resides in the retained stage arena; these interval counters are
+// diagnostic-only and never participate in simulation or replay state.
+struct PspBulletTransformTerminalTelemetrySnapshot
+{
+    unsigned long long firedCalls;
+    unsigned long long hits;
+    unsigned long long misses;
+    unsigned long long fallbacks;
+    unsigned long long invariantWitnesses;
+    unsigned long long repairs;
+    unsigned long long terminalIndexMarks;
+    unsigned long long terminalNoneMarks;
+    unsigned long long markFallbacks;
+    unsigned long long spawnProgramClears;
+    unsigned long long wholeSlotClears;
+};
+
+PspBulletTransformTerminalTelemetrySnapshot
+PspPeekBulletTransformTerminalTelemetry();
+PspBulletTransformTerminalTelemetrySnapshot
+PspTakeBulletTransformTerminalTelemetry();
+void PspResetBulletTransformTerminalTelemetry();
+
+// Reserved in every PSP build so a later audit-OFF/product A/B retains the
+// same global layout.  The audit observes the existing canonical collision
+// call exactly once and never permits these counters to affect simulation.
+struct PspBulletCollisionGateAuditTelemetrySnapshot
+{
+    unsigned long long frames;
+    unsigned long long sidecarOwnerInvalidFrames;
+    unsigned long long sidecarClaimsEmptyFrames;
+    unsigned long long authoritativeEmptyFrames;
+    unsigned long long knownEmptyFrames;
+    unsigned long long cancelFalseEmptyWitnesses;
+    unsigned long long cancelStalePositiveFrames;
+    unsigned long long collisionEligibleBullets;
+    unsigned long long grazePathBullets;
+    unsigned long long lethalPathBullets;
+    unsigned long long clearGrazeSuppressed;
+    unsigned long long clearGrazeSeparate;
+    unsigned long long clearLethalSeparate;
+    unsigned long long cancelUnknownFallbacks;
+    unsigned long long invalidSnapshotFallbacks;
+    unsigned long long invalidBulletFallbacks;
+    unsigned long long touchOrOverlapFallbacks;
+    unsigned long long snapshotMutationWitnesses;
+    unsigned long long canonicalZero;
+    unsigned long long canonicalOne;
+    unsigned long long canonicalTwo;
+    unsigned long long falseClearWitnesses;
+    unsigned long long itemTypeWitnesses;
+};
+
+PspBulletCollisionGateAuditTelemetrySnapshot
+PspPeekBulletCollisionGateAuditTelemetry();
+PspBulletCollisionGateAuditTelemetrySnapshot
+PspTakeBulletCollisionGateAuditTelemetry();
+void PspResetBulletCollisionGateAuditTelemetry();
+#endif
+
 struct Bullet
 {
     Bullet();
@@ -387,7 +575,11 @@ struct Bullet
     void UpdateHorizontalWrap();
     ZunResult DrawSingleBullet();
 
+#if defined(TH08_PSP_COMPACT_BULLET_VM)
+    PspCompactBulletSprites sprites;
+#else
     BulletTypeSprites sprites;
+#endif
     Float3 position;
     Float3 velocity;
     Float3 unconsumedVectorD5C;
@@ -418,6 +610,39 @@ struct Bullet
     i8 collisionDisabled;
     u8 trailingAlignment10B5[3];
 };
+#if defined(TH08_PSP_COMPACT_BULLET_VM)
+// Removing two 0x2a4-byte VMs shifts the complete gameplay tail by 0x548.
+C_ASSERT(sizeof(Bullet) == 0xb70);
+C_ASSERT(offsetof(Bullet, position) == 0x7fc);
+C_ASSERT(offsetof(Bullet, velocity) == 0x808);
+C_ASSERT(offsetof(Bullet, unconsumedVectorD5C) == 0x814);
+C_ASSERT(offsetof(Bullet, speed) == 0x820);
+C_ASSERT(offsetof(Bullet, unconsumedDwordsD6C) == 0x824);
+C_ASSERT(offsetof(Bullet, angle) == 0x82c);
+C_ASSERT(offsetof(Bullet, unconsumedDwordsD78) == 0x830);
+C_ASSERT(offsetof(Bullet, stateTimer) == 0x838);
+C_ASSERT(offsetof(Bullet, activeTimer) == 0x844);
+C_ASSERT(offsetof(Bullet, unconsumedDwordsD98) == 0x850);
+C_ASSERT(offsetof(Bullet, offscreenCullDelayFrames) == 0x860);
+C_ASSERT(offsetof(Bullet, activeTransformFlags) == 0x864);
+C_ASSERT(offsetof(Bullet, transformFlags) == 0x868);
+C_ASSERT(offsetof(Bullet, color) == 0x86c);
+C_ASSERT(offsetof(Bullet, unconsumedWordDB6) == 0x86e);
+C_ASSERT(offsetof(Bullet, state) == 0x870);
+C_ASSERT(offsetof(Bullet, offscreenFrames) == 0x872);
+C_ASSERT(offsetof(Bullet, unconsumedSpawnMarkerDBC) == 0x874);
+C_ASSERT(offsetof(Bullet, isGrazed) == 0x875);
+C_ASSERT(offsetof(Bullet, cancelledDuringSpawn) == 0x876);
+C_ASSERT(offsetof(Bullet, pointerAlignmentDBF) == 0x877);
+C_ASSERT(offsetof(Bullet, nextInDrawBucket) == 0x878);
+C_ASSERT(offsetof(Bullet, zoneTransitionCooldownFrames) == 0x87c);
+C_ASSERT(offsetof(Bullet, transformSound) == 0x880);
+C_ASSERT(offsetof(Bullet, transformIndex) == 0x884);
+C_ASSERT(offsetof(Bullet, transforms) == 0x888);
+C_ASSERT(offsetof(Bullet, exStates) == 0xa38);
+C_ASSERT(offsetof(Bullet, collisionDisabled) == 0xb6c);
+C_ASSERT(offsetof(Bullet, trailingAlignment10B5) == 0xb6d);
+#else
 C_ASSERT(sizeof(Bullet) == 0x10b8);
 C_ASSERT(offsetof(Bullet, position) == 0xd44);
 C_ASSERT(offsetof(Bullet, velocity) == 0xd50);
@@ -448,12 +673,18 @@ C_ASSERT(offsetof(Bullet, transforms) == 0xdd0);
 C_ASSERT(offsetof(Bullet, exStates) == 0xf80);
 C_ASSERT(offsetof(Bullet, collisionDisabled) == 0x10b4);
 C_ASSERT(offsetof(Bullet, trailingAlignment10B5) == 0x10b5);
+#endif
 
 struct BulletManager
 {
     BulletTypeSprites bulletTypeSprites[0x20];
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    Bullet *bullets;
+    Laser *lasers;
+#else
     Bullet bullets[0x601];
     Laser lasers[0x100];
+#endif
     i32 activeBulletCount;
     i32 spawnSuppressionFrames;
     ZunTimer timer;
@@ -483,6 +714,14 @@ struct BulletManager
     static ZunResult DeletedCallback(BulletManager *bulletManager);
     static void CutChain();
 };
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+C_ASSERT(sizeof(BulletManager) == 0x1a8c8);
+C_ASSERT(offsetof(BulletManager, bullets) == 0x1a880);
+C_ASSERT(offsetof(BulletManager, lasers) == 0x1a884);
+C_ASSERT(offsetof(BulletManager, activeBulletCount) == 0x1a888);
+C_ASSERT(offsetof(BulletManager, drawBuckets) == 0x1a8a4);
+C_ASSERT(offsetof(BulletManager, bulletAnm) == 0x1a8c4);
+#else
 C_ASSERT(sizeof(BulletManager) == 0x6ba578);
 C_ASSERT(offsetof(BulletManager, bullets) == 0x1a880);
 C_ASSERT(offsetof(BulletManager, lasers) == 0x660938);
@@ -494,6 +733,7 @@ C_ASSERT(offsetof(BulletManager, drawBuckets) == 0x6ba554);
 C_ASSERT(offsetof(BulletManager, bulletCursor) == 0x6ba56c);
 C_ASSERT(offsetof(BulletManager, cancelItemType) == 0x6ba570);
 C_ASSERT(offsetof(BulletManager, bulletAnm) == 0x6ba574);
+#endif
 
 DIFFABLE_EXTERN(BulletManager, g_BulletManager);
 

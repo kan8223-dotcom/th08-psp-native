@@ -1,0 +1,122 @@
+diff --git a/glDrawElements.c b/glDrawElements.c
+index a0695fe..23f2c5d 100644
+--- a/glDrawElements.c
++++ b/glDrawElements.c
+@@ -1,13 +1,25 @@
+ #include <stdint.h>
++#include <string.h>
+ #include <psputils.h>
+ 
+ #include "pspgl_internal.h"
++#include "pspgl_buffers.h"
++#include "pspgl_dlist.h"
++
++const char __pspgl_th08_native_indexed_copy_marker[] =
++	"pspGL TH08 native indexed-quad copy v1 upstream "
++	"de4260adf56d06516ec46018d404ca77e0b61748 base native-submit-v3";
+ 
+ int __pspgl_th08_draw_native_indexed_triangles(
+ 	const void *vertices, unsigned vertex_bytes,
+ 	const unsigned short *indices, unsigned index_bytes,
+ 	unsigned index_count);
+ 
++int __pspgl_th08_draw_native_indexed_quads_copy(
++	const void *vertices, unsigned vertex_bytes,
++	const unsigned short *indices, unsigned index_bytes,
++	unsigned quad_count);
++
+ static int th08_native_range_valid(const void *address, unsigned bytes,
+ 				   unsigned alignment)
+ {
+@@ -69,6 +81,91 @@ int __pspgl_th08_draw_native_indexed_triangles(
+ }
+ 
+ 
++/* TH08-private same-call owned copy for one packed indexed-quad batch.
++ *
++ * The application has already validated the immutable canonical u16 prefix.
++ * Copy both caller ranges into one PSPGL stream buffer before PRIM, then pin
++ * that buffer to the current list.  The caller may immediately reuse both
++ * ranges after a successful return.  A failure emits no primitive and leaves
++ * the application free to execute exactly one public client-array fallback.
++ */
++int __pspgl_th08_draw_native_indexed_quads_copy(
++	const void *vertices, unsigned vertex_bytes,
++	const unsigned short *indices, unsigned index_bytes,
++	unsigned quad_count)
++{
++	const unsigned vertex_stride = 24;
++	const unsigned vertex_format =
++		GE_TEXTURE_32BITF | GE_COLOR_8888 | GE_VERTEX_32BITF |
++		GE_TRANSFORM_3D | GE_VINDEX_16BIT;
++	const unsigned uint_max = ~0u;
++	unsigned vertex_count;
++	unsigned index_count;
++	unsigned expected_vertex_bytes;
++	unsigned expected_index_bytes;
++	unsigned total_bytes;
++	uintptr_t vertex_begin = (uintptr_t)vertices;
++	uintptr_t vertex_end;
++	uintptr_t index_begin = (uintptr_t)indices;
++	uintptr_t index_end;
++	struct pspgl_buffer *buffer;
++	unsigned char *copy;
++
++	/* Validate the whole operation before allocation, mapping, copying, or
++	 * emitting GE state.  Every product is guarded before it is evaluated. */
++	if (pspgl_curctx == NULL || pspgl_curctx->draw == NULL ||
++	    pspgl_curctx->draw->draw == NULL ||
++	    *pspgl_curctx->draw->draw == NULL || __pspgl_actuallist != NULL)
++		return 0;
++	if (quad_count == 0 || quad_count > 0x600u ||
++	    quad_count > uint_max / 4u ||
++	    quad_count > uint_max / (4u * vertex_stride) ||
++	    quad_count > 0xffffu / 6u)
++		return 0;
++
++	vertex_count = quad_count * 4u;
++	index_count = quad_count * 6u;
++	expected_vertex_bytes = vertex_count * vertex_stride;
++	expected_index_bytes = index_count * (unsigned)sizeof(*indices);
++	if (vertices == NULL || vertex_bytes == 0 ||
++	    (vertex_begin & (sizeof(float) - 1u)) != 0 ||
++	    indices == NULL || index_bytes == 0 ||
++	    (index_begin & (sizeof(*indices) - 1u)) != 0)
++		return 0;
++	vertex_end = vertex_begin + (uintptr_t)vertex_bytes;
++	index_end = index_begin + (uintptr_t)index_bytes;
++	if (vertex_end < vertex_begin || index_end < index_begin ||
++	    vertex_bytes != expected_vertex_bytes ||
++	    index_bytes != expected_index_bytes ||
++	    vertex_count > 0x10000u || index_count > 0xffffu)
++		return 0;
++	if (vertex_bytes > uint_max - index_bytes)
++		return 0;
++	total_bytes = vertex_bytes + index_bytes;
++
++	/* One allocation makes ownership atomic: there cannot be a vertex buffer
++	 * without its index prefix.  Complete both copies before the only PRIM. */
++	buffer = __pspgl_buffer_new(total_bytes, GL_STREAM_DRAW_ARB);
++	if (buffer == NULL)
++		return 0;
++	copy = __pspgl_buffer_map(buffer, GL_WRITE_ONLY_ARB);
++	if (copy == NULL) {
++		__pspgl_buffer_free(buffer);
++		return 0;
++	}
++	memcpy(copy, vertices, vertex_bytes);
++	memcpy(copy + vertex_bytes, indices, index_bytes);
++	__pspgl_buffer_unmap(buffer, GL_WRITE_ONLY_ARB);
++
++	__pspgl_context_render_prim(pspgl_curctx, GE_TRIANGLES, index_count,
++				    vertex_format, buffer->base,
++				    (unsigned char *)buffer->base + vertex_bytes);
++	__pspgl_dlist_pin_buffer(buffer, BF_PINNED_RD);
++	__pspgl_buffer_free(buffer);
++	return 1;
++}
++
++
+ void glDrawElements (GLenum mode, GLsizei count, GLenum type, const GLvoid *indices)
+ {
+ 	__pspgl_varray_draw_elts(mode, type, indices, count);

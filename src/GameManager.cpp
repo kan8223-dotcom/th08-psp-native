@@ -1,5 +1,16 @@
 #include "th_pch.h"
 
+#if defined(PSP)
+#if defined(TH08_PSP_ANTITAMPER_SWAR) && TH08_PSP_ANTITAMPER_SWAR
+#include "antitamper_checksum.hpp"
+#endif
+#include "memory_telemetry.hpp"
+#include "modern/linux/d3d8_internal.hpp"
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+#include "stage_pool_arena.hpp"
+#endif
+#endif
+
 #include "GameManager.hpp"
 #include "AnmManager.hpp"
 #include "AsciiManager.hpp"
@@ -12,6 +23,7 @@
 #include "ItemManager.hpp"
 #include "Player.hpp"
 #include "ReplayManager.hpp"
+#include "ReplaySyncAudit.hpp"
 #include "ResultScreen.hpp"
 #include "ScoreDat.hpp"
 #include "ScreenEffect.hpp"
@@ -78,7 +90,11 @@ DIFFABLE_STATIC(ChainElem, g_GameManagerCalcChain);
 DIFFABLE_STATIC(ChainElem, g_GameManagerDrawChain);
 
 i32 InitializeScoreData();
+#if defined(PSP)
+#define g_GuiMessageStageMode g_Background.spellVmScriptBase
+#else
 extern i32 g_GuiMessageStageMode;
+#endif
 
 // FUNCTION: th08 0x439829
 ZunBool GameManager::IsStageClearedWithoutRetries(i32 stage, i32 character, i32 difficulty)
@@ -153,6 +169,48 @@ ZunBool GameManager::IsWithinPlayfield(f32 x, f32 y, f32 width, f32 height)
 
 i32 GameManager::CalcAntiTamperChecksum()
 {
+#if defined(PSP) && defined(TH08_PSP_ANTITAMPER_SWAR) && TH08_PSP_ANTITAMPER_SWAR
+    constexpr std::size_t kGlobalsPrefixBytes =
+        offsetof(ZunGlobals, antiTamperValue) - offsetof(ZunGlobals, rng1);
+    constexpr std::size_t kRng8Bytes = sizeof(g_GameManager.globals->rng8);
+    constexpr std::size_t kGameConfigurationBytes = sizeof(GameConfiguration);
+    constexpr std::size_t kHscrBytes = sizeof(Hscr);
+    constexpr std::size_t kTotalBytes =
+        kGlobalsPrefixBytes + kRng8Bytes + 2U * kGameConfigurationBytes +
+        kHscrBytes;
+    static_assert(kGlobalsPrefixBytes == 128U,
+                  "anti-tamper globals prefix contract changed");
+    static_assert(kRng8Bytes == 20U, "anti-tamper rng8 contract changed");
+    static_assert(kGameConfigurationBytes == 60U,
+                  "anti-tamper configuration contract changed");
+    static_assert(kHscrBytes == 360U, "anti-tamper Hscr contract changed");
+    static_assert(kTotalBytes == 628U,
+                  "anti-tamper checksum byte count changed");
+
+    // The original loop also advances antiTamperValue once per byte. None of
+    // the five summed ranges aliases that field, so read all bytes first and
+    // apply the equivalent uint32_t modulo-2^32 advance exactly once.
+    std::uint32_t sum = psp::AntiTamperSwarByteSum(
+        reinterpret_cast<const std::uint8_t *>(&g_GameManager.globals->rng1),
+        kGlobalsPrefixBytes);
+    sum += psp::AntiTamperSwarByteSum(
+        reinterpret_cast<const std::uint8_t *>(&g_GameManager.globals->rng8),
+        kRng8Bytes);
+    sum += psp::AntiTamperSwarByteSum(
+        reinterpret_cast<const std::uint8_t *>(g_GameManager.cfg),
+        kGameConfigurationBytes);
+    sum += psp::AntiTamperSwarByteSum(
+        reinterpret_cast<const std::uint8_t *>(&g_Supervisor.cfg),
+        kGameConfigurationBytes);
+    sum += psp::AntiTamperSwarByteSum(
+        reinterpret_cast<const std::uint8_t *>(&this->hscr), kHscrBytes);
+
+    g_GameManager.globals->antiTamperValue = psp::AntiTamperAdvanceValue(
+        g_GameManager.globals->antiTamperValue,
+        g_GameManager.globals->rng8[2],
+        static_cast<std::uint32_t>(kTotalBytes));
+    return static_cast<i32>(sum);
+#else
     i32 sum;
 
     // There is zero chance ZUN actually used intptr_t here, but the codegen matches
@@ -165,6 +223,7 @@ i32 GameManager::CalcAntiTamperChecksum()
     sum += CalcChecksum((u8 *)&this->hscr, sizeof(Hscr));
 
     return sum;
+#endif
 }
 
 i32 GameManager::CalcChecksum(u8 *address, i32 size)
@@ -681,6 +740,117 @@ struct SetupPlayCountTable
 };
 C_ASSERT(offsetof(SetupPlayCountTable, counts) == 0x2C);
 
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+namespace
+{
+enum PspStageSetupSubsystem : u32
+{
+    PSP_SETUP_PLAYER = 1U << 0,
+    PSP_SETUP_REPLAY_PLAYBACK = 1U << 1,
+    PSP_SETUP_BACKGROUND = 1U << 2,
+    PSP_SETUP_BULLET = 1U << 3,
+    PSP_SETUP_ENEMY = 1U << 4,
+    PSP_SETUP_EFFECT = 1U << 5,
+    PSP_SETUP_GUI = 1U << 6,
+    PSP_SETUP_SPELLCARD = 1U << 7,
+    PSP_SETUP_REPLAY_RECORDING = 1U << 8,
+};
+
+struct PspStageSetupRollbackState
+{
+    u32 attemptedMask;
+    u32 registeredMask;
+    bool stagePoolBound;
+};
+
+void CutReplayManagerForSetupRollback()
+{
+    if (g_ReplayManager == NULL || g_ReplayManager->calcChain == NULL)
+        return;
+
+    // Cutting the owning calc element invokes DeleteReplayManager, which in
+    // turn cuts playback/frame-sync children and releases prepared or adopted
+    // replay buffers.  Do not call StopRecording here: finalizing an aborted
+    // stage would mutate replay contents on an error-only path.
+    g_Chain.Cut(g_ReplayManager->calcChain);
+}
+
+void RollBackPartialPspStageSetup(PspStageSetupRollbackState *state)
+{
+    if (state == NULL)
+        return;
+
+    th08::psp::MemoryTelemetryMarkPhase("stage_setup_rollback_begin");
+
+    // A failed partial stage cannot safely retain resources for a restart.
+    // Publish the same release policy used by a terminal normal teardown
+    // before any DeletedCallback examines it.
+    g_Supervisor.keepStageResources = FALSE;
+    g_Supervisor.releaseResourcesOnRestart = TRUE;
+
+    // Strict reverse registration order.  Attempted is used rather than only
+    // registered because Chain::AddTo*Chain links the element even when its
+    // added callback reports failure.  Every Cut routine is idempotent for an
+    // unlinked draw companion; no callback is invoked twice.
+    if ((state->attemptedMask & PSP_SETUP_REPLAY_RECORDING) != 0)
+        CutReplayManagerForSetupRollback();
+
+    if ((state->attemptedMask & PSP_SETUP_SPELLCARD) != 0)
+    {
+        if ((state->registeredMask & PSP_SETUP_SPELLCARD) != 0 ||
+            g_SpellcardCalcChain != NULL)
+            Spellcard::CutChain();
+        else
+            // Init can fail after loading only a prefix of the face ANMs and
+            // before publishing the owning chain.  Apply its normal release
+            // callback directly in that one no-chain case.
+            Spellcard::DeletedCallback(&g_Spellcard);
+    }
+
+    if ((state->attemptedMask & PSP_SETUP_GUI) != 0)
+        Gui::CutChain();
+    if ((state->attemptedMask & PSP_SETUP_EFFECT) != 0)
+        EffectManager::CutChain();
+    if ((state->attemptedMask & PSP_SETUP_ENEMY) != 0)
+        EnemyManager::CutChain();
+    if ((state->attemptedMask & PSP_SETUP_BULLET) != 0)
+        BulletManager::CutChain();
+    if ((state->attemptedMask & PSP_SETUP_BACKGROUND) != 0)
+        Background::CutChain();
+
+    if ((state->attemptedMask & PSP_SETUP_REPLAY_PLAYBACK) != 0)
+        CutReplayManagerForSetupRollback();
+    if ((state->attemptedMask & PSP_SETUP_PLAYER) != 0)
+        Player::CutChain();
+
+    state->attemptedMask = 0;
+    state->registeredMask = 0;
+    th08::psp::MemoryTelemetryMarkPhase("stage_setup_rollback_chains_released");
+
+    // Enemy::DeletedCallback is the last rollback consumer that walks the
+    // stage pool.  Only after every owning chain is gone may the managers be
+    // unpublished and the retained stage-pool payload become an idle transient.
+    if (state->stagePoolBound || th08::psp::StagePoolArenaIsBound())
+    {
+        th08::psp::MemoryTelemetryMarkPhase("stage_setup_rollback_pool_release");
+        if (!th08::psp::StagePoolArenaEndStage(true))
+        {
+            g_GameErrorContext.Log(
+                "error: PSP stage setup rollback detected pool guard corruption\n");
+        }
+        state->stagePoolBound = false;
+    }
+
+    if (th08::psp::StagePoolArenaIsBound())
+    {
+        g_GameErrorContext.Log(
+            "error: PSP stage setup rollback left pool arena bound\n");
+    }
+    th08::psp::MemoryTelemetryMarkPhase("stage_setup_rollback_complete");
+}
+} // namespace
+#endif
+
 // FUNCTION: th08 0x43abd7
 #pragma var_order(gameManager, size, replaySeed, i, oldCfg, oldGlobals, newCfg, newGlobals, allocation, stageMode, configMode)
 void __fastcall GameManager::GameplaySetupThread(void *unused)
@@ -696,8 +866,40 @@ void __fastcall GameManager::GameplaySetupThread(void *unused)
     void *allocation;
     i32 stageMode;
     i32 configMode;
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    PspStageSetupRollbackState pspSetupRollback = {};
+#endif
 
     gameManager = &g_GameManager;
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_setup_begin");
+#endif
+#if defined(PSP)
+    if (!g_GameManager.flags.isReplay)
+    {
+        if (ReplayManager::PrepareRecordingStageBuffers() != ZUN_SUCCESS)
+        {
+            th08::psp::MemoryTelemetryMarkPhase("stage_replay_reserve_failed");
+            g_GameErrorContext.Log("error: PSP replay recording reservation failed\n");
+            goto setup_error;
+        }
+        th08::psp::MemoryTelemetryMarkPhase("stage_replay_reserve_ready");
+    }
+#endif
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    // Preserve the proven normal-play allocation order.  Reserving the
+    // original-capacity replay input first lets both allocations coexist;
+    // preparing the stage-pool backing first leaves too little heap for the later
+    // 864,000-byte replay block on the current 64 MiB layout.  Neither
+    // preparation publishes manager pointers or consumes RNG.
+    if (!th08::psp::StagePoolArenaPrepareIdle())
+    {
+        th08::psp::MemoryTelemetryMarkPhase("stage_pool_arena_prepare_failed");
+        g_GameErrorContext.Log("error: PSP stage pool arena preparation failed\n");
+        goto setup_error;
+    }
+    th08::psp::MemoryTelemetryMarkPhase("stage_pool_arena_prepared");
+#endif
     gameManager->gameplaySetupWaitFrames = 0;
     g_Supervisor.systemTime = timeGetTime();
 
@@ -755,13 +957,33 @@ void __fastcall GameManager::GameplaySetupThread(void *unused)
         if (g_GameManager.flags.isPracticeMode)
             gameManager->cfg->lifeCount = 8;
 
+#if defined(PSP)
+        // GameManager's priority-2 setup callback stops the calc chain before
+        // Player priority 9 can update.  Keep the original Player-before-score
+        // order (both paths consume RNG), while pool pointers remain private
+        // until every synchronous score-arena loan has been released.
+        th08::psp::MemoryTelemetryMarkPhase("stage_player_register_begin");
+#endif
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+        pspSetupRollback.attemptedMask |= PSP_SETUP_PLAYER;
+#endif
         if (Player::RegisterChain(0))
         {
+#if defined(PSP)
+            th08::psp::MemoryTelemetryMarkPhase("stage_player_register_failed");
+#endif
             if (g_Supervisor.subthreadCloseRequestActive)
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+                goto setup_cancelled;
+#else
                 goto thread_done;
+#endif
             g_GameErrorContext.Log("error: player initialization failed\n");
             goto setup_error;
         }
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+        pspSetupRollback.registeredMask |= PSP_SETUP_PLAYER;
+#endif
 
         if (!g_GameManager.flags.isReplay)
         {
@@ -860,15 +1082,46 @@ void __fastcall GameManager::GameplaySetupThread(void *unused)
         gameManager->UpdateAntiTamper();
         gameManager->globals->bombsUsedInStage = 0.0f;
         gameManager->UpdateAntiTamper();
+#if defined(PSP)
+        th08::psp::MemoryTelemetryMarkPhase("stage_player_register_begin");
+#endif
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+        pspSetupRollback.attemptedMask |= PSP_SETUP_PLAYER;
+#endif
         if (Player::RegisterChain(0))
         {
+#if defined(PSP)
+            th08::psp::MemoryTelemetryMarkPhase("stage_player_register_failed");
+#endif
             if (g_Supervisor.subthreadCloseRequestActive)
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+                goto setup_cancelled;
+#else
                 goto thread_done;
+#endif
             g_GameErrorContext.Log("error: player initialization failed\n");
             goto setup_error;
         }
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+        pspSetupRollback.registeredMask |= PSP_SETUP_PLAYER;
+#endif
     }
 
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    // Every setup-only borrower has completed and released its exact loan.
+    // Reconstruct all original-capacity pools, then publish their fixed bases.
+    if (!th08::psp::StagePoolArenaBeginStage())
+    {
+        th08::psp::MemoryTelemetryMarkPhase("stage_pool_arena_bind_failed");
+        g_GameErrorContext.Log("error: PSP stage pool arena bind failed\n");
+        goto setup_error;
+    }
+    pspSetupRollback.stagePoolBound = true;
+    th08::psp::MemoryTelemetryMarkPhase("stage_pool_arena_ready");
+#endif
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_player_ready");
+#endif
     gameManager->subRank = 0;
     gameManager->globals->pointItemsCollectedInStage = 0;
     gameManager->globals->grazeInStage = 0;
@@ -929,58 +1182,171 @@ void __fastcall GameManager::GameplaySetupThread(void *unused)
     if (g_GameManager.flags.isReplay)
     {
         gameManager->InitRankParams();
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+        pspSetupRollback.attemptedMask |= PSP_SETUP_REPLAY_PLAYBACK;
+        if (ReplayManager::RegisterChain(1, g_GameManager.replayFilename) != ZUN_SUCCESS)
+        {
+            th08::psp::MemoryTelemetryMarkPhase("stage_replay_playback_register_failed");
+            if (g_Supervisor.subthreadCloseRequestActive)
+                goto setup_cancelled;
+            g_GameErrorContext.Log("error: replay playback initialization failed\n");
+            goto setup_error;
+        }
+        pspSetupRollback.registeredMask |= PSP_SETUP_REPLAY_PLAYBACK;
+#else
         ReplayManager::RegisterChain(1, g_GameManager.replayFilename);
+#endif
         replaySeed = *reinterpret_cast<u16 *>(&g_Rng);
         gameManager->UpdateAntiTamper();
         *reinterpret_cast<u16 *>(&g_Rng) = replaySeed;
     }
     gameManager->stageRngSeed = *reinterpret_cast<u16 *>(&g_Rng);
 
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.attemptedMask |= PSP_SETUP_BACKGROUND;
+#endif
     if (Background::RegisterChain(gameManager->currentStage))
     {
         if (g_Supervisor.subthreadCloseRequestActive)
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+            goto setup_cancelled;
+#else
             goto thread_done;
+#endif
         g_GameErrorContext.Log("error: background initialization failed\n");
         goto setup_error;
     }
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.registeredMask |= PSP_SETUP_BACKGROUND;
+#endif
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_background_ready");
+#endif
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.attemptedMask |= PSP_SETUP_BULLET;
+#endif
     if (BulletManager::RegisterChain(const_cast<char *>("etama.anm")))
     {
         if (g_Supervisor.subthreadCloseRequestActive)
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+            goto setup_cancelled;
+#else
             goto thread_done;
+#endif
         g_GameErrorContext.Log("error: bullet initialization failed\n");
         goto setup_error;
     }
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.registeredMask |= PSP_SETUP_BULLET;
+#endif
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_bullet_ready");
+#endif
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.attemptedMask |= PSP_SETUP_ENEMY;
+#endif
     if (EnemyManager::RegisterChain())
     {
         if (g_Supervisor.subthreadCloseRequestActive)
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+            goto setup_cancelled;
+#else
             goto thread_done;
+#endif
         g_GameErrorContext.Log("error: enemy initialization failed\n");
         goto setup_error;
     }
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.registeredMask |= PSP_SETUP_ENEMY;
+#endif
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_enemy_ready");
+#endif
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.attemptedMask |= PSP_SETUP_EFFECT;
+#endif
     if (EffectManager::RegisterChain())
     {
         if (g_Supervisor.subthreadCloseRequestActive)
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+            goto setup_cancelled;
+#else
             goto thread_done;
+#endif
         g_GameErrorContext.Log("error: effect initialization failed\n");
         goto setup_error;
     }
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.registeredMask |= PSP_SETUP_EFFECT;
+#endif
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_effect_ready");
+#endif
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.attemptedMask |= PSP_SETUP_GUI;
+#endif
     if (Gui::RegisterChain())
     {
         if (g_Supervisor.subthreadCloseRequestActive)
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+            goto setup_cancelled;
+#else
             goto thread_done;
+#endif
         g_GameErrorContext.Log("error: 2D initialization failed\n");
         goto setup_error;
     }
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.registeredMask |= PSP_SETUP_GUI;
+#endif
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_gui_ready");
+#endif
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.attemptedMask |= PSP_SETUP_SPELLCARD;
+#endif
     if (Spellcard::RegisterChain())
     {
         if (g_Supervisor.subthreadCloseRequestActive)
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+            goto setup_cancelled;
+#else
             goto thread_done;
+#endif
         g_GameErrorContext.Log("error: spell card initialization failed\n");
         goto setup_error;
     }
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    pspSetupRollback.registeredMask |= PSP_SETUP_SPELLCARD;
+#endif
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_spell_ready");
+#endif
 
     if (!g_GameManager.flags.isReplay)
-        ReplayManager::RegisterChain(0, "replay/th8_00.rpy");
+    {
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+        pspSetupRollback.attemptedMask |= PSP_SETUP_REPLAY_RECORDING;
+#endif
+        if (ReplayManager::RegisterChain(0, "replay/th8_00.rpy") != ZUN_SUCCESS)
+        {
+#if defined(PSP)
+            th08::psp::MemoryTelemetryMarkPhase("stage_replay_register_failed");
+#endif
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+            if (g_Supervisor.subthreadCloseRequestActive)
+                goto setup_cancelled;
+#endif
+            g_GameErrorContext.Log("error: replay initialization failed\n");
+            goto setup_error;
+        }
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+        pspSetupRollback.registeredMask |= PSP_SETUP_REPLAY_RECORDING;
+#endif
+#if defined(PSP)
+        th08::psp::MemoryTelemetryMarkPhase("stage_replay_ready");
+#endif
+    }
 
     if (g_GameManager.flags.isSpellPractice)
     {
@@ -1029,6 +1395,9 @@ void __fastcall GameManager::GameplaySetupThread(void *unused)
                 g_Supervisor.LoadMusic(2, g_Background.stageData->songPaths[2]);
         }
     }
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_audio_ready");
+#endif
 
     gameManager->showRetryMenu = 0;
     GM_FLAGS_WORD(gameManager) |= 4U;
@@ -1068,26 +1437,60 @@ void __fastcall GameManager::GameplaySetupThread(void *unused)
     while (gameManager->flags.stageTransitionState != 0)
         Sleep(17);
 
-    g_GameManager.gameplaySetupState = GAMEPLAY_SETUP_COMPLETE;
-    g_Supervisor.runningSubthreadHandle = NULL;
     g_Supervisor.subthreadCloseRequestActive = FALSE;
     g_Supervisor.subthreadActive = FALSE;
     g_Supervisor.screenTransitionCountdown = 60;
     GM_FLAGS_WORD(gameManager) &= ~0x200U;
     g_Supervisor.keepStageResources = 0;
     g_ScreenEffectCounter = 2;
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_setup_complete");
+#endif
+#if defined(TH08_REPLAY_SYNC_AUDIT)
+    ReplaySyncAudit::StageBegin();
+#endif
+    g_GameManager.gameplaySetupState = GAMEPLAY_SETUP_COMPLETE;
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    __sync_synchronize();
+#endif
+    g_Supervisor.runningSubthreadHandle = NULL;
     goto thread_done;
 
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+setup_cancelled:
+    // ThreadClose waits for this worker to return, so release every partial
+    // owner here while this is still the sole setup writer. Leaving the arena
+    // bound for the outer Chain::Release would let intervening score/result
+    // allocations hit the fragmented heap instead of idle transient storage.
+    ReplayManager::ReleasePreparedRecordingStageBuffers();
+    RollBackPartialPspStageSetup(&pspSetupRollback);
+    th08::psp::MemoryTelemetryMarkPhase("stage_setup_cancelled_rolled_back");
+    goto thread_done;
+#endif
+
 setup_error:
+#if defined(PSP)
+    ReplayManager::ReleasePreparedRecordingStageBuffers();
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    RollBackPartialPspStageSetup(&pspSetupRollback);
+#endif
+    th08::psp::MemoryTelemetryMarkPhase("stage_setup_failed");
+#endif
     g_GameManager.gameplaySetupState = GAMEPLAY_SETUP_FAILED;
     g_Supervisor.BeginLoadingCompletion();
-    g_Supervisor.runningSubthreadHandle = NULL;
     g_Supervisor.subthreadCloseRequestActive = FALSE;
     g_Supervisor.subthreadActive = FALSE;
     g_Supervisor.keepStageResources = 0;
     g_ScreenEffectCounter = 2;
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    __sync_synchronize();
+#endif
+    g_Supervisor.runningSubthreadHandle = NULL;
 
 thread_done:
+#if defined(PSP)
+    ReplayManager::ReleasePreparedRecordingStageBuffers();
+#endif
     (void)unused;
 }
 
@@ -1217,6 +1620,12 @@ void __fastcall IncrementTruncate(u32 *value, i32 unused)
 // FUNCTION: th08 0x43be2c
 ZunResult GameManager::DeletedCallback(GameManager *gameManager)
 {
+#if defined(TH08_REPLAY_SYNC_AUDIT)
+    ReplaySyncAudit::StageTerminal();
+#endif
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_teardown_begin");
+#endif
     g_ScreenEffectCounter = 1;
     g_AsciiManager.nightBlindnessAlpha = 0;
 
@@ -1254,10 +1663,25 @@ ZunResult GameManager::DeletedCallback(GameManager *gameManager)
     EnemyManager::CutChain();
     EffectManager::CutChain();
     Gui::CutChain();
+#if defined(PSP)
+    // Every producer of the Item vertex stream is now detached. Return its
+    // presentation-only workspace before any following stage begins loading;
+    // this never mutates Item state and therefore cannot affect replay input.
+    if (!th08_psp_item_direct_ge_release_stage(g_Supervisor.d3dDevice))
+    {
+        g_GameErrorContext.Log(
+            "error: PSP Item direct-GE stage arena release failed\n");
+    }
+    th08::psp::MemoryTelemetryMarkPhase("item_direct_ge_stage_release");
+#endif
 
     if (!g_GameManager.flags.isReplay)
     {
         ReplayManager::StopRecording();
+#if defined(PSP)
+        ReplayManager::CompactRecordedStage(g_GameManager.stageAtStart);
+        th08::psp::MemoryTelemetryMarkPhase("stage_replay_compacted");
+#endif
     }
     if (!g_GameManager.flags.isReplay)
     {
@@ -1269,6 +1693,34 @@ ZunResult GameManager::DeletedCallback(GameManager *gameManager)
     g_AsciiManager.Reset();
     g_GameManager.skipCurrentFrame = FALSE;
     g_GameManager.gameplayFrameCounter = 0;
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+    if (th08::psp::StagePoolArenaIsBound())
+    {
+        th08::psp::MemoryTelemetryMarkPhase("stage_pool_arena_before_release");
+        // PSP dedicated lifetime: keep the one proven-contiguous pool allocation
+        // across every frontend/stage boundary. Managers are unbound and reset at
+        // teardown, but the backing cannot be fragmented before the next stage.
+        const bool retainStagePoolBacking = true;
+        if (!th08::psp::StagePoolArenaEndStage(retainStagePoolBacking))
+            g_GameErrorContext.Log("error: PSP stage pool arena guard corruption detected\n");
+    }
+    else
+    {
+        // A setup-error rollback has already cut every partial owner and
+        // unpublished the pools. Do not run EndStage a second time; retain an
+        // explicit guard check so the later GameManager callback cannot hide
+        // corruption detected on the error path.
+        if (!th08::psp::StagePoolArenaGuardsIntact())
+            g_GameErrorContext.Log("error: PSP idle stage pool arena guard corruption detected\n");
+        th08::psp::MemoryTelemetryMarkPhase("stage_pool_arena_already_idle");
+    }
+#endif
+#if defined(PSP)
+    th08::psp::MemoryTelemetryMarkPhase("stage_teardown_complete");
+#endif
+#if defined(TH08_REPLAY_SYNC_AUDIT) && defined(PSP)
+    ReplaySyncAudit::CheckpointAfterStage();
+#endif
     return ZUN_SUCCESS;
 }
 

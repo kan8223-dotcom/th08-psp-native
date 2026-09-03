@@ -581,15 +581,24 @@ enter_subroutine:
     {
         lhsInt = TH08_ECL_READ_I(ctx, 0);
         if (TH08_ECL_CONTEXT_ENEMY(ctx)->childEclBlocks[lhsInt])
+#if defined(PSP)
+            psp::EnemyChildEclFree(
+                TH08_ECL_CONTEXT_ENEMY(ctx)->childEclBlocks[lhsInt]);
+#else
             g_ZunMemory.Free(
                 TH08_ECL_CONTEXT_ENEMY(ctx)->childEclBlocks[lhsInt]);
+#endif
         TH08_ECL_CONTEXT_ENEMY(ctx)->childEclBlocks[lhsInt] = 0;
 
         if (TH08_ECL_READ_I(ctx, 1) >= 0)
         {
             TH08_ECL_CONTEXT_ENEMY(ctx)->childEclBlocks[lhsInt] =
                 static_cast<EnemyChildEclBlock *>(
+#if defined(PSP)
+                    psp::EnemyChildEclAllocate());
+#else
                     g_ZunMemory.Alloc(sizeof(EnemyChildEclBlock), "ECLInt"));
+#endif
             if (TH08_ECL_CONTEXT_ENEMY(ctx)->childEclBlocks[lhsInt])
             {
                 memset(
@@ -843,7 +852,11 @@ enter_subroutine:
         if (TH08_ECL_CONTEXT_ENEMY(ctx)->trailFlags & ENEMY_TRAIL_RENDER_AS_STRIP)
             g_AnmManager->InitializeHorizontalTextureStrip(
                 &TH08_ECL_CONTEXT_ENEMY(ctx)->vm,
+#if defined(TH08_PSP_STAGE_POOL_ARENA)
+                g_EnemyManager.sharedTrailVertices,
+#else
                 TH08_ECL_CONTEXT_ENEMY(ctx)->trailVertices,
+#endif
                 (TH08_ECL_CONTEXT_ENEMY(ctx)->trailHistoryLength /
                  TH08_ECL_CONTEXT_ENEMY(ctx)->trailSampleStride) << 1);
         break;
@@ -866,6 +879,36 @@ enter_subroutine:
             ((TH08_ECL_CONTEXT_INSTRUCTION(ctx)->operandFlags & (1U << 0)) ? TH08_ECL_CONTEXT_ENEMY(ctx)->ResolveFloat(*reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 0))) : *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 0)));
         break;
     case 166:
+#ifdef TH08_MODERN_PORT
+    {
+        const f32 sinAngle =
+            ((TH08_ECL_CONTEXT_INSTRUCTION(ctx)->operandFlags & (1U << 2))
+                 ? TH08_ECL_CONTEXT_ENEMY(ctx)->ResolveFloat(
+                       *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 2)))
+                 : *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 2)));
+        const f32 sinMagnitude =
+            ((TH08_ECL_CONTEXT_INSTRUCTION(ctx)->operandFlags & (1U << 3))
+                 ? TH08_ECL_CONTEXT_ENEMY(ctx)->ResolveFloat(
+                       *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 3)))
+                 : *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 3)));
+        *TH08_ECL_WRITE_F(ctx, 1) =
+            X87CompatibleSinMul(sinAngle, sinMagnitude);
+
+        const f32 cosAngle =
+            ((TH08_ECL_CONTEXT_INSTRUCTION(ctx)->operandFlags & (1U << 2))
+                 ? TH08_ECL_CONTEXT_ENEMY(ctx)->ResolveFloat(
+                       *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 2)))
+                 : *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 2)));
+        const f32 cosMagnitude =
+            ((TH08_ECL_CONTEXT_INSTRUCTION(ctx)->operandFlags & (1U << 3))
+                 ? TH08_ECL_CONTEXT_ENEMY(ctx)->ResolveFloat(
+                       *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 3)))
+                 : *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 3)));
+        *TH08_ECL_WRITE_F(ctx, 0) =
+            X87CompatibleCosMul(cosAngle, cosMagnitude);
+        break;
+    }
+#else
         *TH08_ECL_WRITE_F(ctx, 1) =
             sinf(((TH08_ECL_CONTEXT_INSTRUCTION(ctx)->operandFlags & (1U << 2)) ? TH08_ECL_CONTEXT_ENEMY(ctx)->ResolveFloat(*reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 2))) : *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 2)))) * ((TH08_ECL_CONTEXT_INSTRUCTION(ctx)->operandFlags & (1U << 3))
             ? TH08_ECL_CONTEXT_ENEMY(ctx)->ResolveFloat(*reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 3)))
@@ -879,6 +922,7 @@ enter_subroutine:
                        *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 3)))
                  : *reinterpret_cast<f32 *>(&TH08_ECL_RAW_I(ctx, 3)));
         break;
+#endif
     case 169:
         if (
             reinterpret_cast<Float3 *>(&g_Player.position)->x <

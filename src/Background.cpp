@@ -9,6 +9,12 @@
 #include "Player.hpp"
 #include "Supervisor.hpp"
 
+#if defined(PSP)
+#include "draw_priority_subprofile.hpp"
+#include "render_perf_telemetry.hpp"
+#include <stdio.h>
+#endif
+
 namespace th08
 {
 ZunBool IsDisableResourceReload();
@@ -55,6 +61,172 @@ struct RawStageInstr
     i32 args[3];
 };
 C_ASSERT(sizeof(RawStageInstr) == 0x14);
+
+#if defined(PSP)
+namespace
+{
+// Background is retail-ABI constrained to 0x6600 bytes, so the PSP-only
+// render caches live beside it.  STD instances and object dimensions are
+// immutable after LoadStageData.  Buckets copy instances in source order and
+// retain a negative-id sentinel, making the optimized RenderObjects loop
+// byte-for-byte equivalent at its inputs.  Any validation/allocation failure
+// leaves the original four full-stream scans active.
+struct PspBackgroundRenderCache
+{
+    Background *owner;
+    RawStageHeader *stageData;
+    void *storage;
+    RawStageObjectInstance *instancesByZ[4];
+    i32 instanceCounts[4];
+    f32 *objectCullRadii;
+    i32 objectCount;
+    bool ready;
+};
+
+PspBackgroundRenderCache g_PspBackgroundRenderCache{};
+
+void ReleasePspBackgroundRenderCache()
+{
+    if (g_PspBackgroundRenderCache.storage != NULL)
+        g_ZunMemory.Free(g_PspBackgroundRenderCache.storage);
+    g_PspBackgroundRenderCache = PspBackgroundRenderCache{};
+}
+
+bool BuildPspBackgroundRenderCache(Background *background)
+{
+    ReleasePspBackgroundRenderCache();
+    if (background == NULL || background->stageData == NULL ||
+        background->stageObjects == NULL ||
+        background->stageObjectInstances == NULL ||
+        background->stageObjectCount <= 0)
+        return false;
+
+    i32 bucketCounts[4] = {};
+    u32 totalInstances = 0;
+    for (RawStageObjectInstance *instance = background->stageObjectInstances;
+         instance->id >= 0; ++instance)
+    {
+        if (instance->id >= background->stageObjectCount ||
+            totalInstances == 0x7fffffffu)
+        {
+            fprintf(stderr,
+                    "TH08PSP BG_CACHE ready=0 reason=invalid_instance id=%ld count=%ld\n",
+                    static_cast<long>(instance->id),
+                    static_cast<long>(background->stageObjectCount));
+            return false;
+        }
+        const i32 z = background->stageObjects[instance->id]->zLevel;
+        if (z >= 0 && z < 4)
+        {
+            ++bucketCounts[z];
+            ++totalInstances;
+        }
+    }
+
+    const size_t radiusBytes =
+        static_cast<size_t>(background->stageObjectCount) * sizeof(f32);
+    const size_t instanceBytes =
+        static_cast<size_t>(totalInstances + 4U) *
+        sizeof(RawStageObjectInstance);
+    if (instanceBytes > 0xffffffffu ||
+        radiusBytes > 0xffffffffu - instanceBytes)
+        return false;
+
+    void *storage = g_ZunMemory.Alloc(
+        static_cast<u32>(radiusBytes + instanceBytes),
+        "PSP background render cache");
+    if (storage == NULL)
+    {
+        fprintf(stderr,
+                "TH08PSP BG_CACHE ready=0 reason=allocation bytes=%lu\n",
+                static_cast<unsigned long>(radiusBytes + instanceBytes));
+        return false;
+    }
+
+    PspBackgroundRenderCache cache{};
+    cache.owner = background;
+    cache.stageData = background->stageData;
+    cache.storage = storage;
+    cache.objectCullRadii = static_cast<f32 *>(storage);
+    cache.objectCount = background->stageObjectCount;
+    RawStageObjectInstance *instanceStorage =
+        reinterpret_cast<RawStageObjectInstance *>(
+            static_cast<u8 *>(storage) + radiusBytes);
+
+    for (i32 objectIndex = 0; objectIndex < background->stageObjectCount;
+         ++objectIndex)
+    {
+        cache.objectCullRadii[objectIndex] =
+            D3DXVec3Length(reinterpret_cast<D3DXVECTOR3 *>(
+                &background->stageObjects[objectIndex]->size)) /
+                2.0f +
+            960.0f;
+    }
+
+    for (i32 z = 0; z < 4; ++z)
+    {
+        cache.instancesByZ[z] = instanceStorage;
+        cache.instanceCounts[z] = 0;
+        instanceStorage += static_cast<size_t>(bucketCounts[z]) + 1U;
+    }
+    for (RawStageObjectInstance *instance = background->stageObjectInstances;
+         instance->id >= 0; ++instance)
+    {
+        const i32 z = background->stageObjects[instance->id]->zLevel;
+        if (z >= 0 && z < 4)
+        {
+            cache.instancesByZ[z][cache.instanceCounts[z]++] = *instance;
+        }
+    }
+    for (i32 z = 0; z < 4; ++z)
+    {
+        RawStageObjectInstance &sentinel =
+            cache.instancesByZ[z][cache.instanceCounts[z]];
+        memset(&sentinel, 0, sizeof(sentinel));
+        sentinel.id = -1;
+    }
+    cache.ready = true;
+    g_PspBackgroundRenderCache = cache;
+    fprintf(stderr,
+            "TH08PSP BG_CACHE ready=1 bytes=%lu objects=%ld instances=%lu buckets=%ld/%ld/%ld/%ld\n",
+            static_cast<unsigned long>(radiusBytes + instanceBytes),
+            static_cast<long>(background->stageObjectCount),
+            static_cast<unsigned long>(totalInstances),
+            static_cast<long>(cache.instanceCounts[0]),
+            static_cast<long>(cache.instanceCounts[1]),
+            static_cast<long>(cache.instanceCounts[2]),
+            static_cast<long>(cache.instanceCounts[3]));
+    return true;
+}
+
+bool PspBackgroundCacheMatches(const Background *background)
+{
+    return g_PspBackgroundRenderCache.ready &&
+           g_PspBackgroundRenderCache.owner == background &&
+           g_PspBackgroundRenderCache.stageData == background->stageData &&
+           g_PspBackgroundRenderCache.objectCount ==
+               background->stageObjectCount;
+}
+
+RawStageObjectInstance *PspBackgroundInstancesForMode(
+    Background *background, i32 mode)
+{
+    if (!PspBackgroundCacheMatches(background) || mode < 0 || mode >= 4)
+        return background->stageObjectInstances;
+    return g_PspBackgroundRenderCache.instancesByZ[mode];
+}
+
+bool PspBackgroundCachedRadius(const Background *background, i32 objectIndex,
+                               f32 *outRadius)
+{
+    if (!PspBackgroundCacheMatches(background) || outRadius == NULL ||
+        objectIndex < 0 || objectIndex >= g_PspBackgroundRenderCache.objectCount)
+        return false;
+    *outRadius = g_PspBackgroundRenderCache.objectCullRadii[objectIndex];
+    return true;
+}
+} // namespace
+#endif
 
 struct BackgroundAnmVmSnapshot
 {
@@ -812,7 +984,20 @@ ChainCallbackResult Background::OnDrawLowPrio(Background *background)
         {
             g_Supervisor.DisableFog();
         }
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+        std::uint64_t drawPriorityEffectBackgroundStartUs;
+        const bool drawPriorityEffectBackgroundSampleActive =
+            psp::DrawPrioritySubprofileBeginEffectBackground(
+                drawPriorityEffectBackgroundStartUs);
+#endif
         g_EffectManager.DrawBackgroundEffects();
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+        if (drawPriorityEffectBackgroundSampleActive)
+        {
+            psp::DrawPrioritySubprofileEndEffectBackground(
+                drawPriorityEffectBackgroundStartUs);
+        }
+#endif
         if (background->spellBackgroundState == SPELL_BACKGROUND_FADING_IN)
         {
             rect.left = 32.0f;
@@ -947,6 +1132,10 @@ ZunResult Background::RegisterChain(i32 stageIndex)
     Background *background = &g_Background;
     RawStageHeader *stageData;
 
+#if defined(PSP)
+    ReleasePspBackgroundRenderCache();
+#endif
+
     if (IsDisableResourceReload())
     {
         stageData = background->stageData;
@@ -983,6 +1172,9 @@ ZunResult Background::RegisterChain(i32 stageIndex)
 // FUNCTION: th08 0x409c20
 ZunResult Background::DeletedCallback(Background *background)
 {
+#if defined(PSP)
+    ReleasePspBackgroundRenderCache();
+#endif
     if (!IsDisableResourceReload())
     {
         g_AnmManager->ReleaseAnm(4);
@@ -1099,6 +1291,9 @@ ZunResult Background::LoadStageData(const char *path)
     this->stageTextVm.SetInterrupt(2);
     this->stageTextUsesYoukaiMode = 0;
     this->stageTextTimer = 0;
+#if defined(PSP)
+    BuildPspBackgroundRenderCache(this);
+#endif
     return ZUN_SUCCESS;
 }
 
@@ -1195,7 +1390,11 @@ ZunResult Background::RenderObjects(i32 mode)
     f32 quadWidth;
     ZunColor originalColor;
 
+#if defined(PSP)
+    instance = PspBackgroundInstancesForMode(this, mode);
+#else
     instance = this->stageObjectInstances;
+#endif
     instancesDrawn = 0;
     didDraw = 0;
 
@@ -1216,9 +1415,15 @@ ZunResult Background::RenderObjects(i32 mode)
 
     while (instance->id >= 0)
     {
+#if defined(PSP)
+        th08::psp::RenderPerfNoteBackgroundInstanceVisit();
+#endif
         obj = this->stageObjects[instance->id];
         if (obj->zLevel == mode)
         {
+#if defined(PSP)
+            th08::psp::RenderPerfNoteBackgroundCandidate();
+#endif
             curQuad = &obj->firstQuad;
 
             quadPos.x = obj->position.x + instance->position.x - this->stagePosition.x + obj->size.x / 2.0f;
@@ -1234,7 +1439,18 @@ ZunResult Background::RenderObjects(i32 mode)
 
             objectDistance = D3DXVec3Dot(reinterpret_cast<D3DXVECTOR3 *>(&quadPos),
                                          reinterpret_cast<D3DXVECTOR3 *>(&this->cameraCurrent.forward));
-            radius = D3DXVec3Length(reinterpret_cast<D3DXVECTOR3 *>(&obj->size)) / 2.0f + 960.0f;
+#if defined(PSP)
+            if (PspBackgroundCachedRadius(this, instance->id, &radius))
+            {
+                th08::psp::RenderPerfNoteBackgroundRadiusCacheHit();
+            }
+            else
+#endif
+            {
+                radius = D3DXVec3Length(reinterpret_cast<D3DXVECTOR3 *>(&obj->size)) /
+                             2.0f +
+                         960.0f;
+            }
             if ((objectDistance > radius) || (objectDistance < 80.0f))
             {
                 goto skip;
@@ -1268,6 +1484,9 @@ ZunResult Background::RenderObjects(i32 mode)
                                 worldMatrix._41 = curQuadVm->pos[0];
                                 worldMatrix._42 = curQuadVm->pos[1];
                                 worldMatrix._43 = curQuadVm->pos[2];
+#if defined(PSP)
+                                th08::psp::RenderPerfNoteBackgroundProject();
+#endif
                                 D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&quadPos),
                                                 reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                                 &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
@@ -1284,6 +1503,9 @@ ZunResult Background::RenderObjects(i32 mode)
                                 worldMatrix._41 = cameraVec.x * quadWidth * curQuadVm->scale.x + worldMatrix._41;
                                 worldMatrix._42 = cameraVec.y * quadWidth * curQuadVm->scale.x + worldMatrix._42;
                                 worldMatrix._43 = cameraVec.z * quadWidth * curQuadVm->scale.x + worldMatrix._43;
+#if defined(PSP)
+                                th08::psp::RenderPerfNoteBackgroundProject();
+#endif
                                 D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectDest),
                                                 reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                                 &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
@@ -1380,6 +1602,9 @@ ZunResult Background::RenderObjects(i32 mode)
                             worldMatrix._41 = type1World.x;
                             worldMatrix._42 = type1World.y;
                             worldMatrix._43 = type1World.z;
+#if defined(PSP)
+                            th08::psp::RenderPerfNoteBackgroundProject();
+#endif
                             D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&quadPos),
                                             reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                             &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
@@ -1395,6 +1620,9 @@ ZunResult Background::RenderObjects(i32 mode)
                             worldMatrix._41 = cameraVec.x * type1Width + worldMatrix._41;
                             worldMatrix._42 = cameraVec.y * type1Width + worldMatrix._42;
                             worldMatrix._43 = cameraVec.z * type1Width + worldMatrix._43;
+#if defined(PSP)
+                            th08::psp::RenderPerfNoteBackgroundProject();
+#endif
                             D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectDest),
                                             reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                             &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
@@ -1446,6 +1674,9 @@ ZunResult Background::RenderObjects(i32 mode)
                             worldMatrix._41 = type1World.x;
                             worldMatrix._42 = type1World.y;
                             worldMatrix._43 = type1World.z;
+#if defined(PSP)
+                            th08::psp::RenderPerfNoteBackgroundProject();
+#endif
                             D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectedSecond),
                                             reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                             &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
@@ -1461,6 +1692,9 @@ ZunResult Background::RenderObjects(i32 mode)
                             worldMatrix._41 = cameraVec.x * type1Width + worldMatrix._41;
                             worldMatrix._42 = cameraVec.y * type1Width + worldMatrix._42;
                             worldMatrix._43 = cameraVec.z * type1Width + worldMatrix._43;
+#if defined(PSP)
+                            th08::psp::RenderPerfNoteBackgroundProject();
+#endif
                             D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectDest),
                                             reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                             &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
@@ -1567,6 +1801,9 @@ ZunResult Background::RenderObjects(i32 mode)
                                                                        curQuad->byteSize);
             }
             instancesDrawn++;
+#if defined(PSP)
+            th08::psp::RenderPerfNoteBackgroundDrawn();
+#endif
         }
     skip:
         instance++;

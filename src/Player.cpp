@@ -16,6 +16,24 @@
 #include "ScreenEffect.hpp"
 #include "utils.hpp"
 
+#if defined(PSP)
+#include "PspBulletCancelSpatial.hpp"
+#include "perf_attribution.hpp"
+#endif
+
+#if defined(PSP) && defined(TH08_PSP_BULLET_COLLISION_GATE_AUDIT) && \
+    TH08_PSP_BULLET_COLLISION_GATE_AUDIT && \
+    (!defined(TH08_PSP_PLAYER_SCAN_SIDECAR) || \
+     !TH08_PSP_PLAYER_SCAN_SIDECAR)
+#error TH08_PSP_BULLET_COLLISION_GATE_AUDIT requires TH08_PSP_PLAYER_SCAN_SIDECAR
+#endif
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL && \
+    (!defined(TH08_PSP_PLAYER_SCAN_SIDECAR) || \
+     !TH08_PSP_PLAYER_SCAN_SIDECAR)
+#error TH08_PSP_BULLET_CANCEL_SPATIAL requires TH08_PSP_PLAYER_SCAN_SIDECAR
+#endif
+
 namespace th08
 {
 
@@ -23,9 +41,20 @@ namespace th08
 // far before the main Player implementation that begins at 0x00449CA0. Its
 // production definitions live in PlayerBomb.cpp.
 DIFFABLE_STATIC(Player, g_Player);
+#if defined(PSP) || defined(TH08_PORTABLE_NATIVE_LAYOUT)
+// These retail globals are exported names for fields inside g_GameManager.
+// Normal portable/PSP links do not reproduce the original fixed-address
+// overlap; direct typed owners preserve the original state and replay
+// semantics.
+#define g_PlayerNormalBombCount g_GameManager.hscr.numBombsUsed
+#define g_PlayerDeathbombCount g_GameManager.hscr.numLastSpells
+#define g_PlayerGaugeBounds                                                                    \
+    (*reinterpret_cast<i16 (*)[6]>(&g_GameManager.youkaiGaugeHumanLimit))
+#else
 DIFFABLE_STATIC(i32, g_PlayerNormalBombCount);
 DIFFABLE_STATIC(i32, g_PlayerDeathbombCount);
 DIFFABLE_STATIC_ARRAY(i16, 6, g_PlayerGaugeBounds);
+#endif
 
 DIFFABLE_STATIC_ARRAY_ASSIGN(const char *, 12, g_PlayerAnmFilenames) = {
     "player00.anm", "player01.anm", "player02.anm", "player03.anm",
@@ -183,6 +212,36 @@ DIFFABLE_STATIC_ARRAY_ASSIGN(PlayerOptionCallback, 4, g_PlayerRoute3ExitUpdateCa
 DIFFABLE_STATIC_ARRAY_ASSIGN(PlayerOptionCallback, 4, g_PlayerRoute3ExitRenderCallbacks) = {
     NULL, NULL, DrawPlayerOption, NULL};
 
+i32 PlayerOptionCallbackStableId(PlayerOptionCallback callback)
+{
+    if (callback == NULL)
+        return -1;
+    for (i32 row = 0; row < 12; ++row)
+    {
+        for (i32 slot = 0; slot < 4; ++slot)
+        {
+            if (g_PlayerOptionUpdateCallbacks[row].callbacks[slot] == callback)
+                return row * 4 + slot;
+        }
+    }
+    for (i32 row = 0; row < 12; ++row)
+    {
+        for (i32 slot = 0; slot < 4; ++slot)
+        {
+            if (g_PlayerOptionRenderCallbacks[row].callbacks[slot] == callback)
+                return 0x100 + row * 4 + slot;
+        }
+    }
+    for (i32 slot = 0; slot < 4; ++slot)
+    {
+        if (g_PlayerRoute3ExitUpdateCallbacks[slot] == callback)
+            return 0x200 + slot;
+        if (g_PlayerRoute3ExitRenderCallbacks[slot] == callback)
+            return 0x210 + slot;
+    }
+    return -2;
+}
+
 DIFFABLE_STATIC_ARRAY_ASSIGN(PlayerShotSpawnCallback, 9, g_PlayerShotSpawnCallbacks) = {
     NULL, SpawnHomingShot, SpawnShotUnlessBombingCallback, SpawnShotUnlessBombingCallback,
     SpawnPersistentShotCallback, SpawnShotAimedAtTrackedPointCallback,
@@ -219,6 +278,416 @@ ZunBool IsResourceReloadDisabled();
 void __fastcall PlayerBuildAabb(Float3 *topLeft, Float3 *bottomRight,
                                 const Float3 *center, const Float3 *size);
 
+#if defined(PSP)
+namespace
+{
+struct PspBulletCancelDuplicateCache
+{
+    Player *owner;
+    Float3 *position;
+    Float3 *size;
+    PlayerCollisionRegion *hitSlot;
+    i32 result;
+    u32 valid;
+    u32 armed;
+};
+
+// Reserved in both OFF/ON variants so the isolated feature does not move
+// later PSP globals or perturb BSS/heap geometry.
+// `used` is required here: with the gate OFF no code names this cache, and
+// GCC would otherwise omit the intended A/B reservation before the linker
+// ever sees it.  Keeping the bytes in both variants prevents unrelated PSP
+// globals from moving between the control and candidate images.
+PspBulletCancelDuplicateCache g_PspBulletCancelDuplicateCache
+    __attribute__((used)) {};
+
+#if defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+
+void PspBeginBulletCancelDuplicateCache(Player *player, Float3 *position,
+                                        Float3 *size)
+{
+    if (g_PspBulletCancelDuplicateCache.armed == 0U)
+        return;
+    g_PspBulletCancelDuplicateCache.armed = 0U;
+    g_PspBulletCancelDuplicateCache.owner = player;
+    g_PspBulletCancelDuplicateCache.position = position;
+    g_PspBulletCancelDuplicateCache.size = size;
+    g_PspBulletCancelDuplicateCache.hitSlot = NULL;
+    g_PspBulletCancelDuplicateCache.result = 0;
+    g_PspBulletCancelDuplicateCache.valid = 1U;
+}
+
+void PspRecordBulletCancelDuplicateHit(PlayerCollisionRegion *slot)
+{
+    if (g_PspBulletCancelDuplicateCache.valid == 0U)
+        return;
+    g_PspBulletCancelDuplicateCache.hitSlot = slot;
+    g_PspBulletCancelDuplicateCache.result = 2;
+}
+#endif
+} // namespace
+
+#if defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+void PspArmNextBulletCancelDuplicateCollision()
+{
+    g_PspBulletCancelDuplicateCache.valid = 0U;
+    g_PspBulletCancelDuplicateCache.armed = 1U;
+}
+
+ZunBool PspReplayLastBulletCancelCollision(
+    Player *player, Float3 *position, Float3 *size, i32 expectedResult)
+{
+    PspBulletCancelDuplicateCache &cache =
+        g_PspBulletCancelDuplicateCache;
+    const bool identityMatches = cache.valid != 0U && cache.owner == player &&
+        cache.position == position && cache.size == size &&
+        cache.result == expectedResult &&
+        (expectedResult == 0 || expectedResult == 2);
+    cache.valid = 0U;
+    if (!identityMatches)
+        return FALSE;
+    if (expectedResult == 0)
+        return TRUE;
+
+    PlayerCollisionRegion *slot = cache.hitSlot;
+    if (slot == NULL || slot < &player->cancelRegions[0] ||
+        slot >= &player->cancelRegions[ARRAY_SIZE(player->cancelRegions)] ||
+        !slot->active)
+    {
+        return FALSE;
+    }
+    // The original matching function performs the same immediately-adjacent
+    // query twice. The first call can change only these two authoritative
+    // fields, neither of which participates in the second geometric test.
+    player->bulletCancelItemType = slot->collisionValue;
+    slot->hitAccumulator++;
+    return TRUE;
+}
+#endif
+#endif
+
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+namespace
+{
+// PSP-only scan metadata deliberately lives outside Player.  Player is part of
+// the replay/game-state ABI (0xE2B30 bytes), while these bits are only a cache
+// of state that remains authoritative in the original arrays.
+struct PspPlayerScanSidecar
+{
+    Player *owner;
+    u32 activeShotBits[4];
+    u32 activeDamageRegionBits[6];
+    u32 activeCancelRegionBits[6];
+#if defined(TH08_PSP_CANCEL_EMPTY_FASTPATH)
+    // These are derived only from activeCancelRegionBits.  A stale positive is
+    // safe and is repaired by the authoritative-slot check; writers and the
+    // once-per-frame rebuild must never permit a false negative.
+    u32 cancelAny;
+    i32 cancelLastActiveWord;
+#endif
+};
+
+static PspPlayerScanSidecar g_PspPlayerScanSidecar;
+
+#if defined(PSP)
+struct PspBulletCancelSpatialState
+{
+    Player *owner;
+    th08::psp::PspBulletCancelSpatial coverage;
+    u32 activeRegionCount;
+    u32 ready;
+    u32 dirty;
+    u32 forceFull;
+};
+
+// Present in both feature variants whenever the prerequisite Player sidecar
+// is present, keeping the isolated OFF/ON BSS layout identical.
+static PspBulletCancelSpatialState g_PspBulletCancelSpatialState
+    __attribute__((used)) {};
+#endif
+
+static inline void PspSetScanBit(u32 *bits, i32 index)
+{
+    bits[index >> 5] |= 1u << (index & 31);
+}
+
+static inline void PspClearScanBit(u32 *bits, i32 index)
+{
+    bits[index >> 5] &= ~(1u << (index & 31));
+}
+
+static inline ZunBool PspTestScanBit(const u32 *bits, i32 index)
+{
+    return (bits[index >> 5] & (1u << (index & 31))) != 0;
+}
+
+static inline void PspClearAllCancelScanBits()
+{
+    memset(g_PspPlayerScanSidecar.activeCancelRegionBits, 0,
+           sizeof(g_PspPlayerScanSidecar.activeCancelRegionBits));
+#if defined(TH08_PSP_CANCEL_EMPTY_FASTPATH)
+    g_PspPlayerScanSidecar.cancelAny = false;
+    g_PspPlayerScanSidecar.cancelLastActiveWord = -1;
+#endif
+}
+
+static inline void PspSetCancelScanBit(i32 index)
+{
+    PspSetScanBit(g_PspPlayerScanSidecar.activeCancelRegionBits, index);
+#if defined(TH08_PSP_CANCEL_EMPTY_FASTPATH)
+    const i32 wordIndex = index >> 5;
+    g_PspPlayerScanSidecar.cancelAny = true;
+    if (wordIndex > g_PspPlayerScanSidecar.cancelLastActiveWord)
+        g_PspPlayerScanSidecar.cancelLastActiveWord = wordIndex;
+#endif
+}
+
+static inline void PspClearCancelScanBit(i32 index)
+{
+    PspClearScanBit(g_PspPlayerScanSidecar.activeCancelRegionBits, index);
+#if defined(TH08_PSP_CANCEL_EMPTY_FASTPATH)
+    i32 wordIndex = index >> 5;
+    if (!g_PspPlayerScanSidecar.cancelAny ||
+        wordIndex != g_PspPlayerScanSidecar.cancelLastActiveWord ||
+        g_PspPlayerScanSidecar.activeCancelRegionBits[wordIndex] != 0)
+        return;
+
+    while (--wordIndex >= 0 &&
+           g_PspPlayerScanSidecar.activeCancelRegionBits[wordIndex] == 0)
+    {
+    }
+    g_PspPlayerScanSidecar.cancelLastActiveWord = wordIndex;
+    if (wordIndex < 0)
+        g_PspPlayerScanSidecar.cancelAny = false;
+#endif
+}
+
+static i32 PspNextScanBit(const u32 *bits, i32 wordCount, i32 previousIndex)
+{
+    i32 index = previousIndex + 1;
+    i32 wordIndex = index >> 5;
+    if (wordIndex >= wordCount)
+        return -1;
+
+    u32 word = bits[wordIndex] & (~0u << (index & 31));
+    while (true)
+    {
+        if (word != 0)
+            return (wordIndex << 5) + __builtin_ctz(word);
+        if (++wordIndex >= wordCount)
+            return -1;
+        word = bits[wordIndex];
+    }
+}
+
+static void PspAuditShotScanBits(Player *player)
+{
+    memset(g_PspPlayerScanSidecar.activeShotBits, 0,
+           sizeof(g_PspPlayerScanSidecar.activeShotBits));
+    for (i32 index = 0; index < ARRAY_SIZE_SIGNED(player->shots); ++index)
+    {
+        if (player->shots[index].state != PLAYER_SHOT_INACTIVE)
+            PspSetScanBit(g_PspPlayerScanSidecar.activeShotBits, index);
+    }
+}
+
+static void PspAuditRegionScanBits(Player *player)
+{
+    memset(g_PspPlayerScanSidecar.activeDamageRegionBits, 0,
+           sizeof(g_PspPlayerScanSidecar.activeDamageRegionBits));
+    PspClearAllCancelScanBits();
+    for (i32 index = 0; index < ARRAY_SIZE_SIGNED(player->damageRegions); ++index)
+    {
+        if (player->damageRegions[index].active)
+            PspSetScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, index);
+        if (player->cancelRegions[index].active)
+            PspSetCancelScanBit(index);
+    }
+}
+
+static void PspResetPlayerScanSidecar(Player *player)
+{
+    memset(&g_PspPlayerScanSidecar, 0, sizeof(g_PspPlayerScanSidecar));
+    g_PspPlayerScanSidecar.owner = player;
+#if defined(TH08_PSP_CANCEL_EMPTY_FASTPATH)
+    g_PspPlayerScanSidecar.cancelLastActiveWord = -1;
+#endif
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+    g_PspBulletCancelSpatialState.owner = player;
+    g_PspBulletCancelSpatialState.coverage.Reset();
+    g_PspBulletCancelSpatialState.activeRegionCount = 0U;
+    g_PspBulletCancelSpatialState.ready = 0U;
+    g_PspBulletCancelSpatialState.dirty = 1U;
+    g_PspBulletCancelSpatialState.forceFull = 0U;
+#endif
+}
+
+static void PspEnsurePlayerScanSidecar(Player *player)
+{
+    if (g_PspPlayerScanSidecar.owner == player)
+        return;
+
+    PspResetPlayerScanSidecar(player);
+    PspAuditShotScanBits(player);
+    PspAuditRegionScanBits(player);
+}
+
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+static void PspInvalidateBulletCancelSpatial(Player *player)
+{
+    if (g_PspBulletCancelSpatialState.owner != player)
+    {
+        g_PspBulletCancelSpatialState.owner = player;
+        g_PspBulletCancelSpatialState.ready = 0U;
+    }
+    g_PspBulletCancelSpatialState.dirty = 1U;
+}
+
+static void PspDisableBulletCancelSpatial(Player *player)
+{
+    g_PspBulletCancelSpatialState.owner = player;
+    g_PspBulletCancelSpatialState.coverage.Invalidate();
+    g_PspBulletCancelSpatialState.ready = 1U;
+    g_PspBulletCancelSpatialState.dirty = 0U;
+    g_PspBulletCancelSpatialState.forceFull = 1U;
+}
+
+static void PspRebuildBulletCancelSpatial(Player *player)
+{
+    PspEnsurePlayerScanSidecar(player);
+    PspAuditRegionScanBits(player);
+
+    PspBulletCancelSpatialState &state =
+        g_PspBulletCancelSpatialState;
+    state.owner = player;
+    state.coverage.Reset();
+    state.activeRegionCount = 0U;
+    state.forceFull = 0U;
+    u32 circles = 0U;
+    u32 rects = 0U;
+    bool invalidGeometry = false;
+
+    for (i32 index = 0;
+         index < ARRAY_SIZE_SIGNED(player->cancelRegions); ++index)
+    {
+        const PlayerCollisionRegion &region = player->cancelRegions[index];
+        if (!region.active)
+            continue;
+        ++state.activeRegionCount;
+
+        bool accepted;
+        if (region.radius != 0.0f)
+        {
+            ++circles;
+            accepted = state.coverage.AddCircle(
+                region.center.x, region.center.y, region.radius);
+        }
+        else if (region.angle != 0.0f)
+        {
+            ++rects;
+            accepted = state.coverage.AddRotatedRect(
+                region.center.x, region.center.y,
+                region.size.x, region.size.y, region.angle);
+        }
+        else
+        {
+            ++rects;
+            accepted = state.coverage.AddAxisAlignedRect(
+                region.center.x, region.center.y,
+                region.size.x, region.size.y);
+        }
+        if (!accepted)
+            invalidGeometry = true;
+    }
+
+    if (invalidGeometry)
+    {
+        // Never consume a partially built coverage map. The authoritative
+        // active-slot scan remains available for every query this frame.
+        state.coverage.Invalidate();
+        state.forceFull = 1U;
+    }
+    else
+    {
+        state.coverage.Finalize();
+    }
+    state.ready = 1U;
+    state.dirty = 0U;
+    PspBulletCancelSpatialNoteRebuild(
+        circles, rects, invalidGeometry ? TRUE : FALSE);
+}
+
+#endif
+} // namespace
+#endif
+
+#if defined(PSP) && \
+    ((defined(TH08_PSP_BULLET_COLLISION_GATE_AUDIT) && \
+      TH08_PSP_BULLET_COLLISION_GATE_AUDIT) || \
+     (defined(TH08_PSP_BULLET_COLLISION_GATE) && \
+      TH08_PSP_BULLET_COLLISION_GATE))
+PspPlayerBulletCollisionAuditSnapshot
+PspCapturePlayerBulletCollisionAuditSnapshot(Player *player)
+{
+    PspPlayerBulletCollisionAuditSnapshot snapshot{};
+    if (player == NULL)
+        return snapshot;
+
+    PspEnsurePlayerScanSidecar(player);
+    snapshot.hurtboxBoundsMin = player->hurtboxBoundsMin;
+    snapshot.hurtboxBoundsMax = player->hurtboxBoundsMax;
+    snapshot.grazeBoundsMin = player->grazeBoundsMin;
+    snapshot.grazeBoundsMax = player->grazeBoundsMax;
+    snapshot.sidecarOwnerValid =
+        g_PspPlayerScanSidecar.owner == player ? 1U : 0U;
+
+    u32 sidecarUnion = 0U;
+    for (i32 wordIndex = 0; wordIndex < 6; ++wordIndex)
+    {
+        sidecarUnion |=
+            g_PspPlayerScanSidecar.activeCancelRegionBits[wordIndex];
+    }
+    snapshot.sidecarClaimsEmpty =
+        snapshot.sidecarOwnerValid != 0U && sidecarUnion == 0U ? 1U : 0U;
+
+    // Audit the derived bitmap against every authoritative slot at exactly the
+    // boundary where a future product would consume the once-per-frame claim.
+    // The audit never trusts this scan to change gameplay or skip a call.
+    for (i32 index = 0;
+         index < ARRAY_SIZE_SIGNED(player->cancelRegions); ++index)
+    {
+        if (player->cancelRegions[index].active)
+            ++snapshot.authoritativeActiveCount;
+    }
+    snapshot.authoritativeEmpty =
+        snapshot.authoritativeActiveCount == 0U ? 1U : 0U;
+    snapshot.knownEmpty =
+        snapshot.sidecarClaimsEmpty != 0U &&
+        snapshot.authoritativeEmpty != 0U ? 1U : 0U;
+    return snapshot;
+}
+
+ZunBool PspPlayerBulletCollisionAuditBoundsMatch(
+    const Player *player,
+    const PspPlayerBulletCollisionAuditSnapshot *snapshot)
+{
+    if (player == NULL || snapshot == NULL)
+        return FALSE;
+    return memcmp(&player->hurtboxBoundsMin, &snapshot->hurtboxBoundsMin,
+                  sizeof(Float3)) == 0 &&
+           memcmp(&player->hurtboxBoundsMax, &snapshot->hurtboxBoundsMax,
+                  sizeof(Float3)) == 0 &&
+           memcmp(&player->grazeBoundsMin, &snapshot->grazeBoundsMin,
+                  sizeof(Float3)) == 0 &&
+           memcmp(&player->grazeBoundsMax, &snapshot->grazeBoundsMax,
+                  sizeof(Float3)) == 0;
+}
+#endif
+
 // FUNCTION: th08 0x449ca0
 Player::Player()
 {
@@ -244,15 +713,111 @@ i32 Player::CheckBulletCancelCollision(Float3 *position, Float3 *position2)
     Float3 rotated;
     Float3 halfSize;
     Float3 boundsMax;
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PlayerCollisionRegion *slot;
+#else
     PlayerCollisionRegion *slot = this->cancelRegions;
+#endif
     i32 i;
     f32 xDelta;
     f32 yDelta;
 
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+    u32 spatialFullCandidates = 0U;
+    u32 spatialSelectedCandidates = 0U;
+    u32 spatialExactTests = 0U;
+    ZunBool spatialIndexed = FALSE;
+    ZunBool spatialFallback = FALSE;
+    ZunBool spatialOwnerFallback = FALSE;
+    ZunBool spatialNonfiniteFallback = FALSE;
+    PspBeginBulletCancelDuplicateCache(this, position, position2);
+#endif
+
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+    if (g_PspBulletCancelSpatialState.owner != this ||
+        g_PspBulletCancelSpatialState.dirty != 0U ||
+        g_PspBulletCancelSpatialState.ready == 0U)
+    {
+        PspRebuildBulletCancelSpatial(this);
+    }
+    spatialFullCandidates =
+        g_PspBulletCancelSpatialState.activeRegionCount;
+    if (!PspBulletCancelSpatialValidatePosition(position))
+    {
+        spatialFallback = TRUE;
+        spatialOwnerFallback = TRUE;
+        spatialSelectedCandidates = spatialFullCandidates;
+    }
+    else if (g_PspBulletCancelSpatialState.forceFull != 0U ||
+             !g_PspBulletCancelSpatialState.coverage.IsValid())
+    {
+        spatialFallback = TRUE;
+        spatialSelectedCandidates = spatialFullCandidates;
+    }
+    else
+    {
+        bool covered = false;
+        if (!g_PspBulletCancelSpatialState.coverage.Query(
+                position->x, position->y, &covered))
+        {
+            spatialFallback = TRUE;
+            spatialSelectedCandidates = spatialFullCandidates;
+            spatialNonfiniteFallback =
+                (!std::isfinite(position->x) ||
+                 !std::isfinite(position->y)) ? TRUE : FALSE;
+        }
+        else if (!covered)
+        {
+            PspBulletCancelSpatialNoteQuery(
+                spatialFullCandidates, 0U, 0U,
+                FALSE, TRUE, FALSE, FALSE, FALSE, FALSE);
+            return 0;
+        }
+        else
+        {
+            spatialIndexed = TRUE;
+            spatialSelectedCandidates = spatialFullCandidates;
+        }
+    }
+#endif
+#if defined(TH08_PSP_CANCEL_EMPTY_FASTPATH) && \
+    !(defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+      TH08_PSP_BULLET_CANCEL_SPATIAL)
+    if (!g_PspPlayerScanSidecar.cancelAny)
+        return 0;
+    const i32 cancelScanWordCount =
+        g_PspPlayerScanSidecar.cancelLastActiveWord + 1;
+#else
+    const i32 cancelScanWordCount = 6;
+#endif
+    for (i = PspNextScanBit(g_PspPlayerScanSidecar.activeCancelRegionBits,
+                            cancelScanWordCount, -1);
+         i >= 0;
+         i = PspNextScanBit(g_PspPlayerScanSidecar.activeCancelRegionBits,
+                            cancelScanWordCount, i))
+    {
+        slot = &this->cancelRegions[i];
+        if (!slot->active)
+        {
+            // A cached one with an inactive authoritative slot is harmless;
+            // repair it immediately so later bullet checks do no extra work.
+            PspClearCancelScanBit(i);
+            continue;
+        }
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+        ++spatialExactTests;
+#endif
+#else
     for (i = 0; i < ARRAY_SIZE_SIGNED(this->cancelRegions); i++, slot++)
     {
         if (!slot->active)
             continue;
+#endif
 
         if (slot->radius != 0.0)
         {
@@ -297,9 +862,26 @@ i32 Player::CheckBulletCancelCollision(Float3 *position, Float3 *position2)
         ;
     }
 
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+    PspBulletCancelSpatialNoteQuery(
+        spatialFullCandidates, spatialSelectedCandidates,
+        spatialExactTests, spatialIndexed, FALSE,
+        spatialIndexed ? TRUE : FALSE, spatialFallback,
+        spatialOwnerFallback, spatialNonfiniteFallback);
+#endif
     return 0;
 
 hit:
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+    PspRecordBulletCancelDuplicateHit(slot);
+    PspBulletCancelSpatialNoteQuery(
+        spatialFullCandidates, spatialSelectedCandidates,
+        spatialExactTests, spatialIndexed, FALSE, FALSE,
+        spatialFallback, spatialOwnerFallback,
+        spatialNonfiniteFallback);
+#endif
     this->bulletCancelItemType = slot->collisionValue;
     slot->hitAccumulator++;
     return 2;
@@ -1016,6 +1598,9 @@ ZunResult Player::RegisterChain(u32 playerType)
     }
 
     memset(player, 0, sizeof(*player));
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspResetPlayerScanSidecar(player);
+#endif
 
     if (IsResourceReloadDisabled())
     {
@@ -1047,8 +1632,17 @@ ZunResult Player::RegisterChain(u32 playerType)
 // FUNCTION: th08 0x44c390
 ChainCallbackResult Player::OnUpdate(Player *player)
 {
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+    th08::psp::PerfAttributionScope perfScope(
+        th08::psp::PerfAttributionPhase::PlayerUpdate);
+#endif
     if (g_GameManager.scriptedUpdateFreeze != 0)
     {
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+        // No end-of-update authoritative rebuild occurs on this branch.
+        PspDisableBulletCancelSpatial(player);
+#endif
         if (player->focusEffect != NULL)
         {
             player->focusEffect->vm.flagsWord |= 0x80000;
@@ -1107,6 +1701,13 @@ updateD180:
             g_GameManager.AddScore(100);
         }
     }
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+    // Bomb callbacks may move regions by direct field writes. Rebuild only
+    // after the complete Player update so BulletManager sees the final frame
+    // geometry. Later Enemy producers mark the cache dirty via Create*.
+    PspRebuildBulletCancelSpatial(player);
+#endif
     return CHAIN_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -1117,6 +1718,39 @@ void Player::UpdateCollisionRegions()
     PlayerCollisionRegion *slot = this->damageRegions;
     i32 index;
 
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+    PspInvalidateBulletCancelSpatial(this);
+#endif
+
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+    memset(g_PspPlayerScanSidecar.activeDamageRegionBits, 0,
+           sizeof(g_PspPlayerScanSidecar.activeDamageRegionBits));
+    PspClearAllCancelScanBits();
+    for (index = 0; index < 384; index++, slot++)
+    {
+        if (slot->lifetime >= 0)
+        {
+            slot->lifetime--;
+            slot->radius += slot->radiusGrowth;
+            slot->size.x += slot->sizeGrowth.x;
+            slot->size.y += slot->sizeGrowth.y;
+
+            if (slot->lifetime <= 0)
+                slot->Deactivate();
+        }
+        // This full once-per-frame pass is the false-negative audit.  Collision
+        // consumers can then walk only active slots while validating each one.
+        if (slot->active)
+        {
+            if (index < 192)
+                PspSetScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, index);
+            else
+                PspSetCancelScanBit(index - 192);
+        }
+    }
+#else
     for (index = 0; index < 384; index++, slot++)
     {
         if (slot->lifetime < 0)
@@ -1130,6 +1764,7 @@ void Player::UpdateCollisionRegions()
         if (slot->lifetime <= 0)
             slot->Deactivate();
     }
+#endif
 }
 
 // FUNCTION: th08 0x44c650
@@ -1513,6 +2148,10 @@ doneTop:
 #pragma var_order(i, this)
 ChainCallbackResult Player::OnDrawHighPrio(Player *player)
 {
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+    th08::psp::PerfAttributionScope perfScope(
+        th08::psp::PerfAttributionPhase::PlayerDraw);
+#endif
     u32 i;
 
     player->DrawActiveShots();
@@ -1546,6 +2185,10 @@ ChainCallbackResult Player::OnDrawHighPrio(Player *player)
 // FUNCTION: th08 0x44d630
 ChainCallbackResult Player::OnDrawLowPrio(Player *player)
 {
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+    th08::psp::PerfAttributionScope perfScope(
+        th08::psp::PerfAttributionPhase::PlayerDraw);
+#endif
     player->DrawHitShots();
     return CHAIN_CALLBACK_RESULT_CONTINUE;
 }
@@ -1604,6 +2247,11 @@ ZunResult Player::AddedCallback(Player *player)
     shotSlot = player->shots;
     for (i = 0; (i32)i < 0x80; ++i, shotSlot++)
         shotSlot->state = PLAYER_SHOT_INACTIVE;
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    // AddedCallback is the authoritative pool reset.  Keep the external cache
+    // empty as well without changing Player's replay-visible layout.
+    PspResetPlayerScanSidecar(player);
+#endif
 
     player->shotTimer = -1;
     player->gaugeShiftDelayTimer = 0;
@@ -1698,6 +2346,9 @@ ZunResult Player::AddedCallback(Player *player)
 // FUNCTION: th08 0x44dc60
 ZunResult Player::DeletedCallback(Player *player)
 {
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspResetPlayerScanSidecar(player);
+#endif
     if (IsBulletManagerAnmReleaseRequired())
     {
         g_AnmManager->ReleaseAnm(5);
@@ -1785,10 +2436,30 @@ PlayerCollisionRegion *Player::CreateRectCancelRegion(const Float3 *center, f32 
     PlayerCollisionRegion *slot = this->cancelRegions;
     i32 index;
 
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+    PspInvalidateBulletCancelSpatial(this);
+#endif
+
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+#endif
     for (index = 0; index < 191; index++, slot++)
     {
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+        if (slot->active)
+        {
+            // Repair a missed producer before selecting the same first free
+            // slot as the original ascending scan.
+            PspSetCancelScanBit(index);
+            continue;
+        }
+        PspClearCancelScanBit(index);
+        break;
+#else
         if (!slot->active)
             break;
+#endif
     }
 
     slot->Reset();
@@ -1799,6 +2470,9 @@ PlayerCollisionRegion *Player::CreateRectCancelRegion(const Float3 *center, f32 
     slot->size.y = height;
     slot->lifetime = lifetime;
     slot->collisionValue = collisionValue;
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspSetCancelScanBit(index);
+#endif
 
     return slot;
 }
@@ -1812,10 +2486,28 @@ PlayerCollisionRegion *Player::CreateCircleCancelRegion(const Float3 *center, f3
     PlayerCollisionRegion *slot = this->cancelRegions;
     i32 index;
 
+#if defined(PSP) && defined(TH08_PSP_BULLET_CANCEL_SPATIAL) && \
+    TH08_PSP_BULLET_CANCEL_SPATIAL
+    PspInvalidateBulletCancelSpatial(this);
+#endif
+
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+#endif
     for (index = 0; index < 191; index++, slot++)
     {
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+        if (slot->active)
+        {
+            PspSetCancelScanBit(index);
+            continue;
+        }
+        PspClearCancelScanBit(index);
+        break;
+#else
         if (!slot->active)
             break;
+#endif
     }
 
     slot->Reset();
@@ -1826,6 +2518,9 @@ PlayerCollisionRegion *Player::CreateCircleCancelRegion(const Float3 *center, f3
     slot->radiusGrowth = radiusGrowthPerFrame;
     slot->lifetime = lifetime;
     slot->collisionValue = collisionValue;
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspSetCancelScanBit(index);
+#endif
 
     return slot;
 }
@@ -1838,10 +2533,23 @@ PlayerCollisionRegion *Player::CreateRectDamageRegion(const Float3 *center, f32 
     PlayerCollisionRegion *slot = this->damageRegions;
     i32 index;
 
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+#endif
     for (index = 0; index < 191; index++, slot++)
     {
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+        if (slot->active)
+        {
+            PspSetScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, index);
+            continue;
+        }
+        PspClearScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, index);
+        break;
+#else
         if (!slot->active)
             break;
+#endif
     }
 
     slot->Reset();
@@ -1852,6 +2560,9 @@ PlayerCollisionRegion *Player::CreateRectDamageRegion(const Float3 *center, f32 
     slot->size.y = height;
     slot->lifetime = lifetime;
     slot->damage = damage;
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspSetScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, index);
+#endif
 
     return slot;
 }
@@ -1865,10 +2576,23 @@ PlayerCollisionRegion *Player::CreateCircleDamageRegion(const Float3 *center, f3
     PlayerCollisionRegion *slot = this->damageRegions;
     i32 index;
 
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+#endif
     for (index = 0; index < 191; index++, slot++)
     {
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+        if (slot->active)
+        {
+            PspSetScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, index);
+            continue;
+        }
+        PspClearScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, index);
+        break;
+#else
         if (!slot->active)
             break;
+#endif
     }
 
     slot->Reset();
@@ -1879,6 +2603,9 @@ PlayerCollisionRegion *Player::CreateCircleDamageRegion(const Float3 *center, f3
     slot->radiusGrowth = radiusGrowthPerFrame;
     slot->lifetime = lifetime;
     slot->damage = damage;
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspSetScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, index);
+#endif
 
     return slot;
 }
@@ -2613,8 +3340,13 @@ void __fastcall Player::InitializeShot(PlayerShot *slot, PlayerShotDescriptor *e
     slot->hitboxSize.z = 1.0f;
     slot->angle = entry->angle;
     slot->speed = entry->speed;
+#ifdef TH08_MODERN_PORT
+    slot->velocity.x = X87CompatibleCosMul(entry->angle, entry->speed);
+    slot->velocity.y = X87CompatibleSinMul(entry->angle, entry->speed);
+#else
     slot->velocity.x = cosf(entry->angle) * entry->speed;
     slot->velocity.y = sinf(entry->angle) * entry->speed;
+#endif
 
     slot->timer = 0;
     slot->focusMode = this->focusMode;
@@ -3084,13 +3816,25 @@ void __fastcall Player::SpawnShots(i32 value)
         (this->focusMode == PLAYER_FOCUS_MODE_UNFOCUSED) ? this->primaryShtFile
                                                         : this->secondaryShtFile,
         table);
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+#endif
     slot = this->shots;
     for (i = 0; i < ARRAY_SIZE_SIGNED(this->shots); i++, slot++)
     {
         if (slot->state != PLAYER_SHOT_INACTIVE)
         {
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+            // The slot array is authoritative.  Repair a missing bit while
+            // preserving the original lowest-free-slot search order.
+            PspSetScanBit(g_PspPlayerScanSidecar.activeShotBits, i);
+#endif
             continue;
         }
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+        if (PspTestScanBit(g_PspPlayerScanSidecar.activeShotBits, i))
+            PspClearScanBit(g_PspPlayerScanSidecar.activeShotBits, i);
+#endif
 
 processEntry:
         if (TH08_SHOT_SPAWN_CALLBACK(entry) != NULL)
@@ -3111,6 +3855,12 @@ processEntry:
             slot->drawCallback = TH08_SHOT_DRAW_CALLBACK(slot->descriptor);
             slot->collisionCallback = TH08_SHOT_COLLISION_CALLBACK(slot->descriptor);
         }
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+        if (slot->state != PLAYER_SHOT_INACTIVE)
+            PspSetScanBit(g_PspPlayerScanSidecar.activeShotBits, i);
+        else
+            PspClearScanBit(g_PspPlayerScanSidecar.activeShotBits, i);
+#endif
 
         entry++;
         if (entry->fireInterval < 0)
@@ -3136,6 +3886,12 @@ void Player::UpdateShots()
         return;
     }
 
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+    memset(g_PspPlayerScanSidecar.activeShotBits, 0,
+           sizeof(g_PspPlayerScanSidecar.activeShotBits));
+#endif
+
     slot = this->shots;
     for (i = 0; i < ARRAY_SIZE_SIGNED(this->shots); i++, slot++)
     {
@@ -3143,12 +3899,18 @@ void Player::UpdateShots()
         {
             continue;
         }
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+        PspSetScanBit(g_PspPlayerScanSidecar.activeShotBits, i);
+#endif
 
         if (slot->updateCallback != NULL)
         {
             if (slot->updateCallback(this, slot) != 0)
             {
                 slot->state = PLAYER_SHOT_INACTIVE;
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+                PspClearScanBit(g_PspPlayerScanSidecar.activeShotBits, i);
+#endif
                 continue;
             }
         }
@@ -3175,6 +3937,10 @@ void Player::UpdateShots()
             slot->state = PLAYER_SHOT_INACTIVE;
         }
         slot->timer++;
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+        if (slot->state == PLAYER_SHOT_INACTIVE)
+            PspClearScanBit(g_PspPlayerScanSidecar.activeShotBits, i);
+#endif
     }
 }
 // FUNCTION: th08 0x4512f0
@@ -3184,9 +3950,23 @@ void Player::DrawActiveShots()
     PlayerShot *slot;
     i32 i;
 
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+    for (i = PspNextScanBit(g_PspPlayerScanSidecar.activeShotBits, 4, -1);
+         i >= 0;
+         i = PspNextScanBit(g_PspPlayerScanSidecar.activeShotBits, 4, i))
+    {
+        slot = &this->shots[i];
+        if (slot->state == PLAYER_SHOT_INACTIVE)
+        {
+            PspClearScanBit(g_PspPlayerScanSidecar.activeShotBits, i);
+            continue;
+        }
+#else
     slot = this->shots;
     for (i = 0; i < ARRAY_SIZE_SIGNED(this->shots); i++, slot++)
     {
+#endif
         if (slot->state != PLAYER_SHOT_ACTIVE)
         {
             continue;
@@ -3219,9 +3999,23 @@ void Player::DrawHitShots()
     PlayerShot *slot;
     i32 i;
 
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+    for (i = PspNextScanBit(g_PspPlayerScanSidecar.activeShotBits, 4, -1);
+         i >= 0;
+         i = PspNextScanBit(g_PspPlayerScanSidecar.activeShotBits, 4, i))
+    {
+        slot = &this->shots[i];
+        if (slot->state == PLAYER_SHOT_INACTIVE)
+        {
+            PspClearScanBit(g_PspPlayerScanSidecar.activeShotBits, i);
+            continue;
+        }
+#else
     slot = this->shots;
     for (i = 0; i < ARRAY_SIZE_SIGNED(this->shots); i++, slot++)
     {
+#endif
         if (slot->state != PLAYER_SHOT_HIT)
         {
             continue;
@@ -3327,8 +4121,22 @@ i32 Player::CalcDamageToEnemy(Float3 *enemyPosition, Float3 *enemySize, i32 *hit
     if (bombHit != NULL)
         *bombHit = 0;
 
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+    PspEnsurePlayerScanSidecar(this);
+    for (i = PspNextScanBit(g_PspPlayerScanSidecar.activeShotBits, 4, -1);
+         i >= 0;
+         i = PspNextScanBit(g_PspPlayerScanSidecar.activeShotBits, 4, i))
+    {
+        bullet = &this->shots[i];
+        if (bullet->state == PLAYER_SHOT_INACTIVE)
+        {
+            PspClearScanBit(g_PspPlayerScanSidecar.activeShotBits, i);
+            continue;
+        }
+#else
     for (i = 0; i < 128; i++, bullet++)
     {
+#endif
         if (bullet->state == PLAYER_SHOT_INACTIVE ||
             (bullet->state != PLAYER_SHOT_ACTIVE && bullet->shotType != 3))
             continue;
@@ -3380,9 +4188,22 @@ i32 Player::CalcDamageToEnemy(Float3 *enemyPosition, Float3 *enemySize, i32 *hit
     *hitAccumulator += damage > 50 ? 50 : damage;
 
     {
+#if defined(TH08_PSP_PLAYER_SCAN_SIDECAR)
+        for (i = PspNextScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, 6, -1);
+             i >= 0;
+             i = PspNextScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, 6, i))
+        {
+            region = &this->damageRegions[i];
+            if (!region->active)
+            {
+                PspClearScanBit(g_PspPlayerScanSidecar.activeDamageRegionBits, i);
+                continue;
+            }
+#else
         region = this->damageRegions;
         for (i = 0; i < 192; i++, region++)
         {
+#endif
             if (!region->active)
                 continue;
             if ((region->lifetime % region->collisionInterval) != 0)

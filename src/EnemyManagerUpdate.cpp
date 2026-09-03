@@ -14,6 +14,12 @@
 #include "ReplayManager.hpp"
 #include "SoundPlayer.hpp"
 
+#if defined(PSP)
+#include "ecl_child_memory.hpp"
+#include "enemy_active_bitmap_audit.hpp"
+#include "perf_attribution.hpp"
+#endif
+
 #include <d3dx8math.h>
 #include <math.h>
 #include <string.h>
@@ -119,8 +125,14 @@ i32 EnemyManager::OnUpdate()
 
     enemy = &this->enemies[0];
     this->activeEnemyCount = 0;
+    // M0 shadows the exact future live-ctz traversal.  The canonical 480-slot
+    // loop below remains authoritative and is never skipped.
+    TH08_PSP_ENEMY_BITMAP_BEGIN_FRAME(this);
     for (enemyIndex = 0; enemyIndex < 480; ++enemyIndex, ++enemy)
     {
+        TH08_PSP_ENEMY_BITMAP_OBSERVE(
+            this, enemyIndex,
+            (enemy->flags1 & ENEMY_FLAG_ACTIVE) != 0);
         if ((enemy->flags1 & ENEMY_FLAG_ACTIVE) == 0)
         {
             if (g_Player.optionHomingTarget == enemy)
@@ -157,6 +169,7 @@ i32 EnemyManager::OnUpdate()
         if (g_EclManager.RunEcl(enemy) == -1)
         {
             enemy->flags1 &= ~1U;
+            TH08_PSP_ENEMY_BITMAP_UNTRACK(this, enemyIndex);
             enemy->Despawn();
             continue;
         }
@@ -260,6 +273,7 @@ i32 EnemyManager::OnUpdate()
                      enemy->vm.loadedSprite->heightPx)))
             {
                 enemy->flags1 &= ~1U;
+                TH08_PSP_ENEMY_BITMAP_UNTRACK(this, enemyIndex);
                 enemy->Despawn();
                 continue;
             }
@@ -470,7 +484,11 @@ i32 EnemyManager::OnUpdate()
             {
                 if (enemy->childEclBlocks[deathPosition] != 0)
                 {
+#if defined(PSP)
+                    psp::EnemyChildEclFree(enemy->childEclBlocks[deathPosition]);
+#else
                     g_ZunMemory.Free(enemy->childEclBlocks[deathPosition]);
+#endif
                     enemy->childEclBlocks[deathPosition] = 0;
                 }
             }
@@ -526,6 +544,7 @@ i32 EnemyManager::OnUpdate()
             case 0:
                 g_GameManager.AddScore(enemy->score);
                 enemy->flags1 &= ~1U;
+                TH08_PSP_ENEMY_BITMAP_UNTRACK(this, enemyIndex);
                 if (enemy->alignmentEffect != 0)
                 {
                     enemy->alignmentEffect->vm.SetInterrupt(3);
@@ -676,6 +695,8 @@ i32 EnemyManager::OnUpdate()
         }
     }
 
+    TH08_PSP_ENEMY_BITMAP_END_FRAME(this);
+
     if ((this->timer % 200) == 0 &&
         g_GameManager.IsTampered())
         return 4;
@@ -687,6 +708,10 @@ i32 EnemyManager::OnUpdate()
 // The portable chain ABI supplies its owner through ChainElem::arg.
 ChainCallbackResult EnemyManager::OnUpdateCallback(EnemyManager *enemyManager)
 {
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+    th08::psp::PerfAttributionScope perfScope(
+        th08::psp::PerfAttributionPhase::EnemyUpdate);
+#endif
     return static_cast<ChainCallbackResult>(enemyManager->OnUpdate());
 }
 

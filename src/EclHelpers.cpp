@@ -28,12 +28,23 @@ void __fastcall ConfigurePolarMotion(Enemy *enemy, EclRawInstruction *instructio
 {
     f32 angle = AddNormalizeAngle(ReadFloat(enemy, instruction, 2), 0.0f);
 
+#ifdef TH08_MODERN_PORT
+    const f32 speedX = ReadFloat(enemy, instruction, 3);
+    const i32 durationX = ReadInt(enemy, instruction, 0);
+    enemy->movementInterpolationDelta.x =
+        X87CompatibleCosMulInt(angle, speedX, durationX);
+    const f32 speedY = ReadFloat(enemy, instruction, 3);
+    const i32 durationY = ReadInt(enemy, instruction, 0);
+    enemy->movementInterpolationDelta.y =
+        X87CompatibleSinMulInt(angle, speedY, durationY);
+#else
     enemy->movementInterpolationDelta.x = cosf(angle) *
                                  ReadFloat(enemy, instruction, 3) *
                                  ReadInt(enemy, instruction, 0);
     enemy->movementInterpolationDelta.y = sinf(angle) *
                                  ReadFloat(enemy, instruction, 3) *
                                  ReadInt(enemy, instruction, 0);
+#endif
     enemy->movementInterpolationDelta.z = 0.0f;
     *reinterpret_cast<D3DXVECTOR3 *>(
         &enemy->movementInterpolationOrigin) =

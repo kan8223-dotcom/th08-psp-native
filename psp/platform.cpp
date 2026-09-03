@@ -13,6 +13,7 @@ namespace
 {
 volatile int gRunning = 1;
 volatile int gSuspended = 0;
+bool gSelectButtonDown = false;
 
 int ExitCallback(int, int, void *)
 {
@@ -67,6 +68,9 @@ int PowerKeepAliveThread(SceSize, void *)
 
 void PlatformInitialize()
 {
+    gRunning = 1;
+    gSuspended = 0;
+    gSelectButtonDown = false;
     pspSdkDisableFPUExceptions();
     scePowerSetClockFrequency(333, 333, 166);
     sceCtrlSetSamplingCycle(0);
@@ -96,6 +100,14 @@ bool PlatformRunning()
 bool PlatformSuspended()
 {
     return gSuspended != 0;
+}
+
+bool PlatformSelectButtonDown()
+{
+    SceCtrlData pad{};
+    if (sceCtrlPeekBufferPositive(&pad, 1) > 0)
+        gSelectButtonDown = (pad.Buttons & PSP_CTRL_SELECT) != 0;
+    return gSelectButtonDown;
 }
 
 void PlatformRequestExit()

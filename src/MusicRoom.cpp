@@ -15,6 +15,131 @@ const char *g_BgmNotUnlockedWarning[] = {
     TH_WARN_BGM_NOT_UNLOCKED0, TH_WARN_BGM_NOT_UNLOCKED1, TH_WARN_BGM_NOT_UNLOCKED2, TH_WARN_BGM_NOT_UNLOCKED3,
     TH_WARN_BGM_NOT_UNLOCKED4, TH_WARN_BGM_NOT_UNLOCKED5, TH_WARN_BGM_NOT_UNLOCKED6, TH_WARN_BGM_NOT_UNLOCKED4};
 
+#if defined(TH08_MODERN_PORT)
+namespace
+{
+
+bool IsCp932LeadByte(u8 value)
+{
+    return (value >= 0x81 && value <= 0x9f) ||
+           (value >= 0xe0 && value <= 0xfc);
+}
+
+bool IsCp932TrailByte(u8 value)
+{
+    return (value >= 0x40 && value <= 0x7e) ||
+           (value >= 0x80 && value <= 0xfc);
+}
+
+// Copy a complete CP932 prefix and always terminate it.  Stock data fits the
+// destination capacities exactly; the prefix rule is for malformed or modded
+// files and prevents a truncated lead byte from reaching the strict decoder.
+void CopyMusicRoomCp932Text(char *destination, size_t destinationCapacity,
+                            const char *source, size_t sourceLength)
+{
+    if (destination == NULL || destinationCapacity == 0)
+        return;
+
+    size_t sourceOffset = 0;
+    size_t destinationOffset = 0;
+    while (sourceOffset < sourceLength)
+    {
+        const u8 first = static_cast<u8>(source[sourceOffset]);
+        size_t characterBytes = 1;
+        if (IsCp932LeadByte(first))
+        {
+            if (sourceOffset + 1 >= sourceLength ||
+                !IsCp932TrailByte(static_cast<u8>(source[sourceOffset + 1])))
+            {
+                break;
+            }
+            characterBytes = 2;
+        }
+
+        if (destinationOffset + characterBytes >= destinationCapacity)
+            break;
+
+        destination[destinationOffset++] = source[sourceOffset++];
+        if (characterBytes == 2)
+            destination[destinationOffset++] = source[sourceOffset++];
+    }
+    destination[destinationOffset] = '\0';
+}
+
+void CopyMusicRoomCp932String(char *destination, size_t destinationCapacity,
+                              const char *source)
+{
+    CopyMusicRoomCp932Text(destination, destinationCapacity, source,
+                          source == NULL ? 0 : strlen(source));
+}
+
+const char *FindMusicRoomLineEnd(const char *cursor, const char *end)
+{
+    while (cursor < end && *cursor != '\n' && *cursor != '\r')
+        ++cursor;
+    return cursor;
+}
+
+const char *SkipMusicRoomLineEndings(const char *cursor, const char *end)
+{
+    while (cursor < end && (*cursor == '\n' || *cursor == '\r'))
+        ++cursor;
+    return cursor;
+}
+
+i32 ParseMusicRoomComments(TrackDescriptor *tracks, i32 trackCapacity,
+                           const char *fileData, size_t fileSize)
+{
+    const char *cursor = fileData;
+    const char *end = fileData + fileSize;
+    i32 trackCount = 0;
+
+    while (cursor < end)
+    {
+        const char *lineEnd = FindMusicRoomLineEnd(cursor, end);
+        if (cursor == lineEnd || *cursor != '@')
+        {
+            cursor = SkipMusicRoomLineEndings(lineEnd, end);
+            continue;
+        }
+        if (trackCount >= trackCapacity)
+            break;
+
+        TrackDescriptor &track = tracks[trackCount];
+        CopyMusicRoomCp932Text(track.path, sizeof(track.path), cursor + 1,
+                              static_cast<size_t>(lineEnd - (cursor + 1)));
+        cursor = SkipMusicRoomLineEndings(lineEnd, end);
+
+        if (cursor < end)
+        {
+            lineEnd = FindMusicRoomLineEnd(cursor, end);
+            CopyMusicRoomCp932Text(track.title, sizeof(track.title), cursor,
+                                  static_cast<size_t>(lineEnd - cursor));
+            cursor = SkipMusicRoomLineEndings(lineEnd, end);
+        }
+
+        for (i32 descriptionIndex = 0;
+             descriptionIndex < 7 && cursor < end;
+             ++descriptionIndex)
+        {
+            lineEnd = FindMusicRoomLineEnd(cursor, end);
+            if (cursor < lineEnd && *cursor == '@')
+                break;
+            CopyMusicRoomCp932Text(
+                track.descriptors[descriptionIndex],
+                sizeof(track.descriptors[descriptionIndex]), cursor,
+                static_cast<size_t>(lineEnd - cursor));
+            cursor = SkipMusicRoomLineEndings(lineEnd, end);
+        }
+        ++trackCount;
+    }
+
+    return trackCount;
+}
+
+} // namespace
+#endif
+
 ZunResult MusicRoom::CheckInputEnable()
 {
     i32 i;
@@ -127,8 +252,8 @@ i32 MusicRoom::ProcessInput()
         this->frameCount = 0;
     }
 
-    char buf1[66];
-    char buf2[66];
+    char buf1[MUSIC_ROOM_DESCRIPTION_CAPACITY];
+    char buf2[MUSIC_ROOM_DESCRIPTION_CAPACITY];
 
     if (this->frameCount < 30)
     {
@@ -172,17 +297,33 @@ i32 MusicRoom::ProcessInput()
 
             if (this->selectedSongIndex == this->cursor || this->bgmUnlocked[this->cursor])
             {
+#if defined(TH08_MODERN_PORT)
+                CopyMusicRoomCp932String(
+                    buf1, sizeof(buf1),
+                    this->trackDescriptors[this->cursor].descriptors[i]);
+#else
                 memcpy(buf1, this->trackDescriptors[this->cursor].descriptors[i], 64);
+#endif
             }
             else
             {
+#if defined(TH08_MODERN_PORT)
+                CopyMusicRoomCp932String(buf1, sizeof(buf1),
+                                         g_BgmNotUnlockedWarning[i]);
+#else
                 memcpy(buf1, g_BgmNotUnlockedWarning[i], 64);
+#endif
             }
 
             if (buf1[0] != '\0')
             {
                 this->descriptionVms[i].flag1 = true;
+#if defined(TH08_MODERN_PORT)
+                g_AnmManager->DrawTextLeft(&this->descriptionVms[i], 0xffe0c0,
+                                           0x300000, "%s", buf1);
+#else
                 g_AnmManager->DrawTextLeft(&this->descriptionVms[i], 0xffe0c0, 0x300000, buf1);
+#endif
             }
             else
             {
@@ -209,9 +350,20 @@ i32 MusicRoom::ProcessInput()
 
         memset(buf2, 0, sizeof(buf2));
 
+#if defined(TH08_MODERN_PORT)
+        CopyMusicRoomCp932String(
+            buf2, sizeof(buf2),
+            this->trackDescriptors[this->cursor].descriptors[0]);
+#else
         memcpy(buf2, this->trackDescriptors[this->cursor].descriptors[0], 64);
+#endif
 
+#if defined(TH08_MODERN_PORT)
+        g_AnmManager->DrawTextLeft(&this->descriptionVms[7], 0xffe0c0,
+                                   0x300000, "%s", buf2);
+#else
         g_AnmManager->DrawTextLeft(&this->descriptionVms[7], 0xffe0c0, 0x300000, buf2);
+#endif
     }
 
     if (WAS_PRESSED(TH_BUTTON_BOMB | TH_BUTTON_MENU))
@@ -418,6 +570,12 @@ ZunResult MusicRoom::AddedCallback(MusicRoom *musicRoom)
 
     musicRoom->trackDescriptors = ZUN_NEW_ARRAY(TrackDescriptor, 32, "MusicCmtInf");
 
+#if defined(TH08_MODERN_PORT)
+    int i = ParseMusicRoomComments(
+        musicRoom->trackDescriptors,
+        ARRAY_SIZE_SIGNED(musicRoom->bgmUnlocked), musicCmtFile, fileSize);
+    musicRoom->numDescriptors = i;
+#else
     int i = -1;
     u32 charIdx;
     int currentLine;
@@ -522,6 +680,7 @@ ZunResult MusicRoom::AddedCallback(MusicRoom *musicRoom)
 
 out:
     musicRoom->numDescriptors = i + 1;
+#endif
 
     for (i = 0; i < musicRoom->numDescriptors; i++)
     {
@@ -533,8 +692,14 @@ out:
         musicRoom->musicAnm->SetAndExecuteScriptIdx(&musicRoom->songNameVms[i], 1 + i);
         if (musicRoom->bgmUnlocked[i])
         {
+#if defined(TH08_MODERN_PORT)
+            g_AnmManager->DrawTextLeft(
+                &musicRoom->songNameVms[i], 0xc0e0ff, 0x302080, "%s",
+                musicRoom->trackDescriptors[i].title);
+#else
             g_AnmManager->DrawTextLeft(&musicRoom->songNameVms[i], 0xc0e0ff, 0x302080,
                                        musicRoom->trackDescriptors[i].title);
+#endif
         }
         else
         {

@@ -7,6 +7,7 @@
 #include "GameManager.hpp"
 #include "Global.hpp"
 #include "ResultScreen.hpp"
+#include "ReplaySyncAudit.hpp"
 #include "ScreenEffect.hpp"
 #include "SoundPlayer.hpp"
 #include "Supervisor.hpp" // Official name: mother.hpp
@@ -19,6 +20,27 @@
 #include "inttypes.hpp"
 #ifdef TH08_MODERN_PORT
 #include "modern/windows_runtime.hpp"
+#endif
+#if defined(PSP)
+#include "boot_checkpoint.hpp"
+#include "fileio.hpp"
+#if defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+#include "io_activity_lamp.hpp"
+#endif
+#include "memory_telemetry.hpp"
+#include "perf_attribution.hpp"
+#include "swap_nowait.hpp"
+#include "perf_env.hpp"
+#include "tick_gate_bypass.hpp"
+#include "swap_triple.hpp"
+// psptypes.h (via pspthreadman.h) collides with the game typedefs; declare
+// the clock the environment record needs.
+extern "C" long long sceKernelGetSystemTimeWide(void);
+#include "platform.hpp"
+#include "render_cadence.hpp"
+#include <pspdisplay.h>
+#else
+#define TH08_PSP_BOOT_CHECKPOINT(phase, state, result) ((void)0)
 #endif
 #include <d3dx8.h>
 #include <direct.h>
@@ -81,6 +103,80 @@ C_ASSERT(sizeof(GameWindow) == 0x44);
 
 DIFFABLE_STATIC(HANDLE, g_ExclusiveMutex);
 DIFFABLE_STATIC(GameWindow, g_GameWindow);
+
+#if defined(PSP)
+static u32 gPspLastPresentVcount;
+static ZunBool gPspHasPresented;
+
+#if defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+static void DrawPspGoIoActivityLamp()
+{
+    const psp::IoActivityLampState state = psp::IoActivityLampQuery();
+    if (state == psp::IoActivityLampState::Off)
+        return;
+
+    // Draw last, after all queued game vertices have been flushed.  The
+    // rectangle lives in the top-right border and does not cover the 384x448
+    // playfield.  Opaque amber is ordinary/recent I/O; red is a >=100 ms
+    // operation latched after it returns (a main-thread stall cannot redraw
+    // while the syscall itself is blocked).
+    g_Supervisor.viewport.X = 0;
+    g_Supervisor.viewport.Y = 0;
+    g_Supervisor.viewport.Width = 640;
+    g_Supervisor.viewport.Height = 480;
+    g_Supervisor.viewport.MinZ = 0.0f;
+    g_Supervisor.viewport.MaxZ = 1.0f;
+    g_Supervisor.d3dDevice->SetViewport(&g_Supervisor.viewport);
+
+    ZunRect rect;
+    rect.left = 616.0f;
+    rect.top = 4.0f;
+    rect.right = 636.0f;
+    rect.bottom = 16.0f;
+    const D3DCOLOR color =
+        state == psp::IoActivityLampState::Slow ? 0xffff3030U : 0xffffb000U;
+    ScreenEffect::DrawSquare(&rect, color);
+}
+#endif
+
+static void WaitForPspRenderCadence(u8 simulatedTicksCovered)
+{
+#if TH08_PSP_SWAP_NOWAIT_ENABLED
+    // TH08_PSP_SWAP_NOWAIT: PSPGL no longer waits for the final VBlank, so
+    // this wait owns all `covered` 60 Hz intervals since the last Present.
+    // A late frame (already past them) never waits here.
+    if (!gPspHasPresented || simulatedTicksCovered == 0)
+        return;
+    const u32 requiredElapsedVblanks =
+        static_cast<u32>(simulatedTicksCovered);
+#else
+    if (!gPspHasPresented || simulatedTicksCovered <= 1)
+        return;
+
+    // PSPGL's SwapWindow waits for the final VBlank.  Ensure the other
+    // (covered - 1) 60 Hz intervals have elapsed first, without adding waits
+    // when drawing itself already crossed them.  Unsigned subtraction keeps
+    // this correct across the display-vcount wrap.
+    const u32 requiredElapsedVblanks =
+        static_cast<u32>(simulatedTicksCovered - 1U);
+#endif
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+    psp::PerfAttributionWaitContextScope waitContext(
+        psp::PerfAttributionWaitContext::Cadence);
+#endif
+    while (static_cast<u32>(sceDisplayGetVcount() - gPspLastPresentVcount) <
+           requiredElapsedVblanks)
+    {
+        sceDisplayWaitVblankStart();
+    }
+}
+
+static void MarkPspRenderPresented()
+{
+    gPspLastPresentVcount = sceDisplayGetVcount();
+    gPspHasPresented = true;
+}
+#endif
 }; // namespace th08
 
 using namespace th08;
@@ -92,13 +188,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR pCmdLine
     i32 i;
     MSG msg;
     i32 renderResult;
+#if defined(PSP)
+    bool pspEnteredMainLoop = false;
+#endif
 
     renderResult = RENDER_RESULT_KEEP_RUNNING;
 
+    TH08_PSP_BOOT_CHECKPOINT("replay_audit", "before_initialize", 0);
+#if defined(TH08_REPLAY_SYNC_AUDIT)
+    ReplaySyncAudit::InitializeRuntime();
+    TH08_PSP_BOOT_CHECKPOINT("replay_audit", "after_initialize", 1);
+#else
+    TH08_PSP_BOOT_CHECKPOINT("replay_audit", "disabled", 0);
+#endif
+
 #ifdef TH08_MODERN_PORT
+    TH08_PSP_BOOT_CHECKPOINT("runtime_data", "before_install_crash_reporter", 0);
     modern::InstallCrashReporter();
+    TH08_PSP_BOOT_CHECKPOINT("runtime_data", "after_install_crash_reporter", 0);
+    TH08_PSP_BOOT_CHECKPOINT("configure_data", "before", 0);
     if (!modern::ConfigureDataDirectory())
+    {
+        TH08_PSP_BOOT_CHECKPOINT("configure_data", "after", 0);
         return EXIT_FAILURE;
+    }
+    TH08_PSP_BOOT_CHECKPOINT("configure_data", "after", 1);
 #endif
 
     g_Supervisor.hInstance = hInstance;
@@ -113,40 +227,77 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR pCmdLine
     g_Supervisor.InitializeCriticalSections();
     g_GameErrorContext.Log(TH_ERR_LOGGER_START);
 
-    if (GameWindow::CheckForRunningGameInstance(hInstance) == ZUN_ERROR)
     {
-        goto stop;
+        TH08_PSP_BOOT_CHECKPOINT("instance_check", "before", 0);
+        const ZunResult instanceResult =
+            GameWindow::CheckForRunningGameInstance(hInstance);
+        TH08_PSP_BOOT_CHECKPOINT("instance_check", "after", instanceResult);
+        if (instanceResult == ZUN_ERROR)
+        {
+            goto stop;
+        }
     }
 
-    if (g_Supervisor.LoadConfig("th08.cfg") != ZUN_SUCCESS)
     {
-        goto stop;
+        TH08_PSP_BOOT_CHECKPOINT("load_config", "before", 0);
+        const ZunResult configResult = g_Supervisor.LoadConfig("th08.cfg");
+        TH08_PSP_BOOT_CHECKPOINT("load_config", "after", configResult);
+        if (configResult != ZUN_SUCCESS)
+        {
+            goto stop;
+        }
     }
 
     GameWindow::CalcExecutableChecksum();
     QueryPerformanceFrequency(&g_GameWindow.pcFrequency);
 
 restart:
-    if (GameWindow::InitD3DInterface())
     {
-        goto stop;
+        TH08_PSP_BOOT_CHECKPOINT("d3d_interface", "before", 0);
+        const ZunBool initFailed = GameWindow::InitD3DInterface();
+        TH08_PSP_BOOT_CHECKPOINT("d3d_interface", "after", initFailed);
+        if (initFailed)
+        {
+            goto stop;
+        }
     }
 
-    if (GameWindow::CreateGameWindow(hInstance))
     {
-        goto stop;
+        TH08_PSP_BOOT_CHECKPOINT("game_window", "before_create", 0);
+        const ZunBool createFailed = GameWindow::CreateGameWindow(hInstance);
+        TH08_PSP_BOOT_CHECKPOINT("game_window", "after_create", createFailed);
+        if (createFailed)
+        {
+            goto stop;
+        }
     }
 
-    if (GameWindow::InitD3DRendering())
     {
-        goto stop;
+        TH08_PSP_BOOT_CHECKPOINT("d3d_rendering", "before_initialize", 0);
+        const ZunBool renderInitFailed = GameWindow::InitD3DRendering();
+        TH08_PSP_BOOT_CHECKPOINT("d3d_rendering", "after_initialize",
+                                 renderInitFailed);
+        if (renderInitFailed)
+        {
+            goto stop;
+        }
     }
 
-    g_SoundPlayer.InitializeDSound(g_GameWindow.window);
+    TH08_PSP_BOOT_CHECKPOINT("sound", "before_initialize", 0);
+    {
+        const ZunResult soundResult =
+            g_SoundPlayer.InitializeDSound(g_GameWindow.window);
+        TH08_PSP_BOOT_CHECKPOINT("sound", "after_initialize", soundResult);
+    }
+    TH08_PSP_BOOT_CHECKPOINT("controller", "before_initialize", 0);
     Controller::GetJoystickCaps();
     Controller::ResetKeyboard();
+    TH08_PSP_BOOT_CHECKPOINT("controller", "after_initialize", 0);
 
+    TH08_PSP_BOOT_CHECKPOINT("anm_manager", "before_allocate", 0);
     g_AnmManager = ZUN_NEW(AnmManager, "SprtCtrlInf");
+    TH08_PSP_BOOT_CHECKPOINT("anm_manager", "after_allocate",
+                             g_AnmManager != NULL ? 1 : 0);
 
     if (!g_Supervisor.IsWindowed())
     {
@@ -155,7 +306,9 @@ restart:
         SetCursor(NULL);
     }
 
+    TH08_PSP_BOOT_CHECKPOINT("supervisor_chain", "before_register", 0);
     renderResult = Supervisor::RegisterChain();
+    TH08_PSP_BOOT_CHECKPOINT("supervisor_chain", "after_register", renderResult);
 
     if (renderResult != RENDER_RESULT_KEEP_RUNNING)
     {
@@ -170,13 +323,37 @@ restart:
     else
     {
         renderResult = RENDER_RESULT_KEEP_RUNNING;
+#if defined(PSP)
+        pspEnteredMainLoop = true;
+#endif
+        TH08_PSP_BOOT_CHECKPOINT("main_loop", "entered", 0);
 
         g_GameWindow.framesSinceRedraw = -4;
+#if defined(PSP)
+        psp::ResetRenderCadence(psp::PlatformSelectButtonDown());
+        gPspLastPresentVcount = 0;
+        gPspHasPresented = false;
+        const u8 initialCadenceMode = psp::InitialRenderCadenceMode();
+        const u8 initialCadenceDivisor =
+            static_cast<u8>(initialCadenceMode + 1U);
+        psp::BootLog(
+            "RENDER_CADENCE init_mode=%u mode=%u divisor=%u "
+            "target_draw_fps=%u simulation_target_hz=60 "
+            "select_out_of_band=1 select_edge_count=0\n",
+            static_cast<unsigned int>(initialCadenceMode),
+            static_cast<unsigned int>(psp::CurrentRenderCadenceMode()),
+            static_cast<unsigned int>(initialCadenceDivisor),
+            static_cast<unsigned int>(60U / initialCadenceDivisor));
+#endif
         g_GameWindow.lastFrameTime = 0;
         g_GameWindow.lastTimestamp = g_GameWindow.lastFrameTime;
         g_GameWindow.curTimestamp = g_GameWindow.lastTimestamp;
 
-        while (!g_GameWindow.windowIsClosing)
+        while (!g_GameWindow.windowIsClosing
+#if defined(PSP)
+               && psp::PlatformRunning()
+#endif
+        )
         {
             if (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE))
             {
@@ -213,6 +390,18 @@ restart:
                 }
             }
         }
+#if defined(PSP)
+        psp::BootLog(
+            "RENDER_CADENCE_SUMMARY initial_mode=%u final_mode=%u "
+            "select_edge_count=%lu\n",
+            static_cast<unsigned int>(psp::InitialRenderCadenceMode()),
+            static_cast<unsigned int>(psp::CurrentRenderCadenceMode()),
+            static_cast<unsigned long>(psp::RenderCadenceSelectEdgeCount()));
+        if (!psp::PlatformRunning())
+        {
+            TH08_PSP_BOOT_CHECKPOINT("main_loop", "platform_exit_observed", 0);
+        }
+#endif
     }
 
 awfulConditionalBreak:
@@ -227,6 +416,7 @@ awfulConditionalBreak:
         ;
 
 stop:
+    TH08_PSP_BOOT_CHECKPOINT("winmain_cleanup", "entered", renderResult);
     Sleep(1000);
 
     g_SoundPlayer.Release();
@@ -293,6 +483,9 @@ stop:
         g_Supervisor.midiOutput = NULL;
     }
 
+#if defined(TH08_REPLAY_SYNC_AUDIT)
+    ReplaySyncAudit::FlushAtShutdown();
+#endif
     g_GameErrorContext.Flush();
     g_Supervisor.DeleteCriticalSections();
 
@@ -301,13 +494,38 @@ stop:
     SystemParametersInfoA(SPI_SETPOWEROFFACTIVE, g_GameWindow.powerOffActive, NULL, SPIF_SENDCHANGE);
     WINNLSEnableIME(NULL, TRUE);
 
+#if defined(PSP)
+    const int processResult = pspEnteredMainLoop ? EXIT_SUCCESS : EXIT_FAILURE;
+    TH08_PSP_BOOT_CHECKPOINT("winmain_cleanup", "return", processResult);
+    return processResult;
+#else
     return 0;
+#endif
 }
 
+#if TH08_PSP_PERF_ENV_ENABLED
+// Exit time of the previous Render call: the gap to the next entry is the
+// outer loop (PeekMessage/SDL pump), PERF_ENV slot 4.
+static std::uint64_t gPspRenderExitUs = 0U;
+#endif
 RenderResult GameWindow::Render()
 {
     i32 calcChainResult;
+#if defined(PSP)
+    psp::RenderCadenceTickResult cadenceResult{};
+    ZunBool shouldDraw = false;
+#endif
 
+#if TH08_PSP_PERF_ENV_ENABLED
+    const std::uint64_t pspLoopHeadStartUs =
+        static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
+    if (gPspRenderExitUs != 0U && pspLoopHeadStartUs >= gPspRenderExitUs)
+        psp::PerfEnvNoteMain(4U, pspLoopHeadStartUs - gPspRenderExitUs);
+#endif
+#if TH08_PSP_SWAP_TRIPLE_ENABLED
+    // Issue the previous frame's flip as soon as its display lists are done.
+    psp::SwapTriplePoll();
+#endif
     this->curTimestamp = this->GetTimestamp();
 
     // Safeguard in case of timestamp overflow or other weirdness
@@ -318,7 +536,12 @@ RenderResult GameWindow::Render()
 
     this->lastTimestamp = this->curTimestamp;
 
+#if TH08_PSP_TICK_GATE_BYPASS_ENABLED
+    // The PSP render cadence paces the loop; never spin on the 1/60 gate.
+    if (true)
+#else
     if (this->lastFrameTime < this->curTimestamp)
+#endif
     {
 
         while (this->lastFrameTime < this->curTimestamp)
@@ -335,8 +558,38 @@ RenderResult GameWindow::Render()
 
         g_Supervisor.d3dDevice->SetViewport(&g_Supervisor.viewport);
 
+#if TH08_PSP_PERF_ENV_ENABLED
+        psp::PerfEnvNoteMain(2U, static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - pspLoopHeadStartUs);
+#endif
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+        {
+            psp::PerfAttributionScope calcScope(
+                psp::PerfAttributionPhase::CalcChain);
+            calcChainResult = g_Chain.RunCalcChain();
+        }
+#else
         calcChainResult = g_Chain.RunCalcChain();
+#endif
+#if defined(PSP)
+#if TH08_PSP_PERF_ENV_ENABLED
+        {
+            const std::uint64_t t0 = static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
+            th08::psp::MemoryTelemetrySampleGameFrame();
+            psp::PerfEnvNoteMain(1U, static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - t0);
+        }
+#else
+        th08::psp::MemoryTelemetrySampleGameFrame();
+#endif
+#endif
+#if TH08_PSP_PERF_ENV_ENABLED
+        {
+            const std::uint64_t t0 = static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
+            g_SoundPlayer.ProcessQueues();
+            psp::PerfEnvNoteMain(0U, static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - t0);
+        }
+#else
         g_SoundPlayer.ProcessQueues();
+#endif
 
         if (calcChainResult == 0)
         {
@@ -349,29 +602,128 @@ RenderResult GameWindow::Render()
             return RENDER_RESULT_EXIT_ERROR;
         }
 
+#if defined(PSP)
+        // Preserve the retail four-tick startup delay, then drive rendering
+        // from a PSP-only cadence.  The physical SELECT level never enters
+        // g_CurFrameInput, replay bytes, demo cancellation, or RNG state.
+#if TH08_PSP_PERF_ENV_ENABLED
+        const std::uint64_t pspCadenceTickStartUs =
+            static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
+#endif
+        if (this->framesSinceRedraw < -1)
+        {
+            this->framesSinceRedraw++;
+        }
+        else
+        {
+            this->framesSinceRedraw = 0;
+            cadenceResult =
+                psp::TickRenderCadence(psp::PlatformSelectButtonDown());
+            shouldDraw = cadenceResult.draw;
+            if (cadenceResult.modeChanged)
+            {
+                psp::BootLog(
+                    "RENDER_CADENCE select_edge_count=%lu mode=%u divisor=%u "
+                    "target_draw_fps=%u simulation_target_hz=60 "
+                    "select_out_of_band=1\n",
+                    static_cast<unsigned long>(
+                        psp::RenderCadenceSelectEdgeCount()),
+                    static_cast<unsigned int>(cadenceResult.mode),
+                    static_cast<unsigned int>(cadenceResult.divisor),
+                    static_cast<unsigned int>(60U / cadenceResult.divisor));
+            }
+        }
+#if TH08_PSP_PERF_ENV_ENABLED
+        psp::PerfEnvNoteMain(7U, static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - pspCadenceTickStartUs);
+#endif
+
+        if (shouldDraw)
+#else
         this->framesSinceRedraw++;
 
         if (g_Supervisor.cfg.frameskipConfig <= this->framesSinceRedraw)
+#endif
         {
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+            psp::PerfAttributionScope drawFrameScope(
+                psp::PerfAttributionPhase::DrawFrame);
+#endif
             g_Supervisor.d3dDevice->BeginScene();
             g_AnmManager->ClearVertexBuffer();
             g_Supervisor.fogState = FOG_UNSET;
             g_Supervisor.DisableFog();
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+            {
+                psp::PerfAttributionScope drawScope(
+                    psp::PerfAttributionPhase::DrawChain);
+                g_Chain.RunDrawChain();
+            }
+#else
             g_Chain.RunDrawChain();
+#endif
             g_AnmManager->FlushVertexBuffer();
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+            DrawPspGoIoActivityLamp();
+#endif
             g_Supervisor.d3dDevice->SetTexture(0, NULL);
             g_Supervisor.d3dDevice->EndScene();
+#if !defined(PSP)
             this->framesSinceRedraw = 0;
+#endif
         }
 
         this->curTimestamp = this->GetTimestamp();
+#if defined(PSP)
+        if (shouldDraw)
+        {
+            WaitForPspRenderCadence(cadenceResult.simulatedTicksCovered);
+            Present();
+#if TH08_PSP_PERF_ENV_ENABLED
+            const std::uint64_t pspPostPresentStartUs =
+                static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
+#endif
+            MarkPspRenderPresented();
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+            psp::PerfAttributionAfterPresent(
+                static_cast<std::int32_t>(g_GameManager.currentStage),
+                static_cast<std::uint32_t>(g_GameManager.stageActiveFrames),
+                cadenceResult.mode, g_GameManager.flags.isReplay != 0,
+                g_GameManager.currentDemoReplay);
+#endif
+#if TH08_PSP_PERF_ENV_ENABLED
+            psp::PerfEnvNoteMain(6U, static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - pspPostPresentStartUs);
+#endif
+        }
+
+        // This counter is shared by loading/dialogue/spell presentation but
+        // is a game-tick value.  It must not slow down with 1/2 or 1/3 draws.
+        if (g_Supervisor.screenTransitionCountdown != 0 &&
+            !g_GameManager.isInGameMenu)
+        {
+            g_Supervisor.screenTransitionCountdown--;
+        }
+#else
         Present();
+#endif
     }
     else
     {
+#if TH08_PSP_PERF_ENV_ENABLED
+        {
+            const std::uint64_t t0 = static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
+            Sleep(0);
+            const std::uint64_t t1 = static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
+            psp::PerfEnvNoteMain(3U, t1 - t0);
+            psp::PerfEnvNoteMain(5U, t1 - pspLoopHeadStartUs);
+        }
+#else
         Sleep(0);
+#endif
     }
 
+#if TH08_PSP_PERF_ENV_ENABLED
+    gPspRenderExitUs = static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
+#endif
     return RENDER_RESULT_KEEP_RUNNING;
 }
 
@@ -380,6 +732,18 @@ void GameWindow::Present()
 {
     i32 i;
     char snapshotPath[0x100];
+
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+    psp::PerfAttributionScope presentScope(
+        psp::PerfAttributionPhase::PresentOuter);
+#endif
+
+#if defined(PSP)
+    // Capture the complete frame that was just drawn.  After Present(), PSPGL
+    // has already switched to the next draw buffer, so reading there captures
+    // uninitialized/partial scanlines instead of the loading-transition image.
+    g_AnmManager->TakeScreencaptures();
+#endif
 
     if (g_Supervisor.d3dDevice->Present(NULL, NULL, NULL, NULL) < 0)
     {
@@ -390,7 +754,9 @@ void GameWindow::Present()
         g_Supervisor.screenTransitionCountdown = 2;
     }
 
+#if !defined(PSP)
     g_AnmManager->TakeScreencaptures();
+#endif
 
     if (WAS_PRESSED(TH_BUTTON_HOME))
     {
@@ -412,10 +778,12 @@ void GameWindow::Present()
         }
     }
 
+#if !defined(PSP)
     if (g_Supervisor.screenTransitionCountdown != 0 && !g_GameManager.isInGameMenu)
     {
         g_Supervisor.screenTransitionCountdown--;
     }
+#endif
 }
 
 #pragma var_order(performanceCounterValue, timestamp)
@@ -636,6 +1004,14 @@ ZunBool GameWindow::InitD3DRendering()
         presentParams.SwapEffect = D3DSWAPEFFECT_COPY;
         presentParams.Windowed = TRUE;
     }
+
+#if defined(PSP)
+    // PSPGL's display surface is RGB565.  Keep the logical D3D backbuffer in
+    // that same format so a transition capture does not retain three separate
+    // 1.2 MiB X8R8G8B8 copies of the 640x480 frame in main RAM.
+    presentParams.BackBufferFormat = D3DFMT_R5G6B5;
+    g_Supervisor.cfg.colorMode16bit = TRUE;
+#endif
 
     presentParams.BackBufferWidth = GAME_WINDOW_WIDTH;
     presentParams.BackBufferHeight = GAME_WINDOW_HEIGHT;

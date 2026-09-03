@@ -39,7 +39,20 @@ reccmp-build.yml
 *.d
 *.elf
 *.prx
+!/deps/ge4wrap_texv1.prx
 *.PBP
 /PARAM.SFO
 /TH08PSP.map
 /.build-profile-*
+
+# Native PSP link products and stray local artifacts (never publish).
+/EBOOT.PBP
+/PARAM.SFO
+/ge4wrap_texv1.prx
+/*.PBP
+/*.map
+/*.log
+/*.LOG
+/NUL
+/CLAUDE.md
+/build-proof/

@@ -22,7 +22,11 @@ namespace th08
 {
 
 extern i32 InitializeScoreData();
+#if defined(PSP)
+#define g_GuiMessageStageMode g_Background.spellVmScriptBase
+#else
 extern i32 g_GuiMessageStageMode;
+#endif
 extern i32 g_TimeRequirementParams[][4];
 
 #define GM_FLAGS_WORD(gm) (*reinterpret_cast<u32 *>(&(gm)->flags))

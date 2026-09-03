@@ -39,6 +39,9 @@ class TextHelper
     bool CopyTextToSurface(IDirect3DSurface8 *outSurface);
 
     static void CreateTextBuffer();
+#if defined(PSP)
+    static bool IsTextBufferReady();
+#endif
     static void ReleaseTextBuffer();
     static void RenderTextToTextureBold(i32 xPos, i32 yPos, i32 spriteWidth, i32 spriteHeight, i32 fontHeight,
                                         i32 fontWidth, COLORREF textColor, COLORREF outlineType, const char *string,

@@ -1,0 +1,141 @@
+diff --git a/glDrawElements.c b/glDrawElements.c
+index a0695fe..28ebed5 100644
+--- a/glDrawElements.c
++++ b/glDrawElements.c
+@@ -7,6 +7,14 @@ int __pspgl_th08_draw_native_indexed_triangles(
+ 	const unsigned short *indices, unsigned index_bytes,
+ 	unsigned index_count);
+ 
++int __pspgl_th08_draw_native_mixed_quads(
++	const void *pair_vertices, unsigned pair_vertex_bytes,
++	const void *quad_vertices, unsigned quad_vertex_bytes,
++	unsigned quad_count,
++	const unsigned short *quad_indices, unsigned quad_index_bytes,
++	unsigned quad_index_count);
++
++
+ static int th08_native_range_valid(const void *address, unsigned bytes,
+ 				   unsigned alignment)
+ {
+@@ -68,6 +76,121 @@ int __pspgl_th08_draw_native_indexed_triangles(
+ }
+ 
+ 
++/* TH08-private atomic no-copy submit for one contiguous compatibility run.
++ *
++ * The run consists of an optional 2-vertex GE_SPRITES prefix followed by an
++ * optional 4-vertex indexed-quad suffix.  Both halves are preflighted before
++ * either primitive is emitted, so a rejected suffix cannot leave the prefix
++ * partially submitted.  The caller owns every range until the present fence.
++ * In particular, quad_indices is a prevalidated immutable index authority.
++ */
++int __pspgl_th08_draw_native_mixed_quads(
++	const void *pair_vertices, unsigned pair_vertex_bytes,
++	const void *quad_vertices, unsigned quad_vertex_bytes,
++	unsigned quad_count,
++	const unsigned short *quad_indices, unsigned quad_index_bytes,
++	unsigned quad_index_count)
++{
++	const unsigned vertex_stride = 24;
++	const unsigned sprite_vertex_format =
++		GE_TEXTURE_32BITF | GE_COLOR_8888 | GE_VERTEX_32BITF |
++		GE_TRANSFORM_3D;
++	const unsigned indexed_vertex_format =
++		GE_TEXTURE_32BITF | GE_COLOR_8888 | GE_VERTEX_32BITF |
++		GE_TRANSFORM_3D | GE_VINDEX_16BIT;
++	const unsigned uint_max = ~0u;
++	const int has_pairs = pair_vertex_bytes != 0;
++	const int has_quads = quad_count != 0;
++	unsigned pair_vertex_count = 0;
++	unsigned quad_vertex_count = 0;
++	unsigned expected_quad_vertex_bytes = 0;
++	unsigned expected_quad_index_count = 0;
++	unsigned expected_quad_index_bytes = 0;
++
++	/* Preflight the complete operation before touching either range or
++	 * emitting either primitive.  PSPGL remains the current-list/state owner. */
++	if (pspgl_curctx == NULL || pspgl_curctx->draw == NULL ||
++	    pspgl_curctx->draw->draw == NULL ||
++	    *pspgl_curctx->draw->draw == NULL || __pspgl_actuallist != NULL)
++		return 0;
++	if ((pair_vertices == NULL) != (pair_vertex_bytes == 0))
++		return 0;
++	if (!has_pairs && !has_quads)
++		return 0;
++
++	if (has_pairs) {
++		if (!th08_native_range_valid(pair_vertices, pair_vertex_bytes,
++					     sizeof(float)) ||
++		    (pair_vertex_bytes % vertex_stride) != 0)
++			return 0;
++		pair_vertex_count = pair_vertex_bytes / vertex_stride;
++		if (pair_vertex_count == 0 || pair_vertex_count > 0xffffu ||
++		    (pair_vertex_count % 2u) != 0)
++			return 0;
++	}
++
++	if (!has_quads) {
++		if (quad_vertices != NULL || quad_vertex_bytes != 0 ||
++		    quad_indices != NULL || quad_index_bytes != 0 ||
++		    quad_index_count != 0)
++			return 0;
++	} else {
++		/* Guard every product before evaluating it. */
++		if (quad_count > uint_max / 4u ||
++		    quad_count > uint_max / (4u * vertex_stride) ||
++		    quad_count > uint_max / 6u)
++			return 0;
++		quad_vertex_count = quad_count * 4u;
++		expected_quad_vertex_bytes =
++			quad_vertex_count * vertex_stride;
++		expected_quad_index_count = quad_count * 6u;
++		if (expected_quad_index_count >
++		    uint_max / (unsigned)sizeof(*quad_indices))
++			return 0;
++		expected_quad_index_bytes = expected_quad_index_count *
++			(unsigned)sizeof(*quad_indices);
++
++		if (!th08_native_range_valid(quad_vertices, quad_vertex_bytes,
++					     sizeof(float)) ||
++		    !th08_native_range_valid(quad_indices, quad_index_bytes,
++					     sizeof(*quad_indices)))
++			return 0;
++		if ((quad_vertex_bytes % vertex_stride) != 0 ||
++		    quad_vertex_bytes != expected_quad_vertex_bytes ||
++		    quad_vertex_count == 0 || quad_vertex_count > 0x10000u ||
++		    (quad_vertex_count % 4u) != 0)
++			return 0;
++		if (quad_index_count == 0 || quad_index_count > 0xffffu ||
++		    (quad_index_count % 3u) != 0 ||
++		    (quad_index_count % 6u) != 0 ||
++		    quad_index_count != expected_quad_index_count ||
++		    quad_index_bytes != expected_quad_index_bytes)
++			return 0;
++	}
++
++	/* All rejection paths end above.  Write back every live caller-owned range
++	 * before emitting the two halves in their original prefix/suffix order. */
++	if (has_pairs)
++		sceKernelDcacheWritebackRange(pair_vertices, pair_vertex_bytes);
++	if (has_quads) {
++		sceKernelDcacheWritebackRange(quad_vertices, quad_vertex_bytes);
++		sceKernelDcacheWritebackRange(quad_indices, quad_index_bytes);
++	}
++
++	if (has_pairs)
++		__pspgl_context_render_prim(pspgl_curctx, GE_SPRITES,
++					    pair_vertex_count,
++					    sprite_vertex_format,
++					    pair_vertices, NULL);
++	if (has_quads)
++		__pspgl_context_render_prim(pspgl_curctx, GE_TRIANGLES,
++					    quad_index_count,
++					    indexed_vertex_format,
++					    quad_vertices, quad_indices);
++	return 1;
++}
++
++
+ void glDrawElements (GLenum mode, GLsizei count, GLenum type, const GLvoid *indices)
+ {
+ 	__pspgl_varray_draw_elts(mode, type, indices, count);

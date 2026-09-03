@@ -17,9 +17,21 @@ namespace th08
 {
 ZunBool IsDisableResourceReload();
 DIFFABLE_STATIC(Spellcard, g_Spellcard);
+#if defined(PSP)
+// The retail image overlays this symbol with
+// g_Spellcard.lifetimeObject (0x004ea670 + 0x263c == 0x004eccac).
+// A normal PSP link gives separately declared globals distinct storage, so
+// preserve the original ownership alias explicitly.  Otherwise CutChain()
+// observes a permanently-null pointer and the face ANMs survive the stage.
+ChainElem *&g_SpellcardCalcChain = g_Spellcard.lifetimeObject;
+#else
 DIFFABLE_STATIC(ChainElem *, g_SpellcardCalcChain);
+#endif
 DIFFABLE_STATIC(i32, g_LastSpellCount);
-#ifdef TH08_PORTABLE_NATIVE_LAYOUT
+#if defined(TH08_PORTABLE_NATIVE_LAYOUT) || defined(PSP)
+// This is another retail overlap: EffectManager::stageEffectAnm occupies the
+// address exported as g_SpellcardBackgroundAnm.  Keep it an alias on PSP so
+// spell-background scripts never read an unrelated null BSS slot.
 #define g_SpellcardBackgroundAnm g_EffectManager.stageEffectAnm
 #else
 DIFFABLE_STATIC(AnmLoaded *, g_SpellcardBackgroundAnm);
@@ -397,7 +409,11 @@ Spellcard::Spellcard()
 }
 
 
+#if defined(PSP)
+#define g_GuiFullPowerModeFrames g_Supervisor.screenTransitionCountdown
+#else
 DIFFABLE_EXTERN(i32, g_GuiFullPowerModeFrames);
+#endif
 
 // FUNCTION: th08 0x4144d0
 #pragma var_order(difficulty, i)
@@ -1696,6 +1712,7 @@ ZunResult Spellcard::DeletedCallback(Spellcard *spellcard)
     if (spellcard->lifetimeObject != NULL)
     {
         spellcard->lifetimeObject->deletedCallback = NULL;
+        spellcard->lifetimeObject = NULL;
     }
     g_Chain.Cut(spellcard->lifetimeChain);
     spellcard->lifetimeChain = NULL;
