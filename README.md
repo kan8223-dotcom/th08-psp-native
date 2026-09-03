@@ -7,6 +7,8 @@ PSPのGE（グラフィックス）／SC（メインCPU）向けに移植した�
 **Unofficial native PSP port of Touhou 8 (Imperishable Night).** Runs the original game logic natively on
 PSP-2000 / PSP-3000 / PSP Go (64 MB models). Not an emulator: it is a port of the PC decompilation to the PSP's GE and main CPU.
 
+> **Note:** This port is based on an AI-generated decompilation of TH08 that is not affiliated with or endorsed by Gensokyo Club. Gensokyo Club does not provide any support for this project. For the community-maintained decompilation, please refer to the official Gensokyo Club repositories.
+
 > 2026-09-04 時点の状態 / Status as of 2026-09-04
 > - 実機（PSP-3000, 333 MHz）で **1面がプレイ可能**。内蔵デモプレイ4本は最後まで完走します。
 > - 60 Hz simulation × 30描画（SELECTで60/30/20描画を切替）。1面道中で約47〜58 sim fps、5面デモで約54 sim fps。
