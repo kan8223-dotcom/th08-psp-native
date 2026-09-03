@@ -1,10 +1,10 @@
 # th08-psp-native — 東方永夜抄 ～ Imperishable Night, native PSP port
 
-**世界初の、東方永夜抄（TH08）PSPネイティブ移植です。** PSP-2000 / PSP-3000 / PSP Go（メインメモリ64MB機）で、
+**東方永夜抄（TH08）の非公式PSPネイティブ移植です。** PSP-2000 / PSP-3000 / PSP Go（メインメモリ64MB機）で、
 原作のゲームロジックをそのままPSP上で走らせます。エミュレーションではなく、PC版のデコンパイル（[GensokyoClub/th08](https://github.com/GensokyoClub/th08) と、そこから枝分かれした [N0zoM1z0/th08](https://github.com/N0zoM1z0/th08)）を
 PSPのGE（グラフィックス）／SC（メインCPU）向けに移植したものです。
 
-**The world's first native PSP port of Touhou 8 (Imperishable Night).** Runs the original game logic natively on
+**Unofficial native PSP port of Touhou 8 (Imperishable Night).** Runs the original game logic natively on
 PSP-2000 / PSP-3000 / PSP Go (64 MB models). Not an emulator: it is a port of the PC decompilation to the PSP's GE and main CPU.
 
 > 2026-09-04 時点の状態 / Status as of 2026-09-04
