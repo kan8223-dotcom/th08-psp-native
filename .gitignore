@@ -56,3 +56,6 @@ reccmp-build.yml
 /NUL
 /CLAUDE.md
 /build-proof/
+
+# Upstream PC-decompilation CI is not applicable to the PSP port.
+/.github/workflows/
