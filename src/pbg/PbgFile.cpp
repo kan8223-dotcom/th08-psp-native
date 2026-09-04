@@ -1,6 +1,9 @@
 #include "th_pch.h"
 
 #include "pbg/PbgFile.hpp"
+#if defined(PSP)
+#include "psp/fileio.hpp"
+#endif
 
 namespace th08
 {
@@ -10,6 +13,7 @@ DIFFABLE_STATIC_ARRAY_ASSIGN(char *, 3, g_PbgFileOpenModes) = {"r", "w", "a"};
 CPbgFile::CPbgFile()
 {
     m_hFile = INVALID_HANDLE_VALUE;
+    m_CachedSize = static_cast<DWORD>(-1);
     m_DesiredAccess = 0;
 }
 
@@ -21,6 +25,7 @@ CPbgFile::~CPbgFile()
 #pragma var_order(curMode, goToEnd, filePathBuffer, creationDisposition)
 bool CPbgFile::Open(const char *filename, char *mode)
 {
+    m_CachedSize = static_cast<DWORD>(-1);
     DWORD creationDisposition;
     BOOL goToEnd = FALSE;
     char filePathBuffer[MAX_PATH];
@@ -87,6 +92,7 @@ void CPbgFile::Close()
     {
         CloseHandle(m_hFile);
         m_hFile = INVALID_HANDLE_VALUE;
+    m_CachedSize = static_cast<DWORD>(-1);
         m_DesiredAccess = 0;
     }
 }
@@ -101,11 +107,16 @@ DWORD CPbgFile::Read(LPVOID data, DWORD dataLen)
     }
 
     ReadFile(m_hFile, data, dataLen, &numBytesRead, NULL);
+#if defined(PSP)
+    if (numBytesRead != dataLen)
+        th08::psp::BootLog("ARCHIVE_SHORT_READ requested=%lu got=%lu\n", static_cast<unsigned long>(dataLen), static_cast<unsigned long>(numBytesRead));
+#endif
     return numBytesRead;
 }
 
 bool CPbgFile::Write(LPVOID data, DWORD dataLen)
 {
+    m_CachedSize = static_cast<DWORD>(-1);
     DWORD outWritten = 0;
 
     if (m_DesiredAccess != GENERIC_WRITE)
@@ -134,7 +145,11 @@ DWORD CPbgFile::GetSize()
         return 0;
     }
 
-    return GetFileSize(m_hFile, NULL);
+    if (m_CachedSize == static_cast<DWORD>(-1))
+    {
+        m_CachedSize = GetFileSize(m_hFile, NULL);
+    }
+    return m_CachedSize;
 }
 
 bool CPbgFile::Seek(DWORD offset, DWORD seekFrom)

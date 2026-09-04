@@ -59,3 +59,8 @@ reccmp-build.yml
 
 # Upstream PC-decompilation CI is not applicable to the PSP port.
 /.github/workflows/
+
+# io_probe build products (source only is tracked).
+/tools/io_probe/*.PBP
+/tools/io_probe/*.prx
+/tools/io_probe/PARAM.SFO

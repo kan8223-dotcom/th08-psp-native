@@ -19,6 +19,11 @@
 #include "font_glyph_cache_policy.hpp"
 #if defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
 #include "io_activity_lamp.hpp"
+#include "io_serialize.hpp"
+#include "io_bounce_high.hpp"
+#include "font_stream_cache.hpp"
+#include "debug_start_stage.hpp"
+#include "render_resource_arena.hpp"
 #endif
 #include "newlib_heap_geometry.hpp"
 #else
@@ -54,20 +59,39 @@ struct LinuxHandle
     HandleKind kind;
 };
 
+#if TH08_PSP_IO_BOUNCE_HIGH_ENABLED
+// Staging buffer inside the module image (always below the extended region).
+constexpr uintptr_t kPspExtendedMemoryBase = 0x0A000000u;
+constexpr DWORD kPspIoBounceBytes = 64u * 1024u;
+static BYTE gPspIoBounce[kPspIoBounceBytes] __attribute__((aligned(64)));
+#endif
 struct FileHandle : LinuxHandle
 {
-    explicit FileHandle(int value) : LinuxHandle(HANDLE_FILE), fd(value) {}
+    explicit FileHandle(int value) : LinuxHandle(HANDLE_FILE), fd(value)
+    {
+        pathTail[0] = '\0';
+    }
+    // Last bytes of the resolved path so slow-I/O records name the file.
+    void TagPath(const char *path)
+    {
+        if (path == NULL) { pathTail[0] = '\0'; return; }
+        const size_t length = strlen(path);
+        const size_t keep = length < sizeof(pathTail) - 1 ? length : sizeof(pathTail) - 1;
+        memcpy(pathTail, path + (length - keep), keep);
+        pathTail[keep] = '\0';
+    }
     ~FileHandle()
     {
         if (fd < 0)
             return;
 #if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
         th08::psp::IoActivityScope ioActivity(
-            th08::psp::IoActivityKind::Close);
+            th08::psp::IoActivityKind::Close, pathTail);
 #endif
         close(fd);
     }
     int fd;
+    char pathTail[40];
 };
 
 struct ThreadHandle : LinuxHandle
@@ -323,6 +347,270 @@ bool PspSubsetAuthorityMatchesRuntimeConverter()
     return compatible;
 }
 
+#if TH08_PSP_IO_SERIALIZE_ENABLED
+// SDL_ttf/FreeType stream glyph data from the font file for the face's whole
+// lifetime, i.e. during gameplay.  Route those reads through the Win32 bridge
+// so they are bracketed, tagged and serialized like every other transaction.
+namespace
+{
+#if TH08_PSP_FONT_STREAM_CACHE_ENABLED
+constexpr Sint64 kPspFontBlockBytes = 4096;
+constexpr int kPspFontBlocks = 8;
+struct PspFontStream
+{
+    HANDLE handle;          // INVALID_HANDLE_VALUE once the file is resident
+    const BYTE *resident;   // whole file in the renderer arena, or NULL
+    Sint64 position;
+    Sint64 size;
+    Sint64 blockIndex[kPspFontBlocks];
+    unsigned lastUse[kPspFontBlocks];
+    unsigned useClock;
+    BYTE blocks[kPspFontBlocks][kPspFontBlockBytes];
+};
+PspFontStream *PspFontStreamOf(SDL_RWops *context)
+{
+    return static_cast<PspFontStream *>(context->hidden.unknown.data1);
+}
+Sint64 SDLCALL PspFontStreamSize(SDL_RWops *context)
+{
+    return PspFontStreamOf(context)->size;
+}
+Sint64 SDLCALL PspFontStreamSeek(SDL_RWops *context, Sint64 offset, int whence)
+{
+    PspFontStream *stream = PspFontStreamOf(context);
+    Sint64 target = whence == RW_SEEK_SET ? offset
+                    : whence == RW_SEEK_CUR ? stream->position + offset
+                                            : stream->size + offset;
+    if (target < 0)
+        return -1;
+    stream->position = target;
+    return target;
+}
+// Fetch one 4 KiB block through the bridge (one seek + one aligned read).
+const BYTE *PspFontStreamBlock(PspFontStream *stream, Sint64 block)
+{
+    int slot = -1;
+    for (int i = 0; i < kPspFontBlocks; ++i)
+        if (stream->blockIndex[i] == block)
+        {
+            stream->lastUse[i] = ++stream->useClock;
+            return stream->blocks[i];
+        }
+    unsigned oldest = 0xffffffffu;
+    for (int i = 0; i < kPspFontBlocks; ++i)
+        if (stream->blockIndex[i] < 0 || stream->lastUse[i] < oldest)
+        {
+            oldest = stream->blockIndex[i] < 0 ? 0 : stream->lastUse[i];
+            slot = i;
+            if (stream->blockIndex[i] < 0)
+                break;
+        }
+    const DWORD offset = static_cast<DWORD>(block * kPspFontBlockBytes);
+    if (SetFilePointer(stream->handle, static_cast<LONG>(offset), NULL, FILE_BEGIN) ==
+        static_cast<DWORD>(-1))
+        return NULL;
+    DWORD got = 0;
+    if (!ReadFile(stream->handle, stream->blocks[slot], static_cast<DWORD>(kPspFontBlockBytes),
+                  &got, NULL))
+        return NULL;
+    if (got < kPspFontBlockBytes)
+        memset(stream->blocks[slot] + got, 0, static_cast<size_t>(kPspFontBlockBytes - got));
+    stream->blockIndex[slot] = block;
+    stream->lastUse[slot] = ++stream->useClock;
+    return stream->blocks[slot];
+}
+size_t SDLCALL PspFontStreamRead(SDL_RWops *context, void *ptr, size_t size, size_t maxnum)
+{
+    PspFontStream *stream = PspFontStreamOf(context);
+    if (size == 0 || maxnum == 0)
+        return 0;
+    Sint64 remaining = static_cast<Sint64>(size * maxnum);
+    if (stream->position >= stream->size)
+        return 0;
+    if (stream->position + remaining > stream->size)
+        remaining = stream->size - stream->position;
+    BYTE *out = static_cast<BYTE *>(ptr);
+    Sint64 copied = 0;
+    if (stream->resident != NULL)
+    {
+        memcpy(out, stream->resident + stream->position, static_cast<size_t>(remaining));
+        stream->position += remaining;
+        return static_cast<size_t>(remaining) / size;
+    }
+    while (copied < remaining)
+    {
+        const Sint64 at = stream->position + copied;
+        const Sint64 block = at / kPspFontBlockBytes;
+        const Sint64 within = at % kPspFontBlockBytes;
+        const BYTE *data = PspFontStreamBlock(stream, block);
+        if (data == NULL)
+            break;
+        Sint64 chunk = kPspFontBlockBytes - within;
+        if (chunk > remaining - copied)
+            chunk = remaining - copied;
+        memcpy(out + copied, data + within, static_cast<size_t>(chunk));
+        copied += chunk;
+    }
+    stream->position += copied;
+    return static_cast<size_t>(copied) / size;
+}
+size_t SDLCALL PspFontStreamWrite(SDL_RWops *, const void *, size_t, size_t)
+{
+    return 0;
+}
+int SDLCALL PspFontStreamClose(SDL_RWops *context)
+{
+    PspFontStream *stream = PspFontStreamOf(context);
+    if (stream != NULL)
+    {
+        if (stream->handle != INVALID_HANDLE_VALUE)
+            CloseHandle(stream->handle);
+        if (stream->resident != NULL)
+            th08::psp::RenderResourceArenaFree(const_cast<BYTE *>(stream->resident));
+        free(stream);
+    }
+    SDL_FreeRW(context);
+    return 0;
+}
+SDL_RWops *OpenPspFontStream(const char *path)
+{
+    HANDLE handle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                OPEN_EXISTING, 0, NULL);
+    if (handle == INVALID_HANDLE_VALUE || handle == NULL)
+        return NULL;
+    PspFontStream *stream = static_cast<PspFontStream *>(malloc(sizeof(PspFontStream)));
+    SDL_RWops *rw = stream != NULL ? SDL_AllocRW() : NULL;
+    if (rw == NULL)
+    {
+        free(stream);
+        CloseHandle(handle);
+        return NULL;
+    }
+    stream->handle = handle;
+    stream->position = 0;
+    DWORD high = 0;
+    const DWORD low = GetFileSize(handle, &high);
+    stream->size = low == static_cast<DWORD>(-1)
+                       ? 0
+                       : (static_cast<Sint64>(high) << 32) | static_cast<Sint64>(low);
+    for (int i = 0; i < kPspFontBlocks; ++i)
+    {
+        stream->blockIndex[i] = -1;
+        stream->lastUse[i] = 0;
+    }
+    stream->useClock = 0;
+    stream->resident = NULL;
+    // Read the whole file once with large sequential reads and close it, so
+    // glyph loading never touches the storage driver again (PSP Go ef0 stalls
+    // after any burst of seek+read pairs, whatever their size).
+    // Go only (ef0): the Memory Stick driver streams fine and the 3000 keeps
+    // its renderer arena headroom untouched.
+    if (th08::psp::IoSerializeEnabled() && stream->size > 0 && stream->size < (8 << 20))
+    {
+        BYTE *resident = static_cast<BYTE *>(th08::psp::RenderResourceArenaAllocate(
+            static_cast<size_t>(stream->size), 64, "font file resident"));
+        if (resident != NULL)
+        {
+            bool complete = SetFilePointer(handle, 0, NULL, FILE_BEGIN) != static_cast<DWORD>(-1);
+            Sint64 done = 0;
+            while (complete && done < stream->size)
+            {
+                const DWORD want = static_cast<DWORD>(
+                    stream->size - done < (64 << 10) ? stream->size - done : (64 << 10));
+                DWORD got = 0;
+                if (!ReadFile(handle, resident + done, want, &got, NULL) || got == 0)
+                    complete = false;
+                else
+                    done += got;
+            }
+            if (complete)
+            {
+                stream->resident = resident;
+                CloseHandle(handle);
+                stream->handle = INVALID_HANDLE_VALUE;
+            }
+            else
+                th08::psp::RenderResourceArenaFree(resident);
+        }
+    }
+    th08::psp::BootLog("FONT_STREAM_CACHE blocks=%d block_bytes=%ld size=%ld resident=%d\n",
+                       kPspFontBlocks, static_cast<long>(kPspFontBlockBytes),
+                       static_cast<long>(stream->size), stream->resident != NULL ? 1 : 0);
+    rw->size = PspFontStreamSize;
+    rw->seek = PspFontStreamSeek;
+    rw->read = PspFontStreamRead;
+    rw->write = PspFontStreamWrite;
+    rw->close = PspFontStreamClose;
+    rw->type = SDL_RWOPS_UNKNOWN;
+    rw->hidden.unknown.data1 = stream;
+    return rw;
+}
+#else
+HANDLE PspFontStreamHandle(SDL_RWops *context)
+{
+    return static_cast<HANDLE>(context->hidden.unknown.data1);
+}
+Sint64 SDLCALL PspFontStreamSize(SDL_RWops *context)
+{
+    DWORD high = 0;
+    const DWORD low = GetFileSize(PspFontStreamHandle(context), &high);
+    if (low == static_cast<DWORD>(-1))
+        return -1;
+    return (static_cast<Sint64>(high) << 32) | static_cast<Sint64>(low);
+}
+Sint64 SDLCALL PspFontStreamSeek(SDL_RWops *context, Sint64 offset, int whence)
+{
+    const DWORD origin = whence == RW_SEEK_SET ? FILE_BEGIN
+                         : whence == RW_SEEK_CUR ? FILE_CURRENT : FILE_END;
+    const DWORD result = SetFilePointer(PspFontStreamHandle(context),
+                                        static_cast<LONG>(offset), NULL, origin);
+    return result == static_cast<DWORD>(-1) ? -1 : static_cast<Sint64>(result);
+}
+size_t SDLCALL PspFontStreamRead(SDL_RWops *context, void *ptr, size_t size, size_t maxnum)
+{
+    if (size == 0 || maxnum == 0)
+        return 0;
+    DWORD got = 0;
+    if (!ReadFile(PspFontStreamHandle(context), ptr,
+                  static_cast<DWORD>(size * maxnum), &got, NULL))
+        return 0;
+    return static_cast<size_t>(got) / size;
+}
+size_t SDLCALL PspFontStreamWrite(SDL_RWops *, const void *, size_t, size_t)
+{
+    return 0;
+}
+int SDLCALL PspFontStreamClose(SDL_RWops *context)
+{
+    CloseHandle(PspFontStreamHandle(context));
+    SDL_FreeRW(context);
+    return 0;
+}
+SDL_RWops *OpenPspFontStream(const char *path)
+{
+    HANDLE handle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                OPEN_EXISTING, 0, NULL);
+    if (handle == INVALID_HANDLE_VALUE || handle == NULL)
+        return NULL;
+    SDL_RWops *stream = SDL_AllocRW();
+    if (stream == NULL)
+    {
+        CloseHandle(handle);
+        return NULL;
+    }
+    stream->size = PspFontStreamSize;
+    stream->seek = PspFontStreamSeek;
+    stream->read = PspFontStreamRead;
+    stream->write = PspFontStreamWrite;
+    stream->close = PspFontStreamClose;
+    stream->type = SDL_RWOPS_UNKNOWN;
+    stream->hidden.unknown.data1 = handle;
+    return stream;
+}
+#endif
+} // namespace
+#endif
+
 TTF_Font *OpenCoverageCheckedPspFont(const PspFontCandidate &candidate)
 {
     struct stat fileStatus{};
@@ -347,7 +635,12 @@ TTF_Font *OpenCoverageCheckedPspFont(const PspFontCandidate &candidate)
     }
 
     LogPspFontHeap("before_open", candidate.source);
+#if TH08_PSP_IO_SERIALIZE_ENABLED
+    SDL_RWops *fontStream = OpenPspFontStream(candidate.path);
+    TTF_Font *font = fontStream != NULL ? TTF_OpenFontRW(fontStream, 1, 10) : NULL;
+#else
     TTF_Font *font = TTF_OpenFont(candidate.path, 10);
+#endif
     LogPspFontHeap("after_open", candidate.source);
     if (font == NULL)
     {
@@ -894,8 +1187,22 @@ void FillKeyboard(BYTE *state, bool directInput)
 #if defined(PSP)
     SceCtrlData pad;
     memset(&pad, 0, sizeof(pad));
+#if TH08_PSP_DEBUG_START_STAGE_ENABLED
+    {
+        static bool first = true;
+        if (first)
+        {
+            first = false;
+            const int peek = sceCtrlPeekBufferPositive(&pad, 1);
+            th08::psp::BootLog("FILLKEYBOARD_FIRST peek=%d buttons=0x%08x\n", peek, static_cast<unsigned int>(pad.Buttons));
+        }
+    }
+#endif
     if (sceCtrlPeekBufferPositive(&pad, 1) <= 0)
         return;
+#if TH08_PSP_DEBUG_START_STAGE_ENABLED
+    pad.Buttons |= th08::psp::DebugAutoStartButtons();
+#endif
 
     const bool up = (pad.Buttons & PSP_CTRL_UP) != 0 || pad.Ly < 64;
     const bool down = (pad.Buttons & PSP_CTRL_DOWN) != 0 || pad.Ly > 192;
@@ -1003,7 +1310,11 @@ HANDLE CreateFileA(LPCSTR path, DWORD access, DWORD, LPVOID, DWORD disposition, 
     int fd = open(path, flags, 0666);
 #endif
     if (fd < 0) { g_lastError = errno; return INVALID_HANDLE_VALUE; }
-    return new FileHandle(fd);
+    FileHandle *handle = new FileHandle(fd);
+#if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
+    handle->TagPath(resolvedPath.c_str());
+#endif
+    return handle;
 }
 
 HANDLE CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPVOID security, DWORD disposition, DWORD attrs, HANDLE templ)
@@ -1019,14 +1330,32 @@ BOOL ReadFile(HANDLE raw, LPVOID data, DWORD size, LPDWORD readSize, LPVOID)
 {
     if (raw == INVALID_HANDLE_VALUE || raw == NULL) return FALSE;
 #if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
-    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Read);
+    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Read,
+                                          static_cast<FileHandle *>(raw)->pathTail, true, data);
 #endif
     BYTE *cursor = static_cast<BYTE *>(data);
     DWORD total = 0;
+#if TH08_PSP_IO_BOUNCE_HIGH_ENABLED
+    const bool bounce = th08::psp::IoSerializeEnabled() &&
+                        reinterpret_cast<uintptr_t>(data) >= kPspExtendedMemoryBase;
+#endif
     while (total < size)
     {
+#if TH08_PSP_IO_BOUNCE_HIGH_ENABLED
+        ssize_t result;
+        if (bounce)
+        {
+            const DWORD want = size - total < kPspIoBounceBytes ? size - total : kPspIoBounceBytes;
+            result = read(static_cast<FileHandle *>(raw)->fd, gPspIoBounce, want);
+            if (result > 0)
+                memcpy(cursor + total, gPspIoBounce, static_cast<size_t>(result));
+        }
+        else
+            result = read(static_cast<FileHandle *>(raw)->fd, cursor + total, size - total);
+#else
         const ssize_t result = read(static_cast<FileHandle *>(raw)->fd,
                                     cursor + total, size - total);
+#endif
         if (result > 0)
         {
             total += static_cast<DWORD>(result);
@@ -1046,7 +1375,8 @@ BOOL WriteFile(HANDLE raw, LPCVOID data, DWORD size, LPDWORD written, LPVOID)
 {
     if (raw == INVALID_HANDLE_VALUE || raw == NULL) return FALSE;
 #if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
-    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Write);
+    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Write,
+                                          static_cast<FileHandle *>(raw)->pathTail, true, data);
 #endif
     const BYTE *cursor = static_cast<const BYTE *>(data);
     DWORD total = 0;
@@ -1071,7 +1401,8 @@ BOOL WriteFile(HANDLE raw, LPCVOID data, DWORD size, LPDWORD written, LPVOID)
 DWORD SetFilePointer(HANDLE raw, LONG offset, LONG *, DWORD origin)
 {
 #if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
-    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Seek);
+    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Seek,
+                                          static_cast<FileHandle *>(raw)->pathTail);
 #endif
     int whence = origin == FILE_BEGIN ? SEEK_SET : origin == FILE_CURRENT ? SEEK_CUR : SEEK_END;
     off_t result = lseek(static_cast<FileHandle *>(raw)->fd, offset, whence);
@@ -1082,7 +1413,7 @@ DWORD GetFileSize(HANDLE raw, LPDWORD high)
 {
 #if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
     th08::psp::IoActivityScope ioActivity(
-        th08::psp::IoActivityKind::Metadata);
+        th08::psp::IoActivityKind::Metadata, static_cast<FileHandle *>(raw)->pathTail);
 #endif
     struct stat info;
     if (fstat(static_cast<FileHandle *>(raw)->fd, &info) != 0) return static_cast<DWORD>(-1);
@@ -1107,7 +1438,8 @@ BOOL CloseHandle(HANDLE raw)
 BOOL FlushFileBuffers(HANDLE raw)
 {
 #if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
-    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Sync);
+    th08::psp::IoActivityScope ioActivity(th08::psp::IoActivityKind::Sync,
+                                          static_cast<FileHandle *>(raw)->pathTail);
 #endif
     return fsync(static_cast<FileHandle *>(raw)->fd) == 0;
 }

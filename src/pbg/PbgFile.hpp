@@ -42,6 +42,7 @@ class CPbgFile : public IPbgFile
 
   protected:
     HANDLE m_hFile;
+    DWORD m_CachedSize;
 
   private:
     DWORD m_DesiredAccess;

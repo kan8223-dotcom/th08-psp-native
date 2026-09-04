@@ -369,6 +369,15 @@ namespace
 // The archive reader can legally return a short read.  Keep requesting the
 // remainder, and distinguish a true zero-byte I/O failure from the LZSS
 // format's implicit zero bits after the declared compressed payload.
+#if defined(PSP)
+// PSP Go internal storage (ef0) stalls the next read for 30 s after a burst of
+// small reads (R-051).  The streaming decoder used to pull compressed entries in
+// 4 KiB pieces, which reproduced that burst during stage 5/6 loads; read in
+// 64 KiB pieces from one shared buffer instead (a second concurrent decoder
+// falls back to its 4 KiB local buffer).
+static u8 gLzssSharedReadBuffer[65536] __attribute__((aligned(64)));
+static volatile int gLzssSharedReadBufferBusy = 0;
+#endif
 class LzssFileBitReader
 {
   public:
@@ -376,7 +385,25 @@ class LzssFileBitReader
         : m_File(file), m_Remaining(inputSize), m_BufferOffset(0), m_BufferSize(0),
           m_CurrentByte(0), m_BitMask(0)
     {
+#if defined(PSP)
+        m_Buffer = m_LocalBuffer;
+        m_BufferCapacity = static_cast<u32>(sizeof(m_LocalBuffer));
+        m_OwnsShared = false;
+        if (__sync_bool_compare_and_swap(&gLzssSharedReadBufferBusy, 0, 1))
+        {
+            m_Buffer = gLzssSharedReadBuffer;
+            m_BufferCapacity = static_cast<u32>(sizeof(gLzssSharedReadBuffer));
+            m_OwnsShared = true;
+        }
+#endif
     }
+#if defined(PSP)
+    ~LzssFileBitReader()
+    {
+        if (m_OwnsShared)
+            __atomic_store_n(&gLzssSharedReadBufferBusy, 0, __ATOMIC_RELEASE);
+    }
+#endif
 
     i32 ReadBit()
     {
@@ -448,8 +475,12 @@ class LzssFileBitReader
   private:
     bool FillBuffer()
     {
-        const u32 request =
-            m_Remaining < sizeof(m_Buffer) ? m_Remaining : static_cast<u32>(sizeof(m_Buffer));
+#if defined(PSP)
+        const u32 capacity = m_BufferCapacity;
+#else
+        const u32 capacity = static_cast<u32>(sizeof(m_Buffer));
+#endif
+        const u32 request = m_Remaining < capacity ? m_Remaining : capacity;
         const u32 bytesRead = m_File->Read(m_Buffer, request);
         if (bytesRead == 0 || bytesRead > request)
         {
@@ -468,7 +499,14 @@ class LzssFileBitReader
     u32 m_BufferSize;
     u8 m_CurrentByte;
     u8 m_BitMask;
+#if defined(PSP)
+    u8 *m_Buffer;
+    u32 m_BufferCapacity;
+    bool m_OwnsShared;
+    u8 m_LocalBuffer[4096];
+#else
     u8 m_Buffer[4096];
+#endif
 };
 } // namespace
 

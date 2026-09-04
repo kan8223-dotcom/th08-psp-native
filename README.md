@@ -9,13 +9,12 @@ PSP-2000 / PSP-3000 / PSP Go (64 MB models). Not an emulator: it is a port of th
 
 > **Note:** This port is based on an AI-generated decompilation of TH08 that is not affiliated with or endorsed by Gensokyo Club. Gensokyo Club does not provide any support for this project. For the community-maintained decompilation, please refer to the official Gensokyo Club repositories.
 
-> 2026-09-04 時点の状態 / Status as of 2026-09-04
-> - 実機（PSP-3000, 333 MHz）で **1面がプレイ可能**。内蔵デモプレイ4本は最後まで完走します。
-> - 60 Hz simulation × 30描画（SELECTで60/30/20描画を切替）。1面道中で約47〜58 sim fps、5面デモで約54 sim fps。
-> - **既知の問題**: ボス撃破後、2面のロードで停止する／会話中に背景が黒くなる（実機のみ）／デモの吸血鬼組（咲夜・レミリア）のリプレイが非同期。
-> - PSP-1000（32 MB）は非対応。
-> - Stage 1 is playable on real hardware (PSP-3000 @ 333 MHz); all four built-in demo plays run to completion.
-> - Known issues: the game stops when loading Stage 2 after the Stage 1 boss; the background goes black during dialogue (hardware only); the Sakuya/Remilia demo replay desyncs. PSP-1000 (32 MB) is not supported.
+> 2026-09-05 時点の状態 / Status as of 2026-09-05
+> - PSP Go（423 MHz）実機で **1面から6面まで通しプレイし、Normal エンディングまで到達**（処理落ち率 15.4%）。PSP-3000 には同じビルドを投入済み、実機確認はこれからです。
+> - 60 Hz simulation × 30描画（SELECTで60/30/20描画を切替）。密集スペルでは弾更新のCPU負荷で処理落ちします。
+> - **既知の問題**: PSP Go 内蔵ストレージ（ef0）では 30 秒の読み込み停止が1周に数回残ります（[docs/psp-go-internal-storage-stall.md](docs/psp-go-internal-storage-stall.md)。メモリースティックからの起動で回避できる見込み）／32bitの顔・背景テクスチャは16bitに減色／ラストワード練習は非対応／PSP-1000（32 MB）は非対応。
+> - Full playthrough to the Normal ending on a PSP Go at 423 MHz (15.4% slowdown counter). The same build is installed on a PSP-3000; hardware check pending.
+> - Known issues: a few 30-second read stalls per playthrough on the PSP Go's internal storage (ef0; see the doc above, expected to be avoided by running from a Memory Stick); 32-bit face/background textures are stored as 16-bit; Last Word practice is unsupported; PSP-1000 (32 MB) is not supported.
 
 ## 必要なもの / Requirements
 

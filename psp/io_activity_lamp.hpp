@@ -29,6 +29,7 @@ enum class IoActivityLampState : std::uint8_t
 // storage driver has shown occasional multi-second open latency.
 void IoActivityLampInitialize();
 bool IoActivityLampEnabled();
+bool IoSerializeEnabled();
 IoActivityLampState IoActivityLampQuery();
 
 // Bracket one synchronous storage transaction.  The detail string is read
@@ -39,7 +40,7 @@ class IoActivityScope
 {
 public:
     IoActivityScope(IoActivityKind kind, const char *detail = nullptr,
-                    bool recordSlowLog = true);
+                    bool recordSlowLog = true, const void *address = nullptr);
     ~IoActivityScope();
 
     IoActivityScope(const IoActivityScope &) = delete;
@@ -51,6 +52,8 @@ private:
     std::uint32_t startedUs_;
     bool armed_;
     bool recordSlowLog_;
+    bool locked_;
+    const void *address_;
 };
 
 } // namespace th08::psp

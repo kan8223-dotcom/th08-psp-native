@@ -98,6 +98,61 @@ TH08_PSP_GO_IO_LAMP ?= 0
 ifneq ($(filter-out 0 1,$(TH08_PSP_GO_IO_LAMP)),)
 $(error TH08_PSP_GO_IO_LAMP must be 0 or 1)
 endif
+# Serialize every storage transaction (and the SDL_ttf font stream) on one
+# recursive kernel mutex; runtime-enabled on PSP Go only (R-051).  Default OFF.
+TH08_PSP_IO_SERIALIZE ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_IO_SERIALIZE)),)
+$(error TH08_PSP_IO_SERIALIZE must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_IO_SERIALIZE),1)
+ifneq ($(TH08_PSP_GO_IO_LAMP),1)
+$(error TH08_PSP_IO_SERIALIZE=1 requires TH08_PSP_GO_IO_LAMP=1)
+endif
+endif
+# Stage ef0 transfers whose user buffer lies above 0x0A000000 through a low
+# 64 KiB buffer (R-051 candidate).  Requires TH08_PSP_IO_SERIALIZE.  Default OFF.
+TH08_PSP_IO_BOUNCE_HIGH ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_IO_BOUNCE_HIGH)),)
+$(error TH08_PSP_IO_BOUNCE_HIGH must be 0 or 1)
+endif
+# Serve the SDL_ttf font stream from a 4 KiB block cache (R-051: the FreeType
+# tiny-read bursts precede every ef0 stall).  Requires TH08_PSP_IO_SERIALIZE.
+TH08_PSP_FONT_STREAM_CACHE ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_FONT_STREAM_CACHE)),)
+$(error TH08_PSP_FONT_STREAM_CACHE must be 0 or 1)
+endif
+# Development aid: start a new game at the stage named in TH08PSP_DEBUG_STAGE.txt.
+TH08_PSP_DEBUG_START_STAGE ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_DEBUG_START_STAGE)),)
+$(error TH08_PSP_DEBUG_START_STAGE must be 0 or 1)
+endif
+# Stage scripts (.ecl/.std/.msg) from the renderer arena instead of the heap (R-056).
+TH08_PSP_STAGE_SCRIPT_ARENA ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_STAGE_SCRIPT_ARENA)),)
+$(error TH08_PSP_STAGE_SCRIPT_ARENA must be 0 or 1)
+endif
+# ANM phase scratch sized for stages 1-6/Extra (3 MiB) instead of the Last
+# Word effect sets (8.25 MiB); reclaims ~5 MiB of heap (R-056).  Default OFF.
+TH08_PSP_ANM_SCRATCH_COMPACT ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_ANM_SCRATCH_COMPACT)),)
+$(error TH08_PSP_ANM_SCRATCH_COMPACT must be 0 or 1)
+endif
+TH08_PSP_ANM_TEXTURE_16BIT ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_ANM_TEXTURE_16BIT)),)
+$(error TH08_PSP_ANM_TEXTURE_16BIT must be 0 or 1)
+endif
+# Redraw the dialogue background snapshot from Background::OnDraw instead of
+# BeginScene (R-045).  Default OFF.
+TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND)),)
+$(error TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND must be 0 or 1)
+endif
+# Keep drawing the stage background during dialogue instead of freezing the
+# dialogue snapshot (deliberate deviation).  Default OFF.
+TH08_PSP_DIALOGUE_LIVE_BACKGROUND ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_DIALOGUE_LIVE_BACKGROUND)),)
+$(error TH08_PSP_DIALOGUE_LIVE_BACKGROUND must be 0 or 1)
+endif
 
 ifeq ($(TH08_PSP_GO_IO_LAMP),1)
 PSP_GO_IO_LAMP_SRCS := psp/io_activity_lamp.cpp
@@ -470,6 +525,8 @@ PSP_HOST_SRCS := \
 	psp/main.cpp \
 	psp/platform.cpp \
 	psp/fileio.cpp \
+	psp/debug_start_stage.cpp \
+	psp/backbuffer_shadow.cpp \
 	psp/sdl_renderer_disabled.cpp \
 	psp/video.cpp \
 	psp/runtime_support.cpp
@@ -667,6 +724,27 @@ TH08_PSP_ITEM_NATURAL_NATIVE_COPY ?= 0
 TH08_PSP_PSPGL_STREAM_ARENA ?= 0
 ifneq ($(filter-out 0 1,$(TH08_PSP_PSPGL_STREAM_ARENA)),)
 $(error TH08_PSP_PSPGL_STREAM_ARENA must be 0 or 1)
+endif
+
+# Keep the replay recording capacity blocks across stages (copy the recorded
+# span into right-sized blocks at teardown) so the next stage's 0xd2f00
+# reservation never hits the fragmented heap (R-046).  Default OFF.
+TH08_PSP_REPLAY_RESERVE_RECYCLE ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_REPLAY_RESERVE_RECYCLE)),)
+$(error TH08_PSP_REPLAY_RESERVE_RECYCLE must be 0 or 1)
+endif
+
+# Exclude the dialogue background snapshot texture from the GE4 upper-tier
+# promotion (hardware-only black background during dialogue, R-045).  Default OFF.
+TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE)),)
+$(error TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE must be 0 or 1)
+endif
+# Hardware diagnostic for the dialogue snapshot (readback statistics + magenta
+# restore flash).  Default OFF.
+TH08_PSP_DIALOGUE_SNAPSHOT_DIAG ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_DIALOGUE_SNAPSHOT_DIAG)),)
+$(error TH08_PSP_DIALOGUE_SNAPSHOT_DIAG must be 0 or 1)
 endif
 ifeq ($(TH08_PSP_PSPGL_STREAM_ARENA),1)
 ifeq ($(TH08_PSP_SWAP_ASYNC),1)
@@ -904,6 +982,18 @@ PSPGL_STREAM_ARENA_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/pspgl-stream-arena-0.stamp \
 	$(GENERATED_DIR)/pspgl-stream-arena-1.stamp
 PSPGL_STREAM_ARENA_CONFIG_STAMP := $(GENERATED_DIR)/pspgl-stream-arena-$(TH08_PSP_PSPGL_STREAM_ARENA).stamp
+REPLAY_RESERVE_RECYCLE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/replay-reserve-recycle-0.stamp \
+	$(GENERATED_DIR)/replay-reserve-recycle-1.stamp
+REPLAY_RESERVE_RECYCLE_CONFIG_STAMP := $(GENERATED_DIR)/replay-reserve-recycle-$(TH08_PSP_REPLAY_RESERVE_RECYCLE).stamp
+DIALOGUE_SNAPSHOT_NO_PROMOTE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/dialogue-snapshot-no-promote-0.stamp \
+	$(GENERATED_DIR)/dialogue-snapshot-no-promote-1.stamp
+DIALOGUE_SNAPSHOT_NO_PROMOTE_CONFIG_STAMP := $(GENERATED_DIR)/dialogue-snapshot-no-promote-$(TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE).stamp
+DIALOGUE_SNAPSHOT_DIAG_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/dialogue-snapshot-diag-0.stamp \
+	$(GENERATED_DIR)/dialogue-snapshot-diag-1.stamp
+DIALOGUE_SNAPSHOT_DIAG_CONFIG_STAMP := $(GENERATED_DIR)/dialogue-snapshot-diag-$(TH08_PSP_DIALOGUE_SNAPSHOT_DIAG).stamp
 PLAYER_SCAN_SIDECAR_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/player-scan-sidecar-0.stamp \
 	$(GENERATED_DIR)/player-scan-sidecar-1.stamp
@@ -1093,6 +1183,26 @@ GO_IO_LAMP_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/go-io-lamp-0.stamp \
 	$(GENERATED_DIR)/go-io-lamp-1.stamp
 GO_IO_LAMP_CONFIG_STAMP := $(GENERATED_DIR)/go-io-lamp-$(TH08_PSP_GO_IO_LAMP).stamp
+IO_SERIALIZE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/io-serialize-0.stamp \
+	$(GENERATED_DIR)/io-serialize-1.stamp
+IO_SERIALIZE_CONFIG_STAMP := $(GENERATED_DIR)/io-serialize-$(TH08_PSP_IO_SERIALIZE).stamp
+IO_BOUNCE_HIGH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/io-bounce-high-0.stamp \
+	$(GENERATED_DIR)/io-bounce-high-1.stamp
+IO_BOUNCE_HIGH_CONFIG_STAMP := $(GENERATED_DIR)/io-bounce-high-$(TH08_PSP_IO_BOUNCE_HIGH).stamp
+FONT_STREAM_CACHE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/font-stream-cache-0.stamp \
+	$(GENERATED_DIR)/font-stream-cache-1.stamp
+FONT_STREAM_CACHE_CONFIG_STAMP := $(GENERATED_DIR)/font-stream-cache-$(TH08_PSP_FONT_STREAM_CACHE).stamp
+DIALOGUE_SNAPSHOT_AT_BACKGROUND_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/dialogue-snapshot-at-background-0.stamp \
+	$(GENERATED_DIR)/dialogue-snapshot-at-background-1.stamp
+DIALOGUE_SNAPSHOT_AT_BACKGROUND_CONFIG_STAMP := $(GENERATED_DIR)/dialogue-snapshot-at-background-$(TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND).stamp
+DIALOGUE_LIVE_BACKGROUND_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/dialogue-live-background-0.stamp \
+	$(GENERATED_DIR)/dialogue-live-background-1.stamp
+DIALOGUE_LIVE_BACKGROUND_CONFIG_STAMP := $(GENERATED_DIR)/dialogue-live-background-$(TH08_PSP_DIALOGUE_LIVE_BACKGROUND).stamp
 EXTRA_CLEAN += $(GE4_MODEL_GATE_CONFIG_STAMPS) \
 	$(BULLET_VM_CONFIG_STAMPS) $(REPLAY_AUDIT_CONFIG_STAMPS) \
 	$(RENDER_VFPU_CONFIG_STAMPS) $(BULLET_FASTPATH_CONFIG_STAMPS) \
@@ -1122,6 +1232,9 @@ EXTRA_CLEAN += $(GE4_MODEL_GATE_CONFIG_STAMPS) \
 	$(ITEM_NATURAL_QUADS_CONFIG_STAMPS) \
 	$(ITEM_NATURAL_NATIVE_COPY_CONFIG_STAMPS) \
 	$(PSPGL_STREAM_ARENA_CONFIG_STAMPS) \
+	$(REPLAY_RESERVE_RECYCLE_CONFIG_STAMPS) \
+	$(DIALOGUE_SNAPSHOT_NO_PROMOTE_CONFIG_STAMPS) \
+	$(DIALOGUE_SNAPSHOT_DIAG_CONFIG_STAMPS) \
 	$(PLAYER_SCAN_SIDECAR_CONFIG_STAMPS) \
 	$(ENEMY_ACTIVE_BITMAP_AUDIT_CONFIG_STAMPS) \
 	$(BULLET_COLLISION_GATE_AUDIT_CONFIG_STAMPS) \
@@ -1168,7 +1281,10 @@ EXTRA_CLEAN += $(GE4_MODEL_GATE_CONFIG_STAMPS) \
 	$(BOOT_PARITY_CONFIG_STAMPS) \
 	$(FONT_SUBSET_CONFIG_STAMPS) \
 	$(FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMPS) \
-	$(GO_IO_LAMP_CONFIG_STAMPS) psp/io_activity_lamp.o
+	$(GO_IO_LAMP_CONFIG_STAMPS) psp/io_activity_lamp.o \
+	$(IO_SERIALIZE_CONFIG_STAMPS) $(DIALOGUE_SNAPSHOT_AT_BACKGROUND_CONFIG_STAMPS) \
+	$(DIALOGUE_LIVE_BACKGROUND_CONFIG_STAMPS) $(IO_BOUNCE_HIGH_CONFIG_STAMPS) \
+	$(FONT_STREAM_CACHE_CONFIG_STAMPS)
 SDL_CFLAGS := $(shell psp-pkg-config --cflags sdl2 SDL2_image SDL2_ttf)
 
 # Heap-geometry telemetry is pinned to PSPSDK/newlib 4.5.0 classic
@@ -1249,8 +1365,44 @@ endif
 ifeq ($(TH08_PSP_PSPGL_STREAM_ARENA),1)
 CXXFLAGS += -DTH08_PSP_PSPGL_STREAM_ARENA=1
 endif
+ifeq ($(TH08_PSP_REPLAY_RESERVE_RECYCLE),1)
+CXXFLAGS += -DTH08_PSP_REPLAY_RESERVE_RECYCLE=1
+endif
+ifeq ($(TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE),1)
+CXXFLAGS += -DTH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE=1
+endif
+ifeq ($(TH08_PSP_DIALOGUE_SNAPSHOT_DIAG),1)
+CXXFLAGS += -DTH08_PSP_DIALOGUE_SNAPSHOT_DIAG=1
+endif
 ifeq ($(TH08_PSP_GO_IO_LAMP),1)
 CXXFLAGS += -DTH08_PSP_GO_IO_LAMP=1
+endif
+ifeq ($(TH08_PSP_IO_SERIALIZE),1)
+CXXFLAGS += -DTH08_PSP_IO_SERIALIZE=1
+endif
+ifeq ($(TH08_PSP_IO_BOUNCE_HIGH),1)
+CXXFLAGS += -DTH08_PSP_IO_BOUNCE_HIGH=1
+endif
+ifeq ($(TH08_PSP_FONT_STREAM_CACHE),1)
+CXXFLAGS += -DTH08_PSP_FONT_STREAM_CACHE=1
+endif
+ifeq ($(TH08_PSP_DEBUG_START_STAGE),1)
+CXXFLAGS += -DTH08_PSP_DEBUG_START_STAGE=1
+endif
+ifeq ($(TH08_PSP_STAGE_SCRIPT_ARENA),1)
+CXXFLAGS += -DTH08_PSP_STAGE_SCRIPT_ARENA=1
+endif
+ifeq ($(TH08_PSP_ANM_SCRATCH_COMPACT),1)
+CXXFLAGS += -DTH08_PSP_ANM_SCRATCH_COMPACT=1
+endif
+ifeq ($(TH08_PSP_ANM_TEXTURE_16BIT),1)
+CXXFLAGS += -DTH08_PSP_ANM_TEXTURE_16BIT=1
+endif
+ifeq ($(TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND),1)
+CXXFLAGS += -DTH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND=1
+endif
+ifeq ($(TH08_PSP_DIALOGUE_LIVE_BACKGROUND),1)
+CXXFLAGS += -DTH08_PSP_DIALOGUE_LIVE_BACKGROUND=1
 endif
 ifeq ($(TH08_PSP_GUI_BORDER_REPLAY_AUDIT),1)
 CXXFLAGS += -DTH08_PSP_GUI_BORDER_REPLAY_AUDIT=1
@@ -2180,6 +2332,21 @@ $(PSPGL_STREAM_ARENA_CONFIG_STAMP):
 	@rm -f $(filter-out $@,$(PSPGL_STREAM_ARENA_CONFIG_STAMPS))
 	@touch $@
 
+$(REPLAY_RESERVE_RECYCLE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(REPLAY_RESERVE_RECYCLE_CONFIG_STAMPS))
+	@touch $@
+
+$(DIALOGUE_SNAPSHOT_NO_PROMOTE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(DIALOGUE_SNAPSHOT_NO_PROMOTE_CONFIG_STAMPS))
+	@touch $@
+
+$(DIALOGUE_SNAPSHOT_DIAG_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(DIALOGUE_SNAPSHOT_DIAG_CONFIG_STAMPS))
+	@touch $@
+
 $(PLAYER_SCAN_SIDECAR_CONFIG_STAMP):
 	@mkdir -p $(dir $@)
 	@rm -f $(filter-out $@,$(PLAYER_SCAN_SIDECAR_CONFIG_STAMPS))
@@ -2415,6 +2582,31 @@ $(GO_IO_LAMP_CONFIG_STAMP):
 	@rm -f $(filter-out $@,$(GO_IO_LAMP_CONFIG_STAMPS))
 	@touch $@
 
+$(IO_SERIALIZE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(IO_SERIALIZE_CONFIG_STAMPS))
+	@touch $@
+
+$(IO_BOUNCE_HIGH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(IO_BOUNCE_HIGH_CONFIG_STAMPS))
+	@touch $@
+
+$(FONT_STREAM_CACHE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(FONT_STREAM_CACHE_CONFIG_STAMPS))
+	@touch $@
+
+$(DIALOGUE_SNAPSHOT_AT_BACKGROUND_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(DIALOGUE_SNAPSHOT_AT_BACKGROUND_CONFIG_STAMPS))
+	@touch $@
+
+$(DIALOGUE_LIVE_BACKGROUND_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(DIALOGUE_LIVE_BACKGROUND_CONFIG_STAMPS))
+	@touch $@
+
 # psp-ld can require private symbols but cannot assert their ELF st_size.
 # Gate EBOOT packing on a post-link ABI/disassembly audit so an SDK allocator
 # replacement cannot silently turn the read-only heap scanner into an unsafe
@@ -2506,6 +2698,19 @@ src/modern/linux/d3d8_compat.o psp/main.o: \
 src/modern/linux/d3d8_compat.o psp/main.o: \
 	$(PSPGL_STREAM_ARENA_CONFIG_STAMP)
 
+# The replay reservation recycle spans the replay manager and the boot identity.
+src/ReplayManager.o psp/main.o: \
+	$(REPLAY_RESERVE_RECYCLE_CONFIG_STAMP)
+
+# The dialogue snapshot promotion exclusion spans the compat device and the
+# boot identity.
+src/modern/linux/d3d8_compat.o psp/main.o: \
+	$(DIALOGUE_SNAPSHOT_NO_PROMOTE_CONFIG_STAMP)
+
+# The dialogue snapshot diagnostic spans the compat device and the boot identity.
+src/modern/linux/d3d8_compat.o psp/main.o: \
+	$(DIALOGUE_SNAPSHOT_DIAG_CONFIG_STAMP)
+
 # The Go storage diagnostic spans its fixed state module, the Win32/POSIX
 # bridge, the PSP-only archive-request stdio trace, the final overlay, and the
 # persisted feature fingerprint.  Switching OFF/ON rebuilds that exact set.
@@ -2513,6 +2718,29 @@ psp/io_activity_lamp.o psp/fileio.o src/main.o \
 	src/modern/linux/linux_compat.o src/modern/linux/linux_runtime.o \
 	psp/main.o: \
 	$(GO_IO_LAMP_CONFIG_STAMP)
+
+# The storage serialization spans the lamp module, the Win32/POSIX bridge
+# (font stream) and the boot identity.
+psp/io_activity_lamp.o src/modern/linux/linux_compat.o psp/main.o: \
+	$(IO_SERIALIZE_CONFIG_STAMP)
+
+# The high-memory bounce spans the bridge and the boot identity.
+src/modern/linux/linux_compat.o psp/main.o: \
+	$(IO_BOUNCE_HIGH_CONFIG_STAMP)
+
+# The font stream cache spans the bridge and the boot identity.
+src/modern/linux/linux_compat.o psp/main.o: \
+	$(FONT_STREAM_CACHE_CONFIG_STAMP)
+
+# The dialogue snapshot relocation spans the background chain, the compat
+# device and the boot identity.
+src/Background.o src/modern/linux/d3d8_compat.o psp/main.o: \
+	$(DIALOGUE_SNAPSHOT_AT_BACKGROUND_CONFIG_STAMP)
+
+# The live dialogue background spans the background chain, the compat device
+# and the boot identity.
+src/Background.o src/modern/linux/d3d8_compat.o psp/main.o: \
+	$(DIALOGUE_LIVE_BACKGROUND_CONFIG_STAMP)
 
 # The tick gate bypass spans the game loop and the boot identity.
 src/main.o psp/main.o: \

@@ -5,12 +5,29 @@
 #include "ItemManager.hpp"
 #include "fileio.hpp"
 #include "memory_telemetry.hpp"
+#include "newlib_heap_geometry.hpp"
 #include "swap_triple.hpp"
 
 #include <cstdint>
 #include <cstring>
 #include <new>
 #include <type_traits>
+
+namespace
+{
+// R-056: heap headroom at every stage boundary (fragmentation trend).
+void LogHeapAtStage(const char *phase, unsigned long generation)
+{
+    const th08::psp::NewlibHeapGeometrySnapshot heap = th08::psp::CaptureNewlibHeapGeometry();
+    th08::psp::BootLog("HEAP_AT_STAGE phase=%s generation=%lu arena=%lu used=%lu free=%lu largest=%lu top=%lu chunks=%lu nogrow=%lu valid=%lu\n",
+                       phase, generation, static_cast<unsigned long>(heap.arenaBytes),
+                       static_cast<unsigned long>(heap.usedBytes), static_cast<unsigned long>(heap.freeBytes),
+                       static_cast<unsigned long>(heap.largestFreeChunkBytes), static_cast<unsigned long>(heap.topChunkBytes),
+                       static_cast<unsigned long>(heap.freeChunkCount), static_cast<unsigned long>(heap.largestNoGrowRequestBytes),
+                       static_cast<unsigned long>(heap.scanValid));
+    th08::psp::FlushBootLog();
+}
+} // namespace
 
 // Including psptypes.h after the reconstructed engine's original u32 typedef
 // creates a duplicate typedef in this translation unit. The SDK ABI uses an
@@ -580,6 +597,7 @@ bool StagePoolArenaBeginStage()
             static_cast<unsigned long>(kEnemyPoolRecoveredBytes),
             static_cast<unsigned long>(kBulletPoolRecoveredBytes),
             static_cast<unsigned long>(kReserveRecoveredBytes));
+    LogHeapAtStage("begin", static_cast<unsigned long>(gGeneration));
     return true;
 }
 
@@ -619,6 +637,7 @@ bool StagePoolArenaEndStage(bool retainBacking)
     BootLog("STAGE_POOL end generation=%lu guards=%s retained=%d quarantined=%d\n",
             static_cast<unsigned long>(gGeneration), guardsIntact ? "OK" : "CORRUPT",
             retainBacking ? 1 : 0, gPoisoned ? 1 : 0);
+    LogHeapAtStage("end", static_cast<unsigned long>(gGeneration));
     return guardsIntact;
 }
 

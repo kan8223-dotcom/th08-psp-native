@@ -34,6 +34,14 @@ struct LinuxFramebufferDeltaStats
 };
 
 bool th08_linux_surface_access(IDirect3DSurface8 *surface, LinuxSurfaceAccess *access, bool readBackbuffer);
+// Releases transient (scratch-backed) backbuffer shadow storage after a copy.
+void th08_linux_surface_access_end(IDirect3DSurface8 *surface);
+#if defined(PSP)
+// Backbuffer-to-texture capture without a destination CPU copy (see d3d8_compat.cpp).
+bool th08_linux_capture_direct_to_texture(IDirect3DSurface8 *destination, const RECT *destinationRect,
+                                          const LinuxSurfaceAccess &source, const RECT *sourceRect,
+                                          D3DCOLOR colorKey);
+#endif
 void th08_linux_surface_changed(IDirect3DSurface8 *surface);
 void th08_linux_texture_mark_static(IDirect3DTexture8 *texture);
 #if defined(PSP)
@@ -260,6 +268,7 @@ void th08_linux_surface_discard_readback(IDirect3DSurface8 *surface);
 bool th08_linux_surface_load_image_memory(IDirect3DDevice8 *device, const void *data,
                                           UINT size, IDirect3DSurface8 **surface,
                                           UINT *width, UINT *height);
+void th08_linux_dialogue_snapshot_restore(IDirect3DDevice8 *device);
 bool th08_linux_surface_capture_native(UINT logicalWidth, UINT logicalHeight,
                                        bool readDisplayedFrame,
                                        IDirect3DSurface8 **surface);

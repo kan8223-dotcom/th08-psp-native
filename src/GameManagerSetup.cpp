@@ -1,4 +1,7 @@
 #include "th_pch.h"
+#if defined(PSP)
+#include "psp/fileio.hpp"
+#endif
 
 #include "GameManager.hpp"
 #include "AsciiManager.hpp"
@@ -291,6 +294,10 @@ void __fastcall GameplaySetupThread0043ABD7(void *unused)
     }
     gameManager->stageRngSeed = *reinterpret_cast<u16 *>(&g_Rng);
 
+#if defined(PSP)
+    th08::psp::BootLog("SETUP_STEP name=Background stage=%d\n", static_cast<int>(gameManager->currentStage));
+    th08::psp::FlushBootLog();
+#endif
     if (Background::RegisterChain(gameManager->currentStage))
     {
         if (g_Supervisor.subthreadCloseRequestActive)
@@ -298,6 +305,10 @@ void __fastcall GameplaySetupThread0043ABD7(void *unused)
         g_GameErrorContext.Log("error: background initialization failed\n");
         goto setup_error;
     }
+#if defined(PSP)
+    th08::psp::BootLog("SETUP_STEP name=BulletManager stage=%d\n", static_cast<int>(gameManager->currentStage));
+    th08::psp::FlushBootLog();
+#endif
     if (BulletManager::RegisterChain(const_cast<char *>("etama.anm")))
     {
         if (g_Supervisor.subthreadCloseRequestActive)
@@ -305,6 +316,10 @@ void __fastcall GameplaySetupThread0043ABD7(void *unused)
         g_GameErrorContext.Log("error: bullet initialization failed\n");
         goto setup_error;
     }
+#if defined(PSP)
+    th08::psp::BootLog("SETUP_STEP name=EnemyManager stage=%d\n", static_cast<int>(gameManager->currentStage));
+    th08::psp::FlushBootLog();
+#endif
     if (EnemyManager::RegisterChain())
     {
         if (g_Supervisor.subthreadCloseRequestActive)
@@ -312,6 +327,10 @@ void __fastcall GameplaySetupThread0043ABD7(void *unused)
         g_GameErrorContext.Log("error: enemy initialization failed\n");
         goto setup_error;
     }
+#if defined(PSP)
+    th08::psp::BootLog("SETUP_STEP name=EffectManager stage=%d\n", static_cast<int>(gameManager->currentStage));
+    th08::psp::FlushBootLog();
+#endif
     if (EffectManager::RegisterChain())
     {
         if (g_Supervisor.subthreadCloseRequestActive)
@@ -319,6 +338,10 @@ void __fastcall GameplaySetupThread0043ABD7(void *unused)
         g_GameErrorContext.Log("error: effect initialization failed\n");
         goto setup_error;
     }
+#if defined(PSP)
+    th08::psp::BootLog("SETUP_STEP name=Gui stage=%d\n", static_cast<int>(gameManager->currentStage));
+    th08::psp::FlushBootLog();
+#endif
     if (Gui::RegisterChain())
     {
         if (g_Supervisor.subthreadCloseRequestActive)
@@ -326,6 +349,10 @@ void __fastcall GameplaySetupThread0043ABD7(void *unused)
         g_GameErrorContext.Log("error: 2D initialization failed\n");
         goto setup_error;
     }
+#if defined(PSP)
+    th08::psp::BootLog("SETUP_STEP name=Spellcard stage=%d\n", static_cast<int>(gameManager->currentStage));
+    th08::psp::FlushBootLog();
+#endif
     if (Spellcard::RegisterChain())
     {
         if (g_Supervisor.subthreadCloseRequestActive)

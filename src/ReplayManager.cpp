@@ -5,6 +5,7 @@
 #include "Gui.hpp"
 #include "ReplayManager.hpp"
 #include "ReplaySyncAudit.hpp"
+#include "replay_reserve_recycle.hpp"
 #include "ResultScreen.hpp"
 #include "i18n.hpp"
 
@@ -991,6 +992,47 @@ void ReplayManager::CompactRecordedStage(i32 stage)
     // physical headroom outside the first serialized span so compaction does
     // not turn that later terminator into a two-byte out-of-bounds read.
     const size_t compactInputCapacity = inputUsed + kReplaySaveFinalizationHeadroom;
+#if TH08_PSP_REPLAY_RESERVE_RECYCLE_ENABLED
+    // Copy the recorded spans into right-sized blocks and keep the two
+    // capacity blocks as the next stage's reservation (see the header).
+    if (gPreparedReplayInput == NULL && gPreparedReplayFps == NULL &&
+        inputCapacity == kReplayInputCapacity && fpsCapacity == kReplayFpsCapacity)
+    {
+        StageReplayData *compactInput = static_cast<StageReplayData *>(
+            g_ZunMemory.Alloc(compactInputCapacity, "PSP replay input compact"));
+        const size_t compactFpsCapacity = fpsUsed != 0U ? fpsUsed : 1U;
+        u8 *compactFps = static_cast<u8 *>(
+            g_ZunMemory.Alloc(compactFpsCapacity, "PSP replay FPS compact"));
+        if (compactInput != NULL && compactFps != NULL)
+        {
+            memcpy(compactInput, inputBase, inputUsed);
+            if (fpsUsed != 0U)
+                memcpy(compactFps, fpsBase, fpsUsed);
+            TH08_REPLAY_STAGE_DATA(mgr->replayData, stage) = compactInput;
+            mgr->replayInputEnds[stage] = reinterpret_cast<u8 *>(compactInput) + inputUsed;
+            mgr->replayInputCursor = reinterpret_cast<u8 *>(compactInput) + inputCursorOffset;
+            mgr->extendedInputCursor = reinterpret_cast<ReplayInputSync *>(
+                reinterpret_cast<u8 *>(compactInput) + extendedCursorOffset);
+            gReplayInputCapacities[stage] = compactInputCapacity;
+            TH08_REPLAY_FPS_DATA(mgr->replayData, stage) = compactFps;
+            mgr->replayFpsSampleEnds[stage] = compactFps + fpsUsed;
+            mgr->replayFpsSampleCursor = compactFps + fpsCursorOffset;
+            gReplayFpsCapacities[stage] = fpsUsed;
+            gPreparedReplayInput = inputBase;
+            gPreparedReplayFps = fpsBase;
+            utils::DebugPrint(
+                "info : PSP replay recycle stage %d input %lu/%lu fps %lu/%lu\r\n",
+                stage + 1, static_cast<unsigned long>(inputUsed),
+                static_cast<unsigned long>(kReplayInputCapacity),
+                static_cast<unsigned long>(fpsUsed),
+                static_cast<unsigned long>(kReplayFpsCapacity));
+            return;
+        }
+        g_ZunMemory.Free(compactInput);
+        g_ZunMemory.Free(compactFps);
+        // Fall back to the in-place shrink.
+    }
+#endif
     StageReplayData *shrunkInput = static_cast<StageReplayData *>(
         th08_psp_tracked_realloc(inputBase, compactInputCapacity, "PSP replay input compact"));
     if (shrunkInput != NULL)

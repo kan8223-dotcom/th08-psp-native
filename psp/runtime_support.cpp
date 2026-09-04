@@ -1,10 +1,14 @@
 #include "ZunResult.hpp"
+#include "anm_scratch.hpp"
+#include "backbuffer_shadow.hpp"
+#include "fileio.hpp"
 #include "memory_telemetry.hpp"
 #include "render_resource_arena.hpp"
 
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <malloc.h>
 #include <new>
 
@@ -23,8 +27,13 @@ void *operator new(std::size_t size)
     void *memory = nullptr;
     if (th08::psp::RenderResourceAllocationScopeActive())
     {
-        memory = th08::psp::RenderResourceArenaAllocate(
-            size, alignof(std::max_align_t), th08::psp::RenderResourceAllocationOwner());
+        const char *owner = th08::psp::RenderResourceAllocationOwner();
+        // The transient backbuffer shadow borrows the idle ANM scratch first so
+        // a texture-filled renderer arena cannot abort a text capture.
+        if (owner != nullptr && std::strcmp(owner, "backbuffer shadow") == 0)
+            memory = th08::psp::BackbufferShadowAcquire(size);
+        if (memory == nullptr)
+            memory = th08::psp::RenderResourceArenaAllocate(size, alignof(std::max_align_t), owner);
     }
     else
     {
@@ -41,6 +50,13 @@ void *operator new(std::size_t size)
                      static_cast<unsigned long>(heap.uordblks),
                      static_cast<unsigned long>(heap.fordblks),
                      static_cast<unsigned long>(heap.keepcost));
+        th08::psp::BootLog("NEW_FAIL size=%lu caller=%p arena=%lu used=%lu free=%lu top=%lu\n",
+                           static_cast<unsigned long>(size), __builtin_return_address(0),
+                           static_cast<unsigned long>(heap.arena),
+                           static_cast<unsigned long>(heap.uordblks),
+                           static_cast<unsigned long>(heap.fordblks),
+                           static_cast<unsigned long>(heap.keepcost));
+        th08::psp::FlushBootLog();
         std::__throw_bad_alloc();
     }
     return memory;
@@ -53,6 +69,13 @@ void *operator new[](std::size_t size)
 
 void operator delete(void *memory) noexcept
 {
+    if (th08::psp::BackbufferShadowRelease(memory))
+        return;
+    if (th08::psp::AnmScratchContains(memory))
+    {
+        th08::psp::AnmScratchRejectGenericFree(memory);
+        return;
+    }
     if (th08::psp::RenderResourceArenaFree(memory))
         return;
     th08_psp_tracked_free(memory);
@@ -60,6 +83,13 @@ void operator delete(void *memory) noexcept
 
 void operator delete[](void *memory) noexcept
 {
+    if (th08::psp::BackbufferShadowRelease(memory))
+        return;
+    if (th08::psp::AnmScratchContains(memory))
+    {
+        th08::psp::AnmScratchRejectGenericFree(memory);
+        return;
+    }
     if (th08::psp::RenderResourceArenaFree(memory))
         return;
     th08_psp_tracked_free(memory);
@@ -67,6 +97,13 @@ void operator delete[](void *memory) noexcept
 
 void operator delete(void *memory, std::size_t) noexcept
 {
+    if (th08::psp::BackbufferShadowRelease(memory))
+        return;
+    if (th08::psp::AnmScratchContains(memory))
+    {
+        th08::psp::AnmScratchRejectGenericFree(memory);
+        return;
+    }
     if (th08::psp::RenderResourceArenaFree(memory))
         return;
     th08_psp_tracked_free(memory);
@@ -74,6 +111,13 @@ void operator delete(void *memory, std::size_t) noexcept
 
 void operator delete[](void *memory, std::size_t) noexcept
 {
+    if (th08::psp::BackbufferShadowRelease(memory))
+        return;
+    if (th08::psp::AnmScratchContains(memory))
+    {
+        th08::psp::AnmScratchRejectGenericFree(memory);
+        return;
+    }
     if (th08::psp::RenderResourceArenaFree(memory))
         return;
     th08_psp_tracked_free(memory);

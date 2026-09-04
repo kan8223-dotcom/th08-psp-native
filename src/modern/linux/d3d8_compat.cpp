@@ -20,12 +20,27 @@
 #include "swap_async.hpp"
 #include "swap_triple.hpp"
 #include "pspgl_stream_arena.hpp"
+#include "dialogue_snapshot_no_promote.hpp"
+#include "dialogue_snapshot_diag.hpp"
+#include "dialogue_snapshot_at_background.hpp"
+#include "dialogue_live_background.hpp"
+#if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
+// Set by RestoreDialogueSnapshot around its surface-cache draw so the texture
+// upload below never arms the GE4 static-upload (promotion) hint for it.
+static bool pspSuppressStaticUploadPromotion = false;
+#endif
+#if TH08_PSP_DIALOGUE_SNAPSHOT_DIAG_ENABLED
+// R-045 diagnostic: while set, DrawPspSurfaceCache draws a flat magenta quad.
+static bool pspDialogueRestoreDiagFlash = false;
+#endif
 #include "perf_env.hpp"
 #include <pspdisplay.h>
 // pspthreadman.h drags psptypes.h (u32 etc.) into this TU; declare the one
 // clock entry point the flip guard needs instead.
 extern "C" long long sceKernelGetSystemTimeWide(void);
 #include "render_resource_arena.hpp"
+#include "backbuffer_shadow.hpp"
+#include "anm_texture_16bit.hpp"
 
 // Import the one GE query used here without pulling PSPSDK's legacy u32
 // typedefs into TH08's reconstruction typedef namespace.
@@ -271,6 +286,12 @@ extern "C" int __pspgl_th08_draw_native_indexed_quads_copy(
 namespace
 {
 class LinuxTexture;
+#if defined(PSP)
+// Diagnostics: who forced the 640x480 backbuffer shadow allocation.
+static const char *gPspShadowReason = "?";
+static const char *gPspSurfaceOp = "?";
+extern "C" void th08_linux_note_surface_op(const char *op) { gPspSurfaceOp = op != NULL ? op : "?"; }
+#endif
 class LinuxSurface;
 
 #if TH08_PSP_ANY_DIRECT_GE_ENABLED
@@ -858,10 +879,24 @@ class LinuxSurface : public IDirect3DSurface8
 #endif
         {
 #if defined(PSP)
-            th08::psp::RenderResourceAllocationScope arenaScope(
-                backbuffer ? "backbuffer shadow" : "surface pixels");
-#endif
+            const std::size_t needed = static_cast<std::size_t>(pitch) * height;
+            if (!th08::psp::RenderResourceArenaCanAllocate(needed))
+            {
+                th08::psp::BootLog("SURFACE_PIXELS skip owner=%s bytes=%lu largest=%lu\n",
+                                   backbuffer ? "backbuffer shadow init" : "surface pixels",
+                                   static_cast<unsigned long>(needed),
+                                   static_cast<unsigned long>(th08::psp::RenderResourceArenaLargestFree()));
+                th08::psp::FlushBootLog();
+            }
+            else
+            {
+                th08::psp::RenderResourceAllocationScope arenaScope(
+                    backbuffer ? "backbuffer shadow init" : "surface pixels");
+                pixels.resize(pitch * height);
+            }
+#else
             pixels.resize(pitch * height);
+#endif
         }
     }
 #if defined(PSP)
@@ -893,7 +928,13 @@ class LinuxSurface : public IDirect3DSurface8
         // This texture is a read-only transition/dialogue snapshot after the
         // initial upload.  Mark only that proven lifetime as eligible for the
         // explicit GE4 upper-aperture promotion path.
+#if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
+        // Except the dialogue snapshot: its promotion right after a mid-frame
+        // upload showed a black background on hardware (R-045).
+        PspGe4StaticUploadScope staticUpload(!pspSuppressStaticUploadPromotion);
+#else
         PspGe4StaticUploadScope staticUpload(true);
+#endif
         // Scope contention must fail closed.  PSPGL's memalign wrapper falls
         // back to newlib when no renderer scope is active; sending a 512 KiB
         // dialogue backing there would recreate the fragmented-heap failure
@@ -1005,6 +1046,42 @@ class LinuxSurface : public IDirect3DSurface8
                 *failureReason = "framebuffer_read_failed";
             return false;
         }
+#if TH08_PSP_DIALOGUE_SNAPSHOT_DIAG_ENABLED
+        {
+            const size_t nativeCount =
+                static_cast<size_t>(kPspFitWidth) * kPspScreenHeight;
+            size_t nonzero = 0;
+            unsigned long checksum = 0;
+            for (size_t i = 0; i < nativeCount; ++i)
+            {
+                const WORD value = nativePixels[i];
+                if (value != 0)
+                    ++nonzero;
+                checksum = checksum * 31u + value;
+            }
+            void *displayTop = NULL;
+            int displayWidth = 0;
+            int displayFormat = 0;
+            sceDisplayGetFrameBuf(&displayTop, &displayWidth, &displayFormat,
+                                  PSP_DISPLAY_SETBUF_IMMEDIATE);
+            const size_t center = static_cast<size_t>(kPspScreenHeight / 2) * kPspFitWidth +
+                                  kPspFitWidth / 2;
+            th08::psp::BootLog(
+                "NATIVE_CAPTURE_PIXELS read_front=%d nonzero=%lu/%lu checksum=%08lx "
+                "center=%04x row10=%04x,%04x row262=%04x,%04x dst=%p "
+                "display=%p width=%d fmt=%d\n",
+                readDisplayedFrame ? 1 : 0,
+                static_cast<unsigned long>(nonzero),
+                static_cast<unsigned long>(nativeCount), checksum,
+                static_cast<unsigned int>(nativePixels[center]),
+                static_cast<unsigned int>(nativePixels[10 * kPspFitWidth + 10]),
+                static_cast<unsigned int>(nativePixels[10 * kPspFitWidth + kPspFitWidth - 10]),
+                static_cast<unsigned int>(nativePixels[262 * kPspFitWidth + 10]),
+                static_cast<unsigned int>(nativePixels[262 * kPspFitWidth + kPspFitWidth - 10]),
+                static_cast<void *>(nativePixels), displayTop, displayWidth,
+                displayFormat);
+        }
+#endif
 
         // glReadPixels starts at the physical framebuffer's bottom row. Keep
         // the D3D-facing top-left convention while preserving every native
@@ -1021,6 +1098,11 @@ class LinuxSurface : public IDirect3DSurface8
 
         if (!CreateNativeFramebufferTexture(texturePixels, failureReason))
             return false;
+#if TH08_PSP_DIALOGUE_SNAPSHOT_DIAG_ENABLED
+        th08::psp::BootLog("NATIVE_CAPTURE_TEXTURE glname=%lu source=%p\n",
+                           static_cast<unsigned long>(pspBlitTexture),
+                           static_cast<const void *>(texturePixels));
+#endif
         fprintf(stderr,
                 "TH08PSP NATIVE_CAPTURE ready logical=%lux%lu physical=%dx%d "
                 "borrowed=%lu texture=%lu backing=%s\n",
@@ -1075,6 +1157,9 @@ class LinuxSurface : public IDirect3DSurface8
     HRESULT LockRect(D3DLOCKED_RECT *locked, const RECT *rect, DWORD flags)
     {
         if (locked == NULL) return E_INVALIDARG;
+#if defined(PSP)
+        if (backbuffer) gPspShadowReason = (flags & D3DLOCK_READONLY) ? "LockRect(readonly)" : "LockRect";
+#endif
         if (!EnsurePixels()) return E_OUTOFMEMORY;
         if (backbuffer && (flags & D3DLOCK_READONLY)) ReadBackbuffer();
         UINT left = rect != NULL && rect->left > 0 ? static_cast<UINT>(rect->left) : 0;
@@ -1087,13 +1172,47 @@ class LinuxSurface : public IDirect3DSurface8
     {
         dirty = true;
         pspBlitTextureDirty = true;
+#if defined(PSP)
+        DropScratchShadow();
+#endif
         return S_OK;
     }
+#if defined(PSP)
+    // Return a scratch-backed backbuffer shadow as soon as its capture is done.
+    void DropScratchShadow()
+    {
+        if (backbuffer && !pixels.empty() && th08::psp::BackbufferShadowBase() == &pixels[0])
+            std::vector<BYTE>().swap(pixels);
+    }
+#endif
     bool EnsurePixels()
     {
         if (pixels.empty() && pitch != 0 && height != 0)
         {
 #if defined(PSP)
+            if (backbuffer)
+            {
+                const std::size_t needed = static_cast<std::size_t>(pitch) * height;
+                // Never let a capture abort the game: skip it when neither the
+                // idle scratch nor the renderer arena can hold the shadow.
+                if (!th08::psp::BackbufferShadowAvailable() &&
+                    th08::psp::RenderResourceArenaLargestFree() < needed)
+                {
+                    th08::psp::BootLog("BACKBUFFER_SHADOW skip bytes=%lu reason=%s op=%s arena_largest=%lu\n",
+                                       static_cast<unsigned long>(needed), gPspShadowReason, gPspSurfaceOp,
+                                       static_cast<unsigned long>(th08::psp::RenderResourceArenaLargestFree()));
+                    th08::psp::FlushBootLog();
+                    return false;
+                }
+            }
+            if (!backbuffer && !th08::psp::RenderResourceArenaCanAllocate(static_cast<std::size_t>(pitch) * height))
+            {
+                th08::psp::BootLog("SURFACE_PIXELS skip owner=surface pixels lazy bytes=%lu largest=%lu\n",
+                                   static_cast<unsigned long>(static_cast<std::size_t>(pitch) * height),
+                                   static_cast<unsigned long>(th08::psp::RenderResourceArenaLargestFree()));
+                th08::psp::FlushBootLog();
+                return false;
+            }
             th08::psp::RenderResourceAllocationScope arenaScope(
                 backbuffer ? "backbuffer shadow" : "surface pixels lazy");
 #endif
@@ -1118,8 +1237,10 @@ class LinuxSurface : public IDirect3DSurface8
         const UINT bytes = BytesPerPixel(format);
         const size_t nativePixelCount = static_cast<size_t>(kPspFitWidth) *
                                         kPspScreenHeight;
-        WORD *nativePixels = static_cast<WORD *>(
-            memalign(16, nativePixelCount * sizeof(WORD)));
+        WORD *nativePixels = static_cast<WORD *>(th08::psp::BackbufferShadowNativeBuffer());
+        const bool ownsNative = nativePixels == NULL;
+        if (ownsNative)
+            nativePixels = static_cast<WORD *>(memalign(16, nativePixelCount * sizeof(WORD)));
         if (nativePixels == NULL)
         {
             fprintf(stderr, "TH08PSP READBACK native_alloc_failed bytes=%lu\n",
@@ -1140,7 +1261,7 @@ class LinuxSurface : public IDirect3DSurface8
         {
             fprintf(stderr, "TH08PSP READBACK read_error=0x%04x\n",
                     static_cast<unsigned int>(readError));
-            free(nativePixels);
+            if (ownsNative) free(nativePixels);
             return;
         }
 
@@ -1170,7 +1291,7 @@ class LinuxSurface : public IDirect3DSurface8
                 EncodePixel(destinationRow + x * bytes, format, rgba);
             }
         }
-        free(nativePixels);
+        if (ownsNative) free(nativePixels);
 #else
         std::vector<BYTE> rgba(width * height * 4);
         glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, &rgba[0]);
@@ -1563,7 +1684,7 @@ class LinuxTexture : public IDirect3DTexture8
 {
   public:
     LinuxTexture(UINT width, UINT height, D3DFORMAT format)
-        : refs(1), priority(0), glName(0), uploaded(false), discardCpuCopy(false)
+        : refs(1), priority(0), glName(0), uploaded(false), discardCpuCopy(false), pspGlFormat(0), pspGlType(0)
     { surface = new LinuxSurface(width, height, format, false, this); }
     ~LinuxTexture()
     {
@@ -1607,7 +1728,11 @@ class LinuxTexture : public IDirect3DTexture8
         // the already fragmented gameplay heap.
         th08::psp::RenderResourceAllocationScope arenaScope("texture upload");
         PspGe4StaticUploadScope staticUpload(
-            discardCpuCopy && !surface->pixels.empty());
+            discardCpuCopy && !surface->pixels.empty()
+#if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
+            && !pspSuppressStaticUploadPromotion
+#endif
+        );
         if (surface->pixels.empty())
         {
             fprintf(stderr,
@@ -1670,6 +1795,8 @@ class LinuxTexture : public IDirect3DTexture8
             }
             uploaded = true;
             surface->dirty = false;
+            pspGlFormat = emptyFormat;
+            pspGlType = emptyType;
             return;
         }
 
@@ -1816,6 +1943,9 @@ class LinuxTexture : public IDirect3DTexture8
     GLuint glName;
     bool uploaded;
     bool discardCpuCopy;
+    // GL client format/type the live GE image was created with (0 = unknown).
+    GLenum pspGlFormat;
+    GLenum pspGlType;
 #if TH08_PSP_PREPARE_STATE_CACHE_ENABLED
     // Sampler parameters are texture-object state.  Keep their applied values
     // beside the owning GL name so deletion/name reuse cannot inherit a stale
@@ -1972,6 +2102,24 @@ void ConfigureTextureComponent(GLenum combineParameter, GLenum source0Parameter,
 class LinuxDevice : public IDirect3DDevice8
 {
   public:
+#if TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND_ENABLED
+    // Entry for Background::OnDraw (th08_linux_dialogue_snapshot_restore).
+    void RestoreDialogueSnapshotExternal()
+    {
+#if TH08_PSP_DIALOGUE_SNAPSHOT_DIAG_ENABLED
+        static unsigned long diagCalls = 0;
+        if (diagCalls < 3UL)
+        {
+            ++diagCalls;
+            th08::psp::BootLog("DIALOGUE_BG_HOOK entry=%lu ready=%d surface=%p backbuffer=%p\n",
+                               diagCalls, dialogueSnapshotReady ? 1 : 0,
+                               static_cast<void *>(dialogueSnapshotSurface),
+                               static_cast<void *>(backbuffer));
+        }
+#endif
+        RestoreDialogueSnapshot();
+    }
+#endif
     LinuxDevice(SDL_Window *window_, const D3DPRESENT_PARAMETERS &parameters)
         : refs(1), window(window_), context(NULL), backbuffer(NULL), texture(NULL), vertexBuffer(NULL),
           fvf(0), streamStride(0), renderFramebuffer(0), renderColorTexture(0), renderDepthBuffer(0),
@@ -2795,6 +2943,16 @@ class LinuxDevice : public IDirect3DDevice8
         textureStates[D3DTSS_MINFILTER] = D3DTEXF_LINEAR;
         textureStates[D3DTSS_MAGFILTER] = D3DTEXF_LINEAR;
         fvf = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+#if TH08_PSP_DIALOGUE_SNAPSHOT_DIAG_ENABLED
+        if (pspDialogueRestoreDiagFlash)
+        {
+            textureStates[D3DTSS_COLOROP] = D3DTOP_SELECTARG1;
+            textureStates[D3DTSS_COLORARG1] = D3DTA_DIFFUSE;
+        }
+        const DWORD quadDiffuse = pspDialogueRestoreDiagFlash ? 0xffff00ffu : 0xffffffffu;
+#else
+        const DWORD quadDiffuse = 0xffffffffu;
+#endif
 
         constexpr float textureWidth = 512.0f;
         constexpr float textureHeight = 512.0f;
@@ -2828,7 +2986,7 @@ class LinuxDevice : public IDirect3DDevice8
             quad[index].pos.y = ys[index];
             quad[index].pos.z = 0.0f;
             quad[index].w = 1.0f;
-            quad[index].diffuse = 0xffffffffu;
+            quad[index].diffuse = quadDiffuse;
             quad[index].textureUV.x = us[index];
             quad[index].textureUV.y = vs[index];
         }
@@ -2847,6 +3005,9 @@ class LinuxDevice : public IDirect3DDevice8
     HRESULT CopyRects(IDirect3DSurface8 *sourceRaw, const RECT *sourceRects, UINT count,
                       IDirect3DSurface8 *destinationRaw, const POINT *destinationPoints)
     {
+#if defined(PSP)
+        gPspSurfaceOp = "CopyRects";
+#endif
 #if TH08_PSP_PREPARE_STATE_CACHE_ENABLED
         PspPrepareStateBoundary stateBoundary(&pspPrepareStateCache);
 #endif
@@ -3004,12 +3165,16 @@ class LinuxDevice : public IDirect3DDevice8
                                static_cast<int>(backbuffer->height));
 #endif
         const bool dialogPresent = th08::g_Gui.IsDialoguePresent() != 0;
+#if !TH08_PSP_DIALOGUE_LIVE_BACKGROUND_ENABLED
         if (dialogPresent && !wasDialogPresent)
             CaptureDialogueSnapshot();
+#if !TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND_ENABLED
         if (dialogPresent && dialogueSnapshotReady)
             RestoreDialogueSnapshot();
+#endif
         if (!dialogPresent && wasDialogPresent)
             ReleaseDialogueSnapshot();
+#endif
         wasDialogPresent = dialogPresent;
         return S_OK;
     }
@@ -3342,6 +3507,14 @@ class LinuxDevice : public IDirect3DDevice8
         if (result == NULL || width == 0 || height == 0) return E_INVALIDARG;
         if (format == D3DFMT_UNKNOWN) format = D3DFMT_A8R8G8B8;
         *result = new(std::nothrow) LinuxSurface(width, height, format, false, NULL);
+#if defined(PSP)
+        if (*result != NULL && static_cast<LinuxSurface *>(*result)->pixels.empty())
+        {
+            (*result)->Release();
+            *result = NULL;
+            return E_OUTOFMEMORY;
+        }
+#endif
         return *result != NULL ? S_OK : E_OUTOFMEMORY;
     }
     void DestroyRenderTarget()
@@ -3481,6 +3654,10 @@ class LinuxDevice : public IDirect3DDevice8
         th08::psp::RenderResourceArenaFreeResult tempFreeResult =
             th08::psp::RenderResourceArenaFreeResult::NotOwned;
 
+#if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
+        // Covers the native capture texture and the arena fallback below.
+        pspSuppressStaticUploadPromotion = true;
+#endif
         if (!useArenaFallback)
         {
             captured = th08_linux_surface_capture_native(
@@ -3605,6 +3782,9 @@ class LinuxDevice : public IDirect3DDevice8
                 static_cast<unsigned long>(before.failureCount),
                 static_cast<unsigned long>(after.failureCount));
         }
+#if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
+        pspSuppressStaticUploadPromotion = false;
+#endif
         if (!captured || snapshot == NULL)
         {
             ++dialogueCaptureFailures;
@@ -3672,7 +3852,24 @@ class LinuxDevice : public IDirect3DDevice8
         POINT destinationPoint;
         destinationPoint.x = 0;
         destinationPoint.y = 0;
-        if (!DrawPspSurfaceCache(dialogueSnapshotSurface, sourceRect, destinationPoint))
+#if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
+        // The snapshot is rewritten every conversation: keep it out of the
+        // GE-only upper tier (R-045).
+        pspSuppressStaticUploadPromotion = true;
+#endif
+#if TH08_PSP_DIALOGUE_SNAPSHOT_DIAG_ENABLED
+        pspDialogueRestoreDiagFlash =
+            dialogueRestoresThisCapture < 120U && (dialogueRestoresThisCapture % 30U) < 4U;
+#endif
+        const bool snapshotDrawn =
+            DrawPspSurfaceCache(dialogueSnapshotSurface, sourceRect, destinationPoint);
+#if TH08_PSP_DIALOGUE_SNAPSHOT_DIAG_ENABLED
+        pspDialogueRestoreDiagFlash = false;
+#endif
+#if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
+        pspSuppressStaticUploadPromotion = false;
+#endif
+        if (!snapshotDrawn)
         {
             ++dialogueRestoreFailures;
             if (!dialogueRestoreFailureLogged)
@@ -6768,6 +6965,9 @@ bool th08_linux_surface_access(IDirect3DSurface8 *surfaceRaw, LinuxSurfaceAccess
 {
     if (surfaceRaw == NULL || access == NULL) return false;
     LinuxSurface *surface = static_cast<LinuxSurface *>(surfaceRaw);
+#if defined(PSP)
+    if (surface->backbuffer) gPspShadowReason = readBackbuffer ? "surface_access(read)" : "surface_access(dest)";
+#endif
     if (!surface->EnsurePixels()) return false;
     // PSP capture releases the logical backbuffer shadow after each use to
     // avoid pinning a full frame in the fragmented game heap.  Recreate that
@@ -6778,6 +6978,191 @@ bool th08_linux_surface_access(IDirect3DSurface8 *surfaceRaw, LinuxSurfaceAccess
     access->pitch = surface->pitch; access->format = surface->format; return true;
 }
 
+void th08_linux_surface_access_end(IDirect3DSurface8 *surfaceRaw)
+{
+#if defined(PSP)
+    if (surfaceRaw == NULL) return;
+    static_cast<LinuxSurface *>(surfaceRaw)->DropScratchShadow();
+#else
+    (void)surfaceRaw;
+#endif
+}
+#if defined(PSP)
+// Capture straight from the backbuffer shadow into the destination texture's
+// live PSPGL image with glTexSubImage2D.  The generic D3DX copy first
+// materializes the destination's full CPU copy (512 KiB for a 512x512 text
+// texture) from the renderer arena; when a stage's textures fill the arena that
+// allocation fails and the game aborted (R-057 stage 4B).  This path needs only
+// a 16 KiB static band buffer.  Returns false to let the generic route run.
+static RECT PspCaptureFullRect(UINT width, UINT height)
+{
+    RECT r; r.left = 0; r.top = 0; r.right = static_cast<LONG>(width); r.bottom = static_cast<LONG>(height); return r;
+}
+static bool PspCaptureValidRect(const RECT &r)
+{
+    return r.left >= 0 && r.top >= 0 && r.right > r.left && r.bottom > r.top;
+}
+static BYTE gPspCaptureBand[16384];
+static unsigned long gPspCaptureDirectOk = 0UL;
+static unsigned long gPspCaptureDirectFail = 0UL;
+bool th08_linux_capture_direct_to_texture(IDirect3DSurface8 *destinationRaw, const RECT *destinationRectRaw,
+                                          const LinuxSurfaceAccess &source, const RECT *sourceRectRaw,
+                                          D3DCOLOR colorKey)
+{
+    if (destinationRaw == NULL || source.pixels == NULL) return false;
+    LinuxSurface *destination = static_cast<LinuxSurface *>(destinationRaw);
+    if (destination->backbuffer || destination->owner == NULL) return false;
+    LinuxTexture *texture = destination->owner;
+    // Only when the CPU copy is absent (static/capture texture) and the GPU
+    // image exists; otherwise the generic path is allocation-free already.
+    if (texture->glName == 0 || !texture->uploaded || !destination->pixels.empty()) return false;
+    if (destination->width == 0 || destination->height == 0) return false;
+    const UINT sourceBytes = BytesPerPixel(source.format);
+    if (!(source.format == D3DFMT_R5G6B5 && sourceBytes == 2) &&
+        !((source.format == D3DFMT_X8R8G8B8 || source.format == D3DFMT_A8R8G8B8) && sourceBytes == 4))
+        return false;
+    GLenum glFormat = GL_RGBA;
+    GLenum glType = GL_UNSIGNED_BYTE;
+    UINT destinationBytes = 4;
+    if (texture->pspGlType != 0)
+    {
+        glFormat = texture->pspGlFormat;
+        glType = texture->pspGlType;
+        destinationBytes = glType == GL_UNSIGNED_BYTE ? (glFormat == GL_RGB ? 3 : 4) : 2;
+    }
+    else
+    switch (destination->format)
+    {
+    case D3DFMT_A8R8G8B8:
+    case D3DFMT_X8R8G8B8:
+        break;
+    case D3DFMT_A4R4G4B4:
+        glType = GL_UNSIGNED_SHORT_4_4_4_4; destinationBytes = 2; break;
+    case D3DFMT_A1R5G5B5:
+    case D3DFMT_X1R5G5B5:
+        glType = GL_UNSIGNED_SHORT_5_5_5_1; destinationBytes = 2; break;
+    case D3DFMT_R5G6B5:
+        glFormat = GL_RGB; glType = GL_UNSIGNED_SHORT_5_6_5; destinationBytes = 2; break;
+    default:
+        return false;
+    }
+    RECT sourceRect = sourceRectRaw != NULL ? *sourceRectRaw : PspCaptureFullRect(source.width, source.height);
+    RECT destinationRect = destinationRectRaw != NULL ? *destinationRectRaw
+                                                      : PspCaptureFullRect(destination->width, destination->height);
+    if (!PspCaptureValidRect(sourceRect) || !PspCaptureValidRect(destinationRect) ||
+        sourceRect.right > static_cast<LONG>(source.width) ||
+        sourceRect.bottom > static_cast<LONG>(source.height))
+        return false;
+    if (destinationRect.right > static_cast<LONG>(destination->width))
+        destinationRect.right = static_cast<LONG>(destination->width);
+    if (destinationRect.bottom > static_cast<LONG>(destination->height))
+        destinationRect.bottom = static_cast<LONG>(destination->height);
+    if (!PspCaptureValidRect(destinationRect)) return false;
+    const UINT destinationWidth = static_cast<UINT>(destinationRect.right - destinationRect.left);
+    const UINT destinationHeight = static_cast<UINT>(destinationRect.bottom - destinationRect.top);
+    const UINT sourceWidth = static_cast<UINT>(sourceRect.right - sourceRect.left);
+    const UINT sourceHeight = static_cast<UINT>(sourceRect.bottom - sourceRect.top);
+    const UINT rowBytes = destinationWidth * destinationBytes;
+    if (rowBytes == 0 || rowBytes > sizeof(gPspCaptureBand)) return false;
+    const UINT bandRows = static_cast<UINT>(sizeof(gPspCaptureBand) / rowBytes);
+#if TH08_PSP_PREPARE_STATE_CACHE_ENABLED
+    PspPrepareStateBoundary stateBoundary(g_pspPrepareStateCache);
+    texture->pspSamplerValidMask = 0;
+#endif
+    while (glGetError() != GL_NO_ERROR) {}
+    glBindTexture(GL_TEXTURE_2D, texture->glName);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, glType == GL_UNSIGNED_BYTE ? 1 : 2);
+    GLenum error = GL_NO_ERROR;
+    for (UINT y0 = 0; y0 < destinationHeight && error == GL_NO_ERROR; y0 += bandRows)
+    {
+        const UINT rows = (destinationHeight - y0 < bandRows) ? destinationHeight - y0 : bandRows;
+        for (UINT r = 0; r < rows; ++r)
+        {
+            const UINT y = y0 + r;
+            const UINT sourceY = static_cast<UINT>(sourceRect.top) +
+                static_cast<UINT>((static_cast<unsigned long long>(y) * sourceHeight) / destinationHeight);
+            const BYTE *sourceRow = source.pixels + sourceY * source.pitch;
+            BYTE *out = gPspCaptureBand + r * rowBytes;
+            for (UINT x = 0; x < destinationWidth; ++x)
+            {
+                const UINT sourceX = static_cast<UINT>(sourceRect.left) +
+                    static_cast<UINT>((static_cast<unsigned long long>(x) * sourceWidth) / destinationWidth);
+                BYTE red, green, blue, alpha = 0xFF;
+                if (sourceBytes == 2)
+                {
+                    const WORD v = *reinterpret_cast<const WORD *>(sourceRow + sourceX * 2);
+                    red = static_cast<BYTE>(((v >> 11) & 0x1F) * 255 / 31);
+                    green = static_cast<BYTE>(((v >> 5) & 0x3F) * 255 / 63);
+                    blue = static_cast<BYTE>((v & 0x1F) * 255 / 31);
+                }
+                else
+                {
+                    const BYTE *p = sourceRow + sourceX * 4;
+                    blue = p[0]; green = p[1]; red = p[2];
+                    alpha = source.format == D3DFMT_A8R8G8B8 ? p[3] : 0xFF;
+                }
+                if (colorKey != 0 && (colorKey & 0x00ffffffu) ==
+                    ((static_cast<DWORD>(red) << 16) | (static_cast<DWORD>(green) << 8) | blue))
+                    alpha = 0;
+                switch (glType)
+                {
+                case GL_UNSIGNED_SHORT_4_4_4_4:
+                    *reinterpret_cast<WORD *>(out + x * 2) = static_cast<WORD>(
+                        ((red >> 4) << 12) | ((green >> 4) << 8) | ((blue >> 4) << 4) | (alpha >> 4));
+                    break;
+                case GL_UNSIGNED_SHORT_5_5_5_1:
+                    *reinterpret_cast<WORD *>(out + x * 2) = static_cast<WORD>(
+                        ((red >> 3) << 11) | ((green >> 3) << 6) | ((blue >> 3) << 1) | (alpha >> 7));
+                    break;
+                case GL_UNSIGNED_SHORT_5_6_5:
+                    *reinterpret_cast<WORD *>(out + x * 2) = static_cast<WORD>(
+                        ((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3));
+                    break;
+                default:
+                    if (destinationBytes == 3)
+                    {
+                        out[x * 3 + 0] = red; out[x * 3 + 1] = green; out[x * 3 + 2] = blue;
+                    }
+                    else
+                    {
+                        out[x * 4 + 0] = red; out[x * 4 + 1] = green; out[x * 4 + 2] = blue; out[x * 4 + 3] = alpha;
+                    }
+                    break;
+                }
+            }
+        }
+        glTexSubImage2D(GL_TEXTURE_2D, 0, destinationRect.left, destinationRect.top + static_cast<GLint>(y0),
+                        static_cast<GLsizei>(destinationWidth), static_cast<GLsizei>(rows), glFormat, glType,
+                        gPspCaptureBand);
+        error = glGetError();
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    if (error != GL_NO_ERROR)
+    {
+        ++gPspCaptureDirectFail;
+        if (gPspCaptureDirectFail <= 8UL)
+            th08::psp::BootLog("CAPTURE_DIRECT fail error=0x%04x dst=%lux%lu fmt=%lu rect=%ldx%ld\n",
+                               static_cast<unsigned int>(error), static_cast<unsigned long>(destination->width),
+                               static_cast<unsigned long>(destination->height),
+                               static_cast<unsigned long>(destination->format),
+                               static_cast<long>(destinationWidth), static_cast<long>(destinationHeight));
+        return false;
+    }
+    destination->dirty = false;
+    destination->pspBlitTextureDirty = true;
+    texture->uploaded = true;
+    ++gPspCaptureDirectOk;
+    if (gPspCaptureDirectOk <= 4UL || (gPspCaptureDirectOk % 64UL) == 0UL)
+        th08::psp::BootLog("CAPTURE_DIRECT ok count=%lu dst=%lux%lu fmt=%lu rect=%ldx%ld at=%ld,%ld src=%ld,%ld\n",
+                           gPspCaptureDirectOk, static_cast<unsigned long>(destination->width),
+                           static_cast<unsigned long>(destination->height),
+                           static_cast<unsigned long>(destination->format), static_cast<long>(destinationWidth),
+                           static_cast<long>(destinationHeight), static_cast<long>(destinationRect.left),
+                           static_cast<long>(destinationRect.top), static_cast<long>(sourceRect.left),
+                           static_cast<long>(sourceRect.top));
+    return true;
+}
+#endif
 void th08_linux_surface_changed(IDirect3DSurface8 *surfaceRaw)
 {
     if (surfaceRaw == NULL) return;
@@ -6850,6 +7235,29 @@ bool th08_linux_surface_capture_native(UINT logicalWidth, UINT logicalHeight,
     return true;
 }
 
+// Owner tag (ANM file name) recorded for renderer-arena census lines.
+static char gPspTextureUploadOwner[32] = "";
+extern "C" void th08_linux_set_texture_upload_owner(const char *name)
+{
+    if (name == NULL) { gPspTextureUploadOwner[0] = '\0'; return; }
+    std::size_t i = 0;
+    for (; i + 1 < sizeof(gPspTextureUploadOwner) && name[i] != '\0'; ++i)
+        gPspTextureUploadOwner[i] = name[i];
+    gPspTextureUploadOwner[i] = '\0';
+}
+
+static unsigned long gPspAnmTexUploads = 0UL;
+static void PspNoteAnmTextureUpload(LinuxTexture *texture, LinuxSurface *surface, int converted)
+{
+    ++gPspAnmTexUploads;
+    const unsigned long bytes = static_cast<unsigned long>(surface->width) * surface->height *
+                                (texture->pspGlType == GL_UNSIGNED_BYTE ? 4UL : 2UL);
+    th08::psp::BootLog("ANM_TEX owner=%s size=%lux%lu d3d=%lu gl=0x%04x bytes=%lu conv=%d\n",
+                       gPspTextureUploadOwner[0] != '\0' ? gPspTextureUploadOwner : "?",
+                       static_cast<unsigned long>(surface->width), static_cast<unsigned long>(surface->height),
+                       static_cast<unsigned long>(surface->format), static_cast<unsigned int>(texture->pspGlType),
+                       bytes, converted);
+}
 bool th08_linux_texture_upload_static(IDirect3DTexture8 *textureRaw, const void *sourceRaw,
                                       UINT sourcePitch, D3DFORMAT sourceFormat)
 {
@@ -6870,8 +7278,13 @@ bool th08_linux_texture_upload_static(IDirect3DTexture8 *textureRaw, const void 
 
     // Scope the PSPGL allocation, not the ANM decode buffer: sourceRaw remains
     // owned by the retained streaming scratch and is released by its lease.
-    th08::psp::RenderResourceAllocationScope arenaScope("static ANM texture");
+    th08::psp::RenderResourceAllocationScope arenaScope(
+        gPspTextureUploadOwner[0] != '\0' ? gPspTextureUploadOwner : "static ANM texture");
+#if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
+    PspGe4StaticUploadScope staticUpload(!pspSuppressStaticUploadPromotion);
+#else
     PspGe4StaticUploadScope staticUpload(true);
+#endif
 
     GLenum uploadFormat = GL_RGBA;
     GLenum uploadType = GL_UNSIGNED_SHORT_4_4_4_4;
@@ -6904,6 +7317,68 @@ bool th08_linux_texture_upload_static(IDirect3DTexture8 *textureRaw, const void 
 
     const BYTE *source = static_cast<const BYTE *>(sourceRaw);
     const UINT sourceBytes = BytesPerPixel(sourceFormat);
+#if TH08_PSP_ANM_TEXTURE_16BIT_ENABLED
+    if (sourceFormat == D3DFMT_A8R8G8B8 && surface->format == D3DFMT_A8R8G8B8 && sourceBytes == 4 &&
+        sourcePitch == surface->width * 4)
+    {
+        // Convert the writable decode scratch in place (2-byte writes never
+        // overtake the 4-byte reads) and upload half the bytes.
+        BYTE *packedSource = const_cast<BYTE *>(source);
+        const UINT pixelCount = surface->width * surface->height;
+        bool binaryAlpha = true;
+        for (UINT i = 0; i < pixelCount; ++i)
+        {
+            const BYTE alpha = packedSource[i * 4 + 3];
+            if (alpha != 0 && alpha != 255)
+            {
+                binaryAlpha = false;
+                break;
+            }
+        }
+        WORD *packed16 = reinterpret_cast<WORD *>(packedSource);
+        if (binaryAlpha)
+        {
+            for (UINT i = 0; i < pixelCount; ++i)
+            {
+                const BYTE *p = packedSource + i * 4;
+                packed16[i] = static_cast<WORD>(((p[2] >> 3) << 11) | ((p[1] >> 3) << 6) | ((p[0] >> 3) << 1) | (p[3] >> 7));
+            }
+            uploadType = GL_UNSIGNED_SHORT_5_5_5_1;
+        }
+        else
+        {
+            for (UINT i = 0; i < pixelCount; ++i)
+            {
+                const BYTE *p = packedSource + i * 4;
+                packed16[i] = static_cast<WORD>(((p[2] >> 4) << 12) | ((p[1] >> 4) << 8) | ((p[0] >> 4) << 4) | (p[3] >> 4));
+            }
+            uploadType = GL_UNSIGNED_SHORT_4_4_4_4;
+        }
+        uploadFormat = GL_RGBA;
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, surface->width, surface->height, 0, GL_RGBA, uploadType,
+                     packedSource);
+        th08::psp::RenderPerfNoteActualUpload(pixelCount * 2U);
+        const GLenum convertError = glGetError();
+        if (convertError == GL_NO_ERROR)
+            staticUpload.Finalize(texture->glName);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        if (convertError != GL_NO_ERROR)
+        {
+            th08::psp::BootLog("ANM_TEX convert_error=0x%04x owner=%s size=%lux%lu\n",
+                               static_cast<unsigned int>(convertError), gPspTextureUploadOwner,
+                               static_cast<unsigned long>(surface->width), static_cast<unsigned long>(surface->height));
+            return false;
+        }
+        texture->uploaded = true;
+        texture->discardCpuCopy = true;
+        surface->dirty = false;
+        texture->pspGlFormat = uploadFormat;
+        texture->pspGlType = uploadType;
+        PspNoteAnmTextureUpload(texture, surface, 1);
+        return true;
+    }
+#endif
     if (sourceFormat == surface->format && sourceBytes == 4 &&
         sourcePitch == surface->width * 4)
     {
@@ -6945,6 +7420,9 @@ bool th08_linux_texture_upload_static(IDirect3DTexture8 *textureRaw, const void 
         if (directError == GL_NO_ERROR)
         {
             texture->uploaded = true;
+            texture->pspGlFormat = uploadFormat;
+            texture->pspGlType = uploadType;
+            PspNoteAnmTextureUpload(texture, surface, 0);
             texture->discardCpuCopy = true;
             surface->dirty = false;
             return true;
@@ -7011,6 +7489,9 @@ bool th08_linux_texture_upload_static(IDirect3DTexture8 *textureRaw, const void 
         if (directError == GL_NO_ERROR)
         {
             texture->uploaded = true;
+            texture->pspGlFormat = uploadFormat;
+            texture->pspGlType = uploadType;
+            PspNoteAnmTextureUpload(texture, surface, 0);
             texture->discardCpuCopy = true;
             surface->dirty = false;
             return true;
@@ -7089,6 +7570,12 @@ bool th08_linux_texture_upload_static(IDirect3DTexture8 *textureRaw, const void 
         return false;
 
     texture->uploaded = true;
+
+    texture->pspGlFormat = uploadFormat;
+
+    texture->pspGlType = uploadType;
+
+    PspNoteAnmTextureUpload(texture, surface, 0);
     texture->discardCpuCopy = true;
     surface->dirty = false;
     std::vector<BYTE>().swap(surface->pixels);
@@ -7181,6 +7668,25 @@ bool th08_linux_texture_region_stats(IDirect3DTexture8 *textureRaw, float u0, fl
         }
     }
     return true;
+}
+
+void th08_linux_dialogue_snapshot_restore(IDirect3DDevice8 *deviceRaw)
+{
+#if TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND_ENABLED
+#if TH08_PSP_DIALOGUE_SNAPSHOT_DIAG_ENABLED
+    static unsigned long diagCalls = 0;
+    if (diagCalls < 3UL)
+    {
+        ++diagCalls;
+        th08::psp::BootLog("DIALOGUE_BG_HOOK called=%lu device=%p\n", diagCalls,
+                           static_cast<void *>(deviceRaw));
+    }
+#endif
+    if (deviceRaw != NULL)
+        static_cast<LinuxDevice *>(deviceRaw)->RestoreDialogueSnapshotExternal();
+#else
+    (void)deviceRaw;
+#endif
 }
 
 bool th08_linux_begin_framebuffer_probe(IDirect3DDevice8 *deviceRaw, int left, int top,

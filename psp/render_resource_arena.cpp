@@ -249,8 +249,11 @@ bool WalkArenaLocked(const void *exactPayload, std::size_t fitBytes,
             summary->freeBytes += block->payloadBytes;
             if (block->payloadBytes > summary->largestFreeBytes)
                 summary->largestFreeBytes = block->payloadBytes;
-            if (summary->firstFit == nullptr && fitBytes != 0U &&
-                block->payloadBytes >= fitBytes)
+            // Best fit: keep the largest holes intact for the 512 KiB-1 MiB
+            // texture sheets that arrive late in a stage load.
+            if (fitBytes != 0U && block->payloadBytes >= fitBytes &&
+                (summary->firstFit == nullptr ||
+                 block->payloadBytes < summary->firstFit->payloadBytes))
             {
                 summary->firstFit = block;
             }
@@ -416,6 +419,86 @@ SurfaceDecodeAllocationScope::~SurfaceDecodeAllocationScope()
     }
 }
 
+bool RenderResourceArenaCanAllocate(std::size_t bytes)
+{
+    if (ArenaBase() == nullptr)
+        return true;
+    std::size_t needed = 0U;
+    if (bytes == 0U || !TryAlignUp(bytes, kAlignment, &needed))
+        return false;
+    return RenderResourceArenaLargestFree() >= needed;
+}
+
+std::size_t RenderResourceArenaLargestFree()
+{
+    if (ArenaBase() == nullptr)
+        return 0U;
+    LockArena();
+    std::size_t largest = 0U;
+    for (BlockHeader *b = gFirstBlock; b != nullptr; b = b->next)
+    {
+        if (b->magic != kBlockMagic)
+            break;
+        if ((b->flags & kBlockAllocated) == 0U && b->payloadBytes > largest)
+            largest = b->payloadBytes;
+    }
+    UnlockArena();
+    return largest;
+}
+
+void RenderResourceArenaLogCensus(const char *tag, std::size_t minBytes)
+{
+    // Snapshot of the live blocks (largest first is not needed; arena order
+    // shows fragmentation).  Collected under the lock, logged outside it.
+    struct CensusEntry { char owner[32]; std::size_t bytes; std::uint32_t generation; };
+    static CensusEntry census[128];
+    static SceUID censusGuard = -1;
+    if (ArenaBase() == nullptr)
+        return;
+    LockArena();
+    int count = 0;
+    std::uint32_t freeBlocks = 0U, liveBlocks = 0U, smallLive = 0U;
+    std::size_t liveBytes = 0U, freeBytes = 0U, largestFree = 0U, smallBytes = 0U;
+    for (BlockHeader *b = gFirstBlock; b != nullptr; b = b->next)
+    {
+        if (b->magic != kBlockMagic)
+            break;
+        if ((b->flags & kBlockAllocated) == 0U)
+        {
+            ++freeBlocks;
+            freeBytes += b->payloadBytes;
+            if (b->payloadBytes > largestFree)
+                largestFree = b->payloadBytes;
+            continue;
+        }
+        ++liveBlocks;
+        liveBytes += b->payloadBytes;
+        if (b->payloadBytes < minBytes || count >= 128)
+        {
+            ++smallLive;
+            smallBytes += b->payloadBytes;
+            continue;
+        }
+        CopyOwner(census[count].owner, b->owner);
+        census[count].bytes = b->payloadBytes;
+        census[count].generation = b->generation;
+        ++count;
+    }
+    UnlockArena();
+    (void)censusGuard;
+    BootLog("RENDER_ARENA census tag=%s live=%lu live_blocks=%lu free=%lu free_blocks=%lu largest=%lu "
+            "small_live=%lu small_bytes=%lu listed=%d\n",
+            tag != nullptr ? tag : "?", static_cast<unsigned long>(liveBytes),
+            static_cast<unsigned long>(liveBlocks), static_cast<unsigned long>(freeBytes),
+            static_cast<unsigned long>(freeBlocks), static_cast<unsigned long>(largestFree),
+            static_cast<unsigned long>(smallLive), static_cast<unsigned long>(smallBytes), count);
+    for (int i = 0; i < count; ++i)
+        BootLog("RENDER_ARENA block tag=%s owner=%s bytes=%lu gen=%lu\n", tag != nullptr ? tag : "?",
+                census[i].owner, static_cast<unsigned long>(census[i].bytes),
+                static_cast<unsigned long>(census[i].generation));
+    FlushBootLog();
+}
+
 void *RenderResourceArenaAllocate(std::size_t bytes, std::size_t alignment,
                                   const char *owner)
 {
@@ -450,6 +533,14 @@ void *RenderResourceArenaAllocate(std::size_t bytes, std::size_t alignment,
     {
         CountFailure();
         UnlockArena();
+        BootLog("RENDER_ARENA alloc_fail owner=%s bytes=%lu needed=%lu live=%lu free=%lu largest=%lu "
+                "allocs=%lu\n",
+                owner != nullptr ? owner : "?", static_cast<unsigned long>(bytes),
+                static_cast<unsigned long>(needed), static_cast<unsigned long>(walk.liveBytes),
+                static_cast<unsigned long>(walk.freeBytes),
+                static_cast<unsigned long>(walk.largestFreeBytes),
+                static_cast<unsigned long>(walk.liveAllocations));
+        RenderResourceArenaLogCensus("alloc_fail", 4096U);
         return nullptr;
     }
 

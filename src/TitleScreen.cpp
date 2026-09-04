@@ -10,6 +10,9 @@
 #include "TitleScreen.hpp"
 #include "ZunMath.hpp"
 #include "i18n.hpp"
+#if defined(PSP)
+#include "debug_start_stage.hpp"
+#endif
 
 #include <direct.h>
 #include <stdio.h>
@@ -1908,6 +1911,13 @@ ChainCallbackResult TitleScreen::OnUpdateCharacterSelect()
             {
                 g_GameManager.currentStage = g_GameManager.difficulty + EXTRA;
             }
+#if defined(PSP) && TH08_PSP_DEBUG_START_STAGE_ENABLED
+            {
+                const int debugStage = th08::psp::DebugStartStageOverride();
+                if (debugStage >= 0)
+                    g_GameManager.currentStage = static_cast<decltype(g_GameManager.currentStage)>(debugStage);
+            }
+#endif
 
             g_Supervisor.curState = SupervisorState_GameManager;
             g_GameManager.SetIsReplayWeird(FALSE);

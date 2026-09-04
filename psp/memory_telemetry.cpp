@@ -1,6 +1,8 @@
 #include "memory_telemetry.hpp"
 
 #include "audio_telemetry.hpp"
+#include "debug_start_stage.hpp"
+#include "fileio.hpp"
 #include "anm_scratch.hpp"
 #include "ecl_child_memory.hpp"
 #include "newlib_heap_geometry.hpp"
@@ -2133,6 +2135,13 @@ void MemoryTelemetryInitialize(const char *gameDirectory)
 
 void MemoryTelemetryMarkPhase(const char *phase)
 {
+#if TH08_PSP_DEBUG_START_STAGE_ENABLED
+    BootLog("PHASE_MARK %s\n", phase);
+    FlushBootLog();
+    if (phase != nullptr && (std::strcmp(phase, "stage_audio_ready") == 0 ||
+                             std::strcmp(phase, "stage_setup_failed") == 0))
+        RenderResourceArenaLogCensus(phase, 4096U);
+#endif
     if (!gInitialized)
         return;
     UpdatePoolHighWater();

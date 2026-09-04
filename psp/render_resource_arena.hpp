@@ -42,6 +42,12 @@ class SurfaceDecodeAllocationScope
 
 void *RenderResourceArenaAllocate(std::size_t bytes, std::size_t alignment,
                                   const char *owner);
+// Logs a census of live arena blocks (>= minBytes) to the boot log and flushes.
+void RenderResourceArenaLogCensus(const char *tag, std::size_t minBytes);
+// Largest free block payload currently available (0 when the arena is absent).
+std::size_t RenderResourceArenaLargestFree();
+// True when a block of `bytes` could be carved right now (true before init).
+bool RenderResourceArenaCanAllocate(std::size_t bytes);
 void *RenderResourceArenaReallocate(void *memory, std::size_t bytes,
                                     std::size_t alignment, const char *owner);
 

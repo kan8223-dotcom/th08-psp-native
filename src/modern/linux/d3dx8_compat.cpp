@@ -1,3 +1,9 @@
+#if defined(PSP)
+extern "C" void th08_linux_note_surface_op(const char *op);
+#define TH08_NOTE_SURFACE_OP(x) th08_linux_note_surface_op(x)
+#else
+#define TH08_NOTE_SURFACE_OP(x) ((void)0)
+#endif
 #include "d3d8_internal.hpp"
 
 #include <SDL.h>
@@ -166,11 +172,16 @@ HRESULT CopyRgbaToSurface(IDirect3DSurface8 *destinationRaw, const RECT *destina
     th08_linux_surface_changed(destinationRaw); return S_OK;
 }
 
-HRESULT CopySurface(IDirect3DSurface8 *destinationRaw, const RECT *destinationRectRaw,
+HRESULT CopySurfaceImpl(IDirect3DSurface8 *destinationRaw, const RECT *destinationRectRaw,
                     IDirect3DSurface8 *sourceRaw, const RECT *sourceRectRaw, D3DCOLOR colorKey)
 {
+    TH08_NOTE_SURFACE_OP("CopySurface");
     LinuxSurfaceAccess source;
     if (!th08_linux_surface_access(sourceRaw, &source, true) || source.pixels == NULL) return E_INVALIDARG;
+#if defined(PSP)
+    if (th08_linux_capture_direct_to_texture(destinationRaw, destinationRectRaw, source, sourceRectRaw, colorKey))
+        return S_OK;
+#endif
 
     // Embedded ANM images and PSP framebuffer captures are copied between
     // equal-format, equal-sized rectangles. Preserve those packed pixels
@@ -269,6 +280,13 @@ HRESULT CopySurface(IDirect3DSurface8 *destinationRaw, const RECT *destinationRe
     th08_linux_surface_changed(destinationRaw);
     return S_OK;
 }
+HRESULT CopySurface(IDirect3DSurface8 *destinationRaw, const RECT *destinationRectRaw,
+                    IDirect3DSurface8 *sourceRaw, const RECT *sourceRectRaw, D3DCOLOR colorKey)
+{
+    const HRESULT result = CopySurfaceImpl(destinationRaw, destinationRectRaw, sourceRaw, sourceRectRaw, colorKey);
+    th08_linux_surface_access_end(sourceRaw);
+    return result;
+}
 
 #if defined(PSP)
 HRESULT CopyMemoryAreaAverage(IDirect3DSurface8 *destinationRaw,
@@ -276,6 +294,7 @@ HRESULT CopyMemoryAreaAverage(IDirect3DSurface8 *destinationRaw,
                               const LinuxSurfaceAccess &source,
                               const RECT *sourceRectRaw, D3DCOLOR colorKey)
 {
+    TH08_NOTE_SURFACE_OP("CopyMemoryAreaAverage");
     LinuxSurfaceAccess destination;
     if (source.pixels == NULL ||
         !th08_linux_surface_access(destinationRaw, &destination, false) ||
@@ -374,17 +393,27 @@ HRESULT CopyMemoryAreaAverage(IDirect3DSurface8 *destinationRaw,
     return S_OK;
 }
 
-HRESULT CopySurfaceAreaAverage(IDirect3DSurface8 *destinationRaw,
+HRESULT CopySurfaceAreaAverageImpl(IDirect3DSurface8 *destinationRaw,
                                const RECT *destinationRectRaw,
                                IDirect3DSurface8 *sourceRaw,
                                const RECT *sourceRectRaw, D3DCOLOR colorKey)
 {
+    TH08_NOTE_SURFACE_OP("CopySurfaceAreaAverage");
     LinuxSurfaceAccess source;
     if (!th08_linux_surface_access(sourceRaw, &source, true) ||
         source.pixels == NULL)
         return E_INVALIDARG;
     return CopyMemoryAreaAverage(destinationRaw, destinationRectRaw, source,
                                  sourceRectRaw, colorKey);
+}
+HRESULT CopySurfaceAreaAverage(IDirect3DSurface8 *destinationRaw,
+                               const RECT *destinationRectRaw,
+                               IDirect3DSurface8 *sourceRaw,
+                               const RECT *sourceRectRaw, D3DCOLOR colorKey)
+{
+    const HRESULT result = CopySurfaceAreaAverageImpl(destinationRaw, destinationRectRaw, sourceRaw, sourceRectRaw, colorKey);
+    th08_linux_surface_access_end(sourceRaw);
+    return result;
 }
 #endif
 
@@ -613,6 +642,7 @@ bool th08_linux_surface_load_image_memory(IDirect3DDevice8 *device, const void *
                                           UINT size, IDirect3DSurface8 **surface,
                                           UINT *width, UINT *height)
 {
+    TH08_NOTE_SURFACE_OP("load_image_memory");
     if (device == NULL || data == NULL || size == 0 || surface == NULL)
         return false;
 

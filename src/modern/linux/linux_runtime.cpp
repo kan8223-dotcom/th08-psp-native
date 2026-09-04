@@ -313,6 +313,14 @@ void InstallCrashReporter()
 void LogArchiveRequest(const char *path)
 {
 #if defined(PSP)
+#if !(defined(TH08_PSP_ARCHIVE_REQUEST_TRACE) && TH08_PSP_ARCHIVE_REQUEST_TRACE)
+    // Diagnostic only.  Every resource request used to fopen/append/fclose
+    // modern-files.txt on the stick; on PSP Go that write traffic interleaved
+    // with th08.dat reads is the prime suspect for the 30 s read stalls the
+    // I/O lamp recorded (r132-H), the same shape as the TH07 ef0 reopen stall.
+    (void)path;
+    return;
+#endif
     char logPath[640];
     const char *gameDirectory = th08::psp::GameDirectory();
     if (gameDirectory == NULL ||

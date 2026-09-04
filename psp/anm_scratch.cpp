@@ -17,13 +17,23 @@ namespace
 // 8,520,496 bytes. Reserve one early, fixed-size phase scratch with full-page
 // guards on both sides. Resource bytes and texture quality remain unchanged.
 constexpr std::size_t kLargestOriginalAnmBytes = 8520496U;
-constexpr std::size_t kArenaAlignment = 64U;
+// TH08_PSP_ANM_SCRATCH_COMPACT: only the Last Word effect sets (eff09*.anm,
+// 8,520,496 B) need the full reserve.  Every stage 1-6 and Extra resource fits
+// in 2,886,088 B (stg6bg.anm), so the compact reserve keeps ~5 MiB of heap
+// for the game.  Oversized ANMs fail closed at acquire time (R-056).
+#if defined(TH08_PSP_ANM_SCRATCH_COMPACT) && TH08_PSP_ANM_SCRATCH_COMPACT
+constexpr std::size_t kLargestSupportedAnmBytes = 2886088U;
+constexpr std::size_t kReservedBytes = 0x310000U;
+#else
+constexpr std::size_t kLargestSupportedAnmBytes = kLargestOriginalAnmBytes;
 constexpr std::size_t kReservedBytes = 0x840000U;
+#endif
+constexpr std::size_t kArenaAlignment = 64U;
 constexpr std::size_t kGuardBytes = 0x1000U;
 constexpr std::size_t kArenaBytes = kReservedBytes - (2U * kGuardBytes);
 constexpr unsigned char kGuardValue = 0xa5U;
 
-static_assert(kArenaBytes >= kLargestOriginalAnmBytes,
+static_assert(kArenaBytes >= kLargestSupportedAnmBytes,
               "ANM phase scratch must hold the largest original resource");
 
 unsigned char *gRawAllocation = nullptr;
@@ -115,7 +125,7 @@ bool AnmScratchInitialize()
             static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(gArena)),
             static_cast<unsigned long>(kArenaBytes),
             static_cast<unsigned long>(kReservedBytes),
-            static_cast<unsigned long>(kLargestOriginalAnmBytes),
+            static_cast<unsigned long>(kLargestSupportedAnmBytes),
             static_cast<unsigned long>(kGuardBytes));
     return true;
 }
@@ -127,7 +137,15 @@ bool AnmScratchTryAcquire(std::size_t bytes, int anmIndex, const char *owner,
         *outLease = AnmScratchLease{};
     if (gArena == nullptr || outLease == nullptr || anmIndex < 0 ||
         !EndsWithAnm(owner) || bytes > kArenaBytes || gPoisoned != 0)
+    {
+        if (owner != nullptr && bytes > kArenaBytes)
+        {
+            BootLog("ANM_SCRATCH reject owner=%s bytes=%lu capacity=%lu\n", owner,
+                    static_cast<unsigned long>(bytes), static_cast<unsigned long>(kArenaBytes));
+            FlushBootLog();
+        }
         return false;
+    }
     const std::uint64_t waitStarted = sceKernelGetSystemTimeWide();
     bool reportedWait = false;
     while (!__sync_bool_compare_and_swap(&gBusy, ScratchState_Idle,

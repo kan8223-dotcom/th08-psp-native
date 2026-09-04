@@ -8,6 +8,16 @@
 #include "GameManager.hpp"
 #include "Player.hpp"
 #include "Supervisor.hpp"
+#if defined(PSP)
+#include "dialogue_snapshot_at_background.hpp"
+#include "dialogue_live_background.hpp"
+#include "dialogue_snapshot_diag.hpp"
+#include "fileio.hpp"
+#include "modern/linux/d3d8_internal.hpp"
+#endif
+#if !defined(TH08_PSP_DIALOGUE_LIVE_BACKGROUND_ENABLED)
+#define TH08_PSP_DIALOGUE_LIVE_BACKGROUND_ENABLED 0
+#endif
 
 #if defined(PSP)
 #include "draw_priority_subprofile.hpp"
@@ -898,7 +908,7 @@ ChainCallbackResult Background::OnDrawHighPrio(Background *background)
     background->tint.b = 0x80;
 
     if (background->spellBackgroundState <= SPELL_BACKGROUND_FADING_IN &&
-        !g_Gui.IsDialoguePresent())
+        (TH08_PSP_DIALOGUE_LIVE_BACKGROUND_ENABLED || !g_Gui.IsDialoguePresent()))
     {
         if (background->stageVm0.activeSpriteIndex > 0)
         {
@@ -957,11 +967,30 @@ ChainCallbackResult Background::OnDrawHighPrio(Background *background)
     }
 
     if (background->spellBackgroundState <= SPELL_BACKGROUND_FADING_IN &&
-        !g_Gui.IsDialoguePresent())
+        (TH08_PSP_DIALOGUE_LIVE_BACKGROUND_ENABLED || !g_Gui.IsDialoguePresent()))
     {
         background->RenderObjects(0);
         background->RenderObjects(1);
     }
+#if defined(PSP) && TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND_ENABLED
+    else if (background->spellBackgroundState <= SPELL_BACKGROUND_FADING_IN)
+    {
+        // The original leaves the previous frame in the backbuffer here.
+        th08_linux_dialogue_snapshot_restore(g_Supervisor.d3dDevice);
+    }
+#if TH08_PSP_DIALOGUE_SNAPSHOT_DIAG_ENABLED
+    else if (g_Gui.IsDialoguePresent())
+    {
+        static i32 loggedSpellState = -1;
+        if (loggedSpellState != background->spellBackgroundState)
+        {
+            loggedSpellState = background->spellBackgroundState;
+            th08::psp::BootLog("DIALOGUE_BG_HOOK skipped spell_state=%d\n",
+                               static_cast<int>(background->spellBackgroundState));
+        }
+    }
+#endif
+#endif
     return CHAIN_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -976,7 +1005,7 @@ ChainCallbackResult Background::OnDrawLowPrio(Background *background)
     f32 zValue;
 
     if (background->spellBackgroundState <= SPELL_BACKGROUND_FADING_IN &&
-        !g_Gui.IsDialoguePresent())
+        (TH08_PSP_DIALOGUE_LIVE_BACKGROUND_ENABLED || !g_Gui.IsDialoguePresent()))
     {
         background->RenderObjects(2);
         background->RenderObjects(3);

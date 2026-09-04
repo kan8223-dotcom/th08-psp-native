@@ -1,4 +1,7 @@
 #include "th_pch.h"
+#if defined(PSP)
+extern "C" void th08_linux_set_texture_upload_owner(const char *name);
+#endif
 
 #if defined(PSP)
 #include "anm_scratch.hpp"
@@ -6917,8 +6920,13 @@ ZunResult AnmManager::CreateTextureFromAnm(IDirect3DTexture8 **outTexture, AnmTe
     }
 #endif
 
+    surface = NULL;
     g_Supervisor.d3dDevice->CreateImageSurface(header->width, header->height,
                                                g_TextureFormatD3D8Mapping[header->format], &surface);
+    if (surface == NULL)
+    {
+        return ZUN_ERROR;
+    }
 
     surface->LockRect(&lockedRect, NULL, 0);
 
@@ -7013,6 +7021,9 @@ AnmLoaded *AnmManager::LoadAnm(i32 anmIdx, const char *filename)
 #pragma var_order(curEntryNum, totalSprites, totalEntries, anmLoaded, entry, result, totalScripts, curEntry)
 AnmLoaded *AnmManager::ReadAnmEntries(int anmIdx, const char *filename)
 {
+#if defined(PSP)
+    th08_linux_set_texture_upload_owner(filename);
+#endif
     i32 result;
     i32 fileSize = 0;
 
@@ -7064,6 +7075,29 @@ AnmLoaded *AnmManager::ReadAnmEntries(int anmIdx, const char *filename)
     }
     else
     {
+#if defined(TH08_PSP_ANM_SCRATCH_COMPACT) && TH08_PSP_ANM_SCRATCH_COMPACT
+        // Compact scratch: resources larger than it (title01.anm, 7.4 MiB)
+        // decode into the stage pool's idle transient space when the pool is
+        // unbound (title/menu), so the fragmented heap is never asked for a
+        // multi-MiB block on every title return.  ReleaseAnm frees it through
+        // th08_psp_tracked_free, which recognises transient loans.
+        if (archiveSize != 0)
+        {
+            void *transient = th08::psp::StagePoolArenaAcquireIdleTransient(
+                static_cast<size_t>(archiveSize), filename);
+            if (transient != NULL)
+            {
+                entry = reinterpret_cast<AnmRawEntry *>(FileSystem::OpenArchiveFileInto(
+                    filename, &fileSize, static_cast<LPBYTE>(transient), archiveSize));
+                th08::psp::BootLog("ANM_POOL_TRANSIENT owner=%s bytes=%lu ok=%d\n", filename,
+                                   static_cast<unsigned long>(archiveSize), entry != NULL ? 1 : 0);
+                th08::psp::FlushBootLog();
+                if (entry == NULL)
+                    th08::psp::StagePoolArenaFreeIdleTransient(transient);
+            }
+        }
+        if (entry == NULL)
+#endif
         entry = reinterpret_cast<AnmRawEntry *>(
             FileSystem::OpenFile(filename, &fileSize, 0));
     }

@@ -9,6 +9,14 @@
 #endif
 
 #include "Global.hpp"
+#if defined(PSP)
+#include "psp/fileio.hpp"
+#endif
+#if defined(PSP)
+#include "psp/stage_script_arena.hpp"
+#include "psp/debug_start_stage.hpp"
+#include "psp/render_resource_arena.hpp"
+#endif
 #include "Supervisor.hpp"
 #include "ZunMath.hpp"
 #include "i18n.hpp"
@@ -480,6 +488,11 @@ u16 Controller::GetJoystickCaps(void)
                   directInputState, buttons)
 u16 Controller::GetControllerInput(u16 buttons)
 {
+#if defined(PSP) && TH08_PSP_DEBUG_START_STAGE_ENABLED
+    // Debug title auto-advance (no host input): tap SHOOT on a schedule.
+    if (th08::psp::DebugAutoStartButtons() != 0U)
+        buttons |= TH_BUTTON_SHOOT;
+#endif
     JOYINFOEX joystickState;
     u32 axisDeadzone;
     u32 joystickShootPressed;
@@ -1190,6 +1203,14 @@ LPBYTE FileSystem::OpenArchiveFileInto(LPCSTR path, i32 *fileSize,
 #endif
 
 #pragma var_order(unused, entryname, size, data, handle)
+#if defined(PSP)
+// Debug enumeration helper (psp/debug_start_stage.cpp); no game state involved.
+extern "C" unsigned long th08_archive_entry_size(const char *name)
+{
+    return name != NULL ? static_cast<unsigned long>(g_PbgArchive.GetEntryDecompressedSize(name)) : 0UL;
+}
+#endif
+
 LPBYTE FileSystem::OpenFile(LPCSTR path, i32 *fileSize, BOOL isExternalResource)
 {
     const char *entryname;
@@ -1214,6 +1235,10 @@ LPBYTE FileSystem::OpenFile(LPCSTR path, i32 *fileSize, BOOL isExternalResource)
         }
         if (size == 0)
         {
+#if defined(PSP)
+            th08::psp::BootLog("ARCHIVE_OPEN_FAIL entry=%s size=0 reason=not_found\n", entryname);
+            th08::psp::FlushBootLog();
+#endif
             g_GameErrorContext.Fatal("error : %s is not found in arcfile.\r\n", entryname);
             goto error;
         }
@@ -1221,13 +1246,38 @@ LPBYTE FileSystem::OpenFile(LPCSTR path, i32 *fileSize, BOOL isExternalResource)
         {
             utils::DebugPrint("%s Decode ... \r\n", entryname);
 
+#if TH08_PSP_STAGE_SCRIPT_ARENA_ENABLED
+            data = NULL;
+            {
+                const size_t entryLength = strlen(entryname);
+                const char *extension = entryLength >= 4 ? entryname + entryLength - 4 : "";
+                if (strcmp(extension, ".ecl") == 0 || strcmp(extension, ".std") == 0 ||
+                    strcmp(extension, ".msg") == 0)
+                {
+                    data = (LPBYTE)th08::psp::RenderResourceArenaAllocate(size, 64, entryname);
+                    th08::psp::BootLog("STAGE_SCRIPT_ARENA entry=%s bytes=%lu source=%s\n", entryname,
+                                       static_cast<unsigned long>(size), data != NULL ? "arena" : "heap");
+                }
+            }
+            if (data == NULL)
+                data = (LPBYTE)g_ZunMemory.Alloc(size, path);
+#else
             data = (LPBYTE)g_ZunMemory.Alloc(size, path);
+#endif
             if (data == NULL)
             {
+#if defined(PSP)
+                th08::psp::BootLog("ARCHIVE_OPEN_FAIL entry=%s size=%lu reason=alloc\n", entryname, static_cast<unsigned long>(size));
+                th08::psp::FlushBootLog();
+#endif
                 goto error;
             }
             if (g_PbgArchive.ReadDecompressEntry(entryname, data) == NULL)
             {
+#if defined(PSP)
+                th08::psp::BootLog("ARCHIVE_OPEN_FAIL entry=%s size=%lu reason=read\n", entryname, static_cast<unsigned long>(size));
+                th08::psp::FlushBootLog();
+#endif
                 g_ZunMemory.Free(data);
                 goto error;
             }

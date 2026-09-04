@@ -182,6 +182,18 @@ LPBYTE PbgArchive::ReadDecompressEntry(LPCSTR filename, LPBYTE outBuffer)
 
 entry_read_error:
     utils::DebugPrint("info : %s error\r\n", m_Filename);
+#if defined(TH08_PSP_PORT)
+    {
+        PbgArchiveEntry *failedEntry = FindEntry(filename);
+        th08::psp::BootLog("ARCHIVE_ENTRY_FAIL entry=%s found=%d data_offset=%lu next_offset=%lu file_size=%lu decompressed=%lu retained=%d\n",
+                           filename != NULL ? filename : "(null)", failedEntry != NULL ? 1 : 0,
+                           failedEntry != NULL ? static_cast<unsigned long>(failedEntry->dataOffset) : 0UL,
+                           failedEntry != NULL ? static_cast<unsigned long>(failedEntry[1].dataOffset) : 0UL,
+                           m_FileAbstraction != NULL ? static_cast<unsigned long>(m_FileAbstraction->GetSize()) : 0UL,
+                           failedEntry != NULL ? static_cast<unsigned long>(failedEntry->decompressedSize) : 0UL,
+                           m_PspArchiveHandleRetained ? 1 : 0);
+    }
+#endif
     MemFree(compressedData);
     return NULL;
 }
