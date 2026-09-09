@@ -313,7 +313,7 @@ void InstallCrashReporter()
 void LogArchiveRequest(const char *path)
 {
 #if defined(PSP)
-#if !(defined(TH08_PSP_ARCHIVE_REQUEST_TRACE) && TH08_PSP_ARCHIVE_REQUEST_TRACE)
+#if !TH08_PSP_LOGGING || !(defined(TH08_PSP_ARCHIVE_REQUEST_TRACE) && TH08_PSP_ARCHIVE_REQUEST_TRACE)
     // Diagnostic only.  Every resource request used to fopen/append/fclose
     // modern-files.txt on the stick; on PSP Go that write traffic interleaved
     // with th08.dat reads is the prime suspect for the 30 s read stalls the

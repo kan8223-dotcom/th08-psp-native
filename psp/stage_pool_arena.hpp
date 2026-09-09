@@ -36,6 +36,8 @@ static_assert(kBulletTransformTerminalBytes == 192U,
 // setup-only resources to borrow it and finish before BeginStage constructs
 // and binds the gameplay pools.
 bool StagePoolArenaPrepareIdle();
+// Allocate the backing at boot (first heap user) so it lands below 32 MiB.
+bool StagePoolArenaReserveEarly();
 bool StagePoolArenaBeginStage();
 bool StagePoolArenaEndStage(bool retainBacking);
 

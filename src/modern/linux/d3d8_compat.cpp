@@ -1,4 +1,6 @@
 #include "d3d8_internal.hpp"
+#include "psp/me_bullet_adopt.hpp"
+#include "psp/ge2d_direct.hpp"
 #include "Gui.hpp"
 
 #include <SDL.h>
@@ -10,24 +12,61 @@
 #include <malloc.h>
 #include "anm_scratch.hpp"
 #include "boot_checkpoint.hpp"
+#include "debug_start_stage.hpp"
 #include "fileio.hpp"
 #include "ge4_bridge.hpp"
 #include "memory_telemetry.hpp"
 #include "perf_attribution.hpp"
 #include "render_perf_telemetry.hpp"
 #include "draw_priority_subprofile.hpp"
+#include "render_quad_vfpu.hpp"
 #include "swap_nowait.hpp"
 #include "swap_async.hpp"
 #include "swap_triple.hpp"
+extern "C" void th08_psp_auto_cadence_note_wait(unsigned long long us);
 #include "pspgl_stream_arena.hpp"
 #include "dialogue_snapshot_no_promote.hpp"
 #include "dialogue_snapshot_diag.hpp"
 #include "dialogue_snapshot_at_background.hpp"
 #include "dialogue_live_background.hpp"
+#include "portrait_lower_policy_20260909_170359.hpp"
+#if TH08_PSP_PORTRAIT_LOWER_VRAM_ENABLED
+// Exact private PSPGL declaration; reports free lower-tier bytes under GE4.
+extern "C" std::size_t __pspgl_vidmem_avail(void);
+#endif
 #if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
 // Set by RestoreDialogueSnapshot around its surface-cache draw so the texture
 // upload below never arms the GE4 static-upload (promotion) hint for it.
 static bool pspSuppressStaticUploadPromotion = false;
+#if defined(PSP) && defined(TH08_PSP_GE4_HOT_TEXTURES) && TH08_PSP_GE4_HOT_TEXTURES
+// Upper-VRAM residency policy: textures that are never sampled during play
+// (dialogue faces, loading and title art) stay in main RAM so the per-frame
+// hot set (bullets, effects, stage, player, enemies, HUD) gets the 2 MiB.
+// Tier A (the only textures promoted): the stage background (full-screen
+// fill), effects (large alpha quads), bullets (hundreds of quads) and the
+// HUD frame.  Together they fit the 2 MiB (stage 5: 512K+640K+576K+192K).
+// Everything else (digits, player, enemies, faces, loading, title, decoded
+// surfaces) is sampled over few pixels per frame and stays in main RAM.
+static bool PspGe4OwnerIsHot(const char *owner)
+{
+    if (owner == NULL || owner[0] == '\0')
+        return false;
+    if (strncmp(owner, "etama", 5) == 0 || strncmp(owner, "eff", 3) == 0 || strncmp(owner, "front", 5) == 0)
+        return true;
+    // Title art is huge (title01.anm ~10 MB over a visit) and the VRAM is idle
+    // there: promoting it keeps the render arena from overflowing (r174 crash);
+    // it is freed when the game starts, so the stage hot set inherits the space.
+    if (strncmp(owner, "title", 5) == 0)
+        return true;
+    if (strncmp(owner, "stg", 3) == 0 && strstr(owner, "bg") != NULL)
+        return true;
+    return false;
+}
+static unsigned long gPspGe4HotSkipped = 0UL;
+#define TH08_PSP_GE4_HOT_TEXTURES_ENABLED 1
+#else
+#define TH08_PSP_GE4_HOT_TEXTURES_ENABLED 0
+#endif
 #endif
 #if TH08_PSP_DIALOGUE_SNAPSHOT_DIAG_ENABLED
 // R-045 diagnostic: while set, DrawPspSurfaceCache draws a flat magenta quad.
@@ -38,9 +77,14 @@ static bool pspDialogueRestoreDiagFlash = false;
 // pspthreadman.h drags psptypes.h (u32 etc.) into this TU; declare the one
 // clock entry point the flip guard needs instead.
 extern "C" long long sceKernelGetSystemTimeWide(void);
+extern "C" unsigned int sceKernelGetSystemTimeLow(void);
 #include "render_resource_arena.hpp"
 #include "backbuffer_shadow.hpp"
 #include "anm_texture_16bit.hpp"
+#include "draw_native_prims.hpp"
+#include "usage_meter.hpp"
+#include "me_core.hpp"
+#include "me_effect_shadow.hpp"
 
 // Import the one GE query used here without pulling PSPSDK's legacy u32
 // typedefs into TH08's reconstruction typedef namespace.
@@ -82,6 +126,25 @@ extern "C" unsigned int sceGeEdramGetSize(void);
 #define TH08_PSP_BULLET_DIRECT_GE_ENABLED 1
 #else
 #define TH08_PSP_BULLET_DIRECT_GE_ENABLED 0
+#endif
+// TH08_PSP_QUAD_BATCH: coalesce consecutive 4-vertex triangle-strip
+// DrawPrimitiveUP calls into one native indexed submit (see FlushPspQuadBatch).
+#if defined(PSP) && defined(TH08_PSP_QUAD_BATCH) && TH08_PSP_QUAD_BATCH && \
+    defined(TH08_PSP_DRAW_NATIVE_PRIMS) && TH08_PSP_DRAW_NATIVE_PRIMS && \
+    defined(TH08_PSP_PREPARE_STATE_CACHE) && TH08_PSP_PREPARE_STATE_CACHE
+#define TH08_PSP_QUAD_BATCH_ENABLED 1
+#else
+#define TH08_PSP_QUAD_BATCH_ENABLED 0
+#endif
+// TH08_PSP_GE_KICK: submit PSPGL's partial command list to the GE every N
+// draws so the GE starts early instead of waiting for a full 512-word list.
+#if defined(PSP) && defined(TH08_PSP_GE_KICK) && TH08_PSP_GE_KICK
+#define TH08_PSP_GE_KICK_ENABLED 1
+#else
+#define TH08_PSP_GE_KICK_ENABLED 0
+#endif
+#ifndef TH08_PSP_GE_KICK_DRAWS
+#define TH08_PSP_GE_KICK_DRAWS 6
 #endif
 
 #if defined(PSP) && defined(TH08_PSP_BULLET_PACKED_VERTEX_AUDIT) && \
@@ -305,7 +368,7 @@ bool g_PspItemMixedGeBatchActive = false;
 #endif
 // The immutable shared quad table has 0x600 entries. Larger Item passes are
 // split at this boundary by AnmManager while retaining their original order.
-constexpr UINT kPspBulletDirectGeMaxQuads = 0x600U;
+constexpr UINT kPspBulletDirectGeMaxQuads = 0x800U; // items + bullets share the ME run arena
 constexpr UINT kPspBulletDirectGeVertexCapacity =
     kPspBulletDirectGeMaxQuads * 4U;
 
@@ -366,6 +429,48 @@ constexpr size_t kPspItemDirectGeArenaBytes =
     static_cast<size_t>(kPspItemDirectGeVertexCapacity) * 24U;
 static_assert(kPspItemDirectGeArenaBytes == 122880U,
               "Bounded Item native arena payload must remain exactly 122880 bytes");
+#endif
+#if TH08_PSP_DRAW_NATIVE_PRIMS_ENABLED
+// Generic native-prim partition: one Present of 3D/2D triangle batches from
+// the D3D draw path (stage background effects/objects, enemies, effects).
+constexpr UINT kPspDrawNativeVertexCapacity = 4096U;
+constexpr size_t kPspDrawNativeArenaBytes = static_cast<size_t>(kPspDrawNativeVertexCapacity) * 24U;
+constexpr UINT kPspDrawNativeMaxBatch = 1024U;
+static unsigned short gPspNativeListIndices[kPspDrawNativeMaxBatch];
+// One quad = strip (0,1,2),(2,1,3) as a triangle list, kPspDrawNativeMaxBatch/4 quads.
+static unsigned short gPspNativeQuadIndices[(kPspDrawNativeMaxBatch / 4U) * 6U];
+static unsigned short gPspNativeStripIndices[(kPspDrawNativeMaxBatch - 2U) * 3U];
+static unsigned short gPspNativeFanIndices[(kPspDrawNativeMaxBatch - 2U) * 3U];
+static bool gPspNativeIndicesReady = false;
+static void PspNativeIndicesInit()
+{
+    if (gPspNativeIndicesReady)
+        return;
+    for (UINT i = 0U; i < kPspDrawNativeMaxBatch; ++i)
+        gPspNativeListIndices[i] = static_cast<unsigned short>(i);
+    for (UINT t = 0U; t + 2U < kPspDrawNativeMaxBatch; ++t)
+    {
+        // Strip winding alternates like GL_TRIANGLE_STRIP; fans pivot on 0.
+        const bool odd = (t & 1U) != 0U;
+        gPspNativeStripIndices[t * 3U + 0U] = static_cast<unsigned short>(odd ? t + 1U : t);
+        gPspNativeStripIndices[t * 3U + 1U] = static_cast<unsigned short>(odd ? t : t + 1U);
+        gPspNativeStripIndices[t * 3U + 2U] = static_cast<unsigned short>(t + 2U);
+        gPspNativeFanIndices[t * 3U + 0U] = 0U;
+        gPspNativeFanIndices[t * 3U + 1U] = static_cast<unsigned short>(t + 1U);
+        gPspNativeFanIndices[t * 3U + 2U] = static_cast<unsigned short>(t + 2U);
+    }
+    for (UINT q = 0U; q < kPspDrawNativeMaxBatch / 4U; ++q)
+    {
+        const unsigned short base = static_cast<unsigned short>(q * 4U);
+        gPspNativeQuadIndices[q * 6U + 0U] = base;
+        gPspNativeQuadIndices[q * 6U + 1U] = static_cast<unsigned short>(base + 1U);
+        gPspNativeQuadIndices[q * 6U + 2U] = static_cast<unsigned short>(base + 2U);
+        gPspNativeQuadIndices[q * 6U + 3U] = static_cast<unsigned short>(base + 2U);
+        gPspNativeQuadIndices[q * 6U + 4U] = static_cast<unsigned short>(base + 1U);
+        gPspNativeQuadIndices[q * 6U + 5U] = static_cast<unsigned short>(base + 3U);
+    }
+    gPspNativeIndicesReady = true;
+}
 #endif
 
 typedef void (APIENTRY *GenFramebuffersFunction)(GLsizei, GLuint *);
@@ -458,8 +563,8 @@ constexpr size_t kPspNativeCaptureWorkspaceBytes =
 class PspGe4StaticUploadScope
 {
   public:
-    explicit PspGe4StaticUploadScope(bool immutable)
-        : armed(immutable && th08_psp_ge4_active() != 0), finalized(false)
+    explicit PspGe4StaticUploadScope(bool immutable, bool promoteUpper = true)
+        : armed(immutable && th08_psp_ge4_active() != 0), finalized(false), upperPromotion(promoteUpper)
     {
         if (armed)
             th08_psp_ge4_static_upload_hint_begin();
@@ -473,7 +578,7 @@ class PspGe4StaticUploadScope
 
     void Finalize(GLuint textureName)
     {
-        if (!armed || finalized || textureName == 0)
+        if (!armed || finalized || !upperPromotion || textureName == 0)
             return;
         const GLclampf priority = 1.0f;
         glPrioritizeTextures(1, &textureName, &priority);
@@ -483,6 +588,7 @@ class PspGe4StaticUploadScope
   private:
     bool armed;
     bool finalized;
+    bool upperPromotion;
 };
 
 struct PspPhysicalRect
@@ -626,6 +732,7 @@ struct PspPrepareStateCache
     unsigned int projectionRawVersion = 0;
     bool modelViewValid = false;
     bool modelViewTransformed = false;
+    bool modelViewIdentityWorld = false;
     unsigned int worldRawVersion = 0;
     unsigned int viewRawVersion = 0;
 
@@ -931,7 +1038,11 @@ class LinuxSurface : public IDirect3DSurface8
 #if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
         // Except the dialogue snapshot: its promotion right after a mid-frame
         // upload showed a black background on hardware (R-045).
+#if TH08_PSP_GE4_HOT_TEXTURES_ENABLED
+        PspGe4StaticUploadScope staticUpload(false);
+#else
         PspGe4StaticUploadScope staticUpload(!pspSuppressStaticUploadPromotion);
+#endif
 #else
         PspGe4StaticUploadScope staticUpload(true);
 #endif
@@ -2099,6 +2210,42 @@ void ConfigureTextureComponent(GLenum combineParameter, GLenum source0Parameter,
     glTexEnvi(GL_TEXTURE_ENV, operand1Parameter, operand);
 }
 
+class LinuxDevice;
+static LinuxDevice *gPspQuadBatchDevice = NULL;
+#if defined(TH08_PSP_PSPGL_STREAM_LIST) && TH08_PSP_PSPGL_STREAM_LIST
+extern "C" void __pspgl_th08_dlist_kick(void);
+#define TH08_PSP_PSPGL_STREAM_LIST_ENABLED 1
+#else
+#define TH08_PSP_PSPGL_STREAM_LIST_ENABLED 0
+#endif
+#if TH08_PSP_GE_KICK_ENABLED
+static unsigned gPspGeKickDraws = 0U;
+static unsigned long gPspGeKickCount = 0UL;
+// Called after every draw submission: hands the pending partial list to the
+// GE once TH08_PSP_GE_KICK_DRAWS draws accumulated (glFlush = dlist submit).
+static inline void PspGeKickNoteDraw()
+{
+#if TH08_PSP_PSPGL_STREAM_LIST_ENABLED
+    // Stream-list PSPGL: release the written commands to the GE after every
+    // draw (one cheap stall update, no list switch).
+    ++gPspGeKickDraws;
+    ++gPspGeKickCount;
+    __pspgl_th08_dlist_kick();
+    return;
+#endif
+    // First kick after the third draw of the frame so the GE starts early,
+    // then every TH08_PSP_GE_KICK_DRAWS draws.
+    ++gPspGeKickDraws;
+    if (gPspGeKickDraws == 3U ||
+        (gPspGeKickDraws > 3U && ((gPspGeKickDraws - 3U) % static_cast<unsigned>(TH08_PSP_GE_KICK_DRAWS)) == 0U))
+    {
+        ++gPspGeKickCount;
+        glFlush();
+    }
+}
+#else
+static inline void PspGeKickNoteDraw() {}
+#endif
 class LinuxDevice : public IDirect3DDevice8
 {
   public:
@@ -2216,6 +2363,7 @@ class LinuxDevice : public IDirect3DDevice8
 #endif
 #if TH08_PSP_PSPGL_STREAM_ARENA_ENABLED
         pspStreamArenaLease = NULL;
+        pspStreamArenaDeferred = false;
         pspStreamArenaPresent = ~0UL;
         pspStreamArenaLeaseFrames = 0UL;
         pspStreamArenaAllocationFailures = 0UL;
@@ -2274,9 +2422,18 @@ class LinuxDevice : public IDirect3DDevice8
         // accepted Stage 5 minimum free heap and can turn this optional path
         // into a later gameplay OOM; failure must instead retain the generic
         // PSPGL path without adding Main-RAM heap pressure.
+#if defined(TH08_PSP_STAGE_POOL_LOW) && TH08_PSP_STAGE_POOL_LOW
+        // The ME writes these vertices: keep them in .bss (below 32 MiB) now
+        // that the render arena may sit in the extra memory.
+        static PspClientVertex s_PspBulletDirectGeStatic[kPspBulletDirectGeVertexCapacity]
+            __attribute__((aligned(64)));
+        (void)directGeArenaBytes;
+        pspBulletDirectGeVertices = s_PspBulletDirectGeStatic;
+#else
         pspBulletDirectGeVertices = static_cast<PspClientVertex *>(
             th08::psp::RenderResourceArenaAllocate(
                 directGeArenaBytes, 64U, "bullet direct GE vertices"));
+#endif
         pspBulletDirectGeVerticesBase = pspBulletDirectGeVertices;
         pspBulletDirectGeVertexCursor = 0U;
         pspBulletDirectGeArenaHighWater = 0U;
@@ -2373,6 +2530,16 @@ class LinuxDevice : public IDirect3DDevice8
 #if TH08_PSP_PSPGL_STREAM_ARENA_ENABLED
         if (pspStreamArenaPresent == presentCount)
             return;
+#if TH08_PSP_SWAP_TRIPLE_ENABLED
+        // Triple buffering: the previous frame's lists may still read this
+        // storage; fence them before recycling (free once the calc-end
+        // bullet-arena rollover already waited).
+        th08::psp::SwapTripleWaitPendingDone();
+#endif
+        // Present uninstalled the stream allocator, but async GE readers kept
+        // ownership of the block through the intervening calc phase.
+        if (pspStreamArenaLease != NULL)
+            ReleasePspglStreamArenaFrame(false);
         pspStreamArenaPresent = presentCount;
         if (pspStreamArenaFaulted)
             return;
@@ -2408,8 +2575,8 @@ class LinuxDevice : public IDirect3DDevice8
             return;
         }
 
-        // The synchronous PSPGL Present below fences every display list that
-        // can reference this frame's transient vertices.  The frozen archive
+        // The next reuse/release fence retires every list that can reference
+        // this frame's transient vertices. The frozen archive
         // computes its unused parity-1 pointer at the one-past address; this
         // synchronous path is contractually fixed to parity 0, so one 256 KiB
         // half is the complete live allocation.
@@ -2418,40 +2585,45 @@ class LinuxDevice : public IDirect3DDevice8
 #endif
     }
 
-    void ReleasePspglStreamArenaFrame(bool report)
+    void ReleasePspglStreamArenaFrame(bool report, bool retainLease = false)
     {
 #if TH08_PSP_PSPGL_STREAM_ARENA_ENABLED
         if (pspStreamArenaLease != NULL)
         {
-            unsigned long allocs = 0UL;
-            unsigned long overflows = 0UL;
-            unsigned long peakBytes = 0UL;
-            __pspgl_th08_stream_arena_stats(&allocs, &overflows, &peakBytes);
-            pspStreamArenaAllocs += allocs;
-            pspStreamArenaOverflows += overflows;
-            if (peakBytes > pspStreamArenaPeakBytes)
-                pspStreamArenaPeakBytes = peakBytes;
+            if (!pspStreamArenaDeferred)
+            {
+                unsigned long allocs = 0UL;
+                unsigned long overflows = 0UL;
+                unsigned long peakBytes = 0UL;
+                __pspgl_th08_stream_arena_stats(&allocs, &overflows, &peakBytes);
+                pspStreamArenaAllocs += allocs;
+                pspStreamArenaOverflows += overflows;
+                if (peakBytes > pspStreamArenaPeakBytes)
+                    pspStreamArenaPeakBytes = peakBytes;
 
-            // Disable the allocator before returning its backing block.  The
-            // caller must have fenced the frame first; Present and teardown do.
-            __pspgl_th08_stream_arena_install(NULL, 0U);
-            const th08::psp::RenderResourceArenaFreeResult freeResult =
-                th08::psp::RenderResourceArenaTryFree(pspStreamArenaLease);
-            if (freeResult != th08::psp::RenderResourceArenaFreeResult::Freed)
-            {
-                ++pspStreamArenaReleaseFailures;
-                pspStreamArenaFaulted = true;
+                // No further allocations may use this frame's backing block.
+                __pspgl_th08_stream_arena_install(NULL, 0U);
             }
-            // Quarantined pointers are consumed by the arena.  A logically
-            // impossible NotOwned result is fail-closed, with its address kept
-            // as inert diagnostics so Present never retries it every frame.
-            if (freeResult ==
-                th08::psp::RenderResourceArenaFreeResult::NotOwned)
+            pspStreamArenaDeferred = retainLease;
+            if (!retainLease)
             {
-                pspStreamArenaOrphanAddress = static_cast<unsigned long>(
-                    reinterpret_cast<std::uintptr_t>(pspStreamArenaLease));
+                // The caller has fenced before making this memory reusable.
+                const th08::psp::RenderResourceArenaFreeResult freeResult =
+                    th08::psp::RenderResourceArenaTryFree(pspStreamArenaLease);
+                if (freeResult != th08::psp::RenderResourceArenaFreeResult::Freed)
+                {
+                    ++pspStreamArenaReleaseFailures;
+                    pspStreamArenaFaulted = true;
+                }
+                // Quarantined pointers are consumed by the arena. A logically
+                // impossible NotOwned result is fail-closed; never retry it.
+                if (freeResult == th08::psp::RenderResourceArenaFreeResult::NotOwned)
+                {
+                    pspStreamArenaOrphanAddress = static_cast<unsigned long>(
+                        reinterpret_cast<std::uintptr_t>(pspStreamArenaLease));
+                }
+                pspStreamArenaLease = NULL;
             }
-            pspStreamArenaLease = NULL;
         }
         pspStreamArenaPresent = ~0UL;
 
@@ -2460,19 +2632,45 @@ class LinuxDevice : public IDirect3DDevice8
             th08::psp::BootLog(
                 "PSPGL_STREAM_ARENA stats presents=%lu lease_frames=%lu "
                 "allocs=%lu overflows=%lu peak_bytes=%lu half_bytes=%lu "
-                "resident_bytes=0 allocation_failures=%lu "
+                "resident_bytes=%lu allocation_failures=%lu "
                 "release_failures=%lu orphan=0x%08lx faulted=%d\n",
                 presentCount, pspStreamArenaLeaseFrames,
                 pspStreamArenaAllocs, pspStreamArenaOverflows,
                 pspStreamArenaPeakBytes,
                 static_cast<unsigned long>(kPspglStreamArenaHalfBytes),
+                pspStreamArenaLease != NULL ? static_cast<unsigned long>(kPspglStreamArenaLeaseBytes) : 0UL,
                 pspStreamArenaAllocationFailures,
                 pspStreamArenaReleaseFailures,
                 pspStreamArenaOrphanAddress,
                 pspStreamArenaFaulted ? 1 : 0);
+#if TH08_PSP_DRAW_NATIVE_PRIMS_ENABLED
+#if TH08_PSP_GE_KICK_ENABLED
+        th08::psp::BootLog("GE_KICK stats kicks=%lu draws_per_kick=%d\n", gPspGeKickCount, TH08_PSP_GE_KICK_DRAWS);
+#endif
+#if TH08_PSP_GE_2D_DIRECT_ENABLED
+        {
+            unsigned long ge2dSubmits = 0UL, ge2dFallbacks = 0UL, ge2dVertices = 0UL;
+            th08_ge2d_direct_stats(&ge2dSubmits, &ge2dFallbacks, &ge2dVertices);
+            th08::psp::BootLog("GE2D stats submits=%lu fallbacks=%lu vertices=%lu\n", ge2dSubmits, ge2dFallbacks,
+                               ge2dVertices);
+        }
+#endif
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        th08::psp::BootLog("QUAD_BATCH stats quads=%lu flushes=%lu singles=%lu fallbacks=%lu rejected=%lu "
+                           "why=draw:%lu rs:%lu tex:%lu tss:%lu vp:%lu xform:%lu scene:%lu texupd:%lu cap:%lu\n",
+                           pspQuadBatchStatQuads, pspQuadBatchStatFlushes, pspQuadBatchStatSingles,
+                           pspQuadBatchStatFallbacks, pspQuadBatchStatRejected, pspQuadBatchReason[0],
+                           pspQuadBatchReason[1], pspQuadBatchReason[2], pspQuadBatchReason[3], pspQuadBatchReason[4],
+                           pspQuadBatchReason[5], pspQuadBatchReason[6], pspQuadBatchReason[7], pspQuadBatchReason[8]);
+#endif
+        th08::psp::BootLog("NATIVE_PRIMS stats submits=%lu vertices=%lu fallback_room=%lu fallback_hook=%lu\n",
+                           pspDrawNativeSubmits, pspDrawNativeVertexTotal, pspDrawNativeFallbackRoom,
+                           pspDrawNativeFallbackHook);
+#endif
         }
 #else
         (void)report;
+        (void)retainLease;
 #endif
     }
 
@@ -2485,6 +2683,11 @@ class LinuxDevice : public IDirect3DDevice8
             // longer references any lower/upper eDRAM owner before freeing it.
             glBindTexture(GL_TEXTURE_2D, 0);
             glFinish();
+#if TH08_PSP_SWAP_TRIPLE_ENABLED
+            // The third colour buffer lives in the upper tier: return it before
+            // the GE4 shutdown audits live upper allocations (HOME / Quit hang).
+            th08::psp::SwapTripleShutdown();
+#endif
 #if TH08_PSP_PSPGL_STREAM_ARENA_ENABLED
             ReleasePspglStreamArenaFrame(false);
 #endif
@@ -2697,8 +2900,99 @@ class LinuxDevice : public IDirect3DDevice8
         framebufferReady = ResetInternal(*parameters);
         return framebufferReady ? S_OK : E_FAIL;
     }
+#if TH08_PSP_USAGE_METER_ENABLED
+    // XP task-manager style SC/ME history graphs in the right sidebar, left of
+    // the logo.  Logical 640x480 coordinates; drawn through the ordinary
+    // transformed-vertex path so it costs two quads, six line segments and
+    // two 64-point line strips per panel pair.
+    struct UsageMeterVertex
+    {
+        float x, y, z, rhw;
+        DWORD color;
+    };
+    void UsageMeterQuad(float x0, float y0, float x1, float y1, DWORD color)
+    {
+        UsageMeterVertex q[4] = {{x0, y0, 0.5f, 1.0f, color}, {x1, y0, 0.5f, 1.0f, color},
+                                 {x0, y1, 0.5f, 1.0f, color}, {x1, y1, 0.5f, 1.0f, color}};
+        Draw(D3DPT_TRIANGLESTRIP, 2, reinterpret_cast<const BYTE *>(q), sizeof(UsageMeterVertex));
+    }
+    void UsageMeterPanel(float px, float py, float w, float h, const std::uint8_t *history, unsigned head)
+    {
+        const DWORD kFrame = 0xff99a8acu, kPanel = 0xff000000u, kGrid = 0xff006600u;
+        const DWORD kLine = 0xff00ff21u, kOver = 0xffe63c3cu;
+        UsageMeterQuad(px - 1.0f, py - 1.0f, px + w + 1.0f, py + h + 1.0f, kFrame);
+        UsageMeterQuad(px, py, px + w, py + h, kPanel);
+        UsageMeterVertex grid[6];
+        for (int i = 0; i < 3; ++i)
+        {
+            const float gy = py + h - (h * 25.0f * static_cast<float>(i + 1)) / 100.0f;
+            grid[i * 2] = {px, gy, 0.5f, 1.0f, kGrid};
+            grid[i * 2 + 1] = {px + w, gy, 0.5f, 1.0f, kGrid};
+        }
+        Draw(D3DPT_LINELIST, 3, reinterpret_cast<const BYTE *>(grid), sizeof(UsageMeterVertex));
+        UsageMeterVertex strip[th08::psp::kUsageMeterHistory];
+        for (unsigned i = 0; i < th08::psp::kUsageMeterHistory; ++i)
+        {
+            const unsigned idx = (head + 1U + i) % th08::psp::kUsageMeterHistory;
+            const unsigned pct = history[idx];
+            const unsigned clipped = pct > 100U ? 100U : pct;
+            strip[i] = {px + (static_cast<float>(i) * w) / static_cast<float>(th08::psp::kUsageMeterHistory - 1U),
+                        py + h - (h * static_cast<float>(clipped)) / 100.0f, 0.5f, 1.0f,
+                        pct > 100U ? kOver : kLine};
+        }
+        Draw(D3DPT_LINESTRIP, th08::psp::kUsageMeterHistory - 1U, reinterpret_cast<const BYTE *>(strip),
+             sizeof(UsageMeterVertex));
+    }
+    void DrawUsageMeterOverlay()
+    {
+        const DWORD savedFvf = fvf;
+        IDirect3DTexture8 *const savedTexture = texture;
+        const DWORD savedBlend = renderStates[D3DRS_ALPHABLENDENABLE];
+        const DWORD savedZ = renderStates[D3DRS_ZENABLE];
+        const DWORD savedFog = renderStates[D3DRS_FOGENABLE];
+        const DWORD savedAlphaTest = renderStates[D3DRS_ALPHATESTENABLE];
+        if (savedTexture != NULL)
+            savedTexture->AddRef();
+        SetTexture(0, NULL);
+        SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        SetRenderState(D3DRS_ZENABLE, FALSE);
+        SetRenderState(D3DRS_FOGENABLE, FALSE);
+        SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        const D3DVIEWPORT8 savedViewport = viewport;
+        const DWORD savedColorOp = textureStates[D3DTSS_COLOROP], savedColorArg2 = textureStates[D3DTSS_COLORARG1];
+        const DWORD savedAlphaOp = textureStates[D3DTSS_ALPHAOP], savedAlphaArg2 = textureStates[D3DTSS_ALPHAARG1];
+        D3DVIEWPORT8 fullViewport = savedViewport;
+        fullViewport.X = 0; fullViewport.Y = 0; fullViewport.Width = 640; fullViewport.Height = 480;
+        SetViewport(&fullViewport);
+        SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+        SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+        // Free strip left of the logo (logical 640x480): top = SC, bottom = ME.
+        const float x = 436.0f, w = 48.0f, h = 28.0f;
+        UsageMeterPanel(x, 296.0f, w, h, th08::psp::UsageMeterScHistory(), th08::psp::UsageMeterHead());
+        UsageMeterPanel(x, 332.0f, w, h, th08::psp::UsageMeterMeHistory(), th08::psp::UsageMeterHead());
+        SetVertexShader(savedFvf);
+        SetTextureStageState(0, D3DTSS_COLOROP, savedColorOp);
+        SetTextureStageState(0, D3DTSS_COLORARG1, savedColorArg2);
+        SetTextureStageState(0, D3DTSS_ALPHAOP, savedAlphaOp);
+        SetTextureStageState(0, D3DTSS_ALPHAARG1, savedAlphaArg2);
+        SetViewport(&savedViewport);
+        SetRenderState(D3DRS_ALPHABLENDENABLE, savedBlend);
+        SetRenderState(D3DRS_ZENABLE, savedZ);
+        SetRenderState(D3DRS_FOGENABLE, savedFog);
+        SetRenderState(D3DRS_ALPHATESTENABLE, savedAlphaTest);
+        SetTexture(0, savedTexture);
+        if (savedTexture != NULL)
+            savedTexture->Release();
+    }
+#endif
     HRESULT Present(const RECT *, const RECT *, HWND, const RGNDATA *)
     {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        FlushPspQuadBatchFor(6U);
+#endif
 #if TH08_PSP_PREPARE_STATE_CACHE_ENABLED
         PspPrepareStateBoundary stateBoundary(&pspPrepareStateCache);
 #endif
@@ -2710,8 +3004,26 @@ class LinuxDevice : public IDirect3DDevice8
             th08::psp::PerfAttributionScope preSwapScope(
                 th08::psp::PerfAttributionPhase::PresentPreSwap);
 #endif
+#if TH08_PSP_USAGE_METER_ENABLED
+        DrawUsageMeterOverlay();
+#endif
         backbuffer->FlushBackbuffer();
         presentCount++;
+#if TH08_PSP_QUAD_VFPU_ENABLED
+        th08::psp::RenderQuadVfpuFrame();
+#endif
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+        EmitPspSubmitSubprofile();
+#endif
+#if TH08_PSP_ME_EFFECT_SHADOW_ENABLED
+        th08_me_effect_shadow_frame();
+#endif
+#if TH08_PSP_ME_CORE_ENABLED
+        th08_me_core_frame();
+#endif
+#if TH08_PSP_USAGE_METER_ENABLED
+        th08::psp::UsageMeterEndFrame(static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()));
+#endif
 
 #if defined(PSP)
         glFlush();
@@ -2764,10 +3076,18 @@ class LinuxDevice : public IDirect3DDevice8
 #endif
         }
 #if TH08_PSP_PSPGL_STREAM_ARENA_ENABLED
-        // eglSwapBuffers synchronizes the just-rendered colour target, which
-        // also retires every transient stream buffer pinned to those lists.
+        // Synchronous swap can release immediately. Triple Present cannot:
+        // calc may allocate ECL children before the next BeginScene fence,
+        // and must not overwrite vertices still being consumed by the GE.
+        bool retainStreamLease = false;
+#if TH08_PSP_SWAP_TRIPLE_ENABLED
+        retainStreamLease = th08::psp::SwapTripleActive();
+#endif
+#if TH08_PSP_DEBUG_START_STAGE_ENABLED
+        retainStreamLease = retainStreamLease || th08::psp::DebugRetainStreamLeaseForTest();
+#endif
         ReleasePspglStreamArenaFrame(
-            presentCount == 1UL || (presentCount % 600UL) == 0UL);
+            presentCount == 1UL || (presentCount % 600UL) == 0UL, retainStreamLease);
 #endif
 #if TH08_PSP_PERF_ATTRIBUTION_ENABLED
         }
@@ -3005,6 +3325,9 @@ class LinuxDevice : public IDirect3DDevice8
     HRESULT CopyRects(IDirect3DSurface8 *sourceRaw, const RECT *sourceRects, UINT count,
                       IDirect3DSurface8 *destinationRaw, const POINT *destinationPoints)
     {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        FlushPspQuadBatchFor(6U);
+#endif
 #if defined(PSP)
         gPspSurfaceOp = "CopyRects";
 #endif
@@ -3080,6 +3403,9 @@ class LinuxDevice : public IDirect3DDevice8
             th08::psp::SwapAsyncWaitFlipComplete(&waitedUs);
 #if TH08_PSP_PERF_ENV_ENABLED
             th08::psp::PerfEnvNoteFlipWait(waitedUs);
+#if TH08_PSP_USAGE_METER_ENABLED
+            th08::psp::UsageMeterNoteWait(waitedUs);
+#endif
 #endif
             pspSwapFlipPending = false;
             return;
@@ -3094,8 +3420,10 @@ class LinuxDevice : public IDirect3DDevice8
         // (the VBlank counter alone let the GE write the on-screen buffer).
         {
             const void *const frontBase = th08::psp::SwapFrontBufferBase();
+            const std::uint64_t autoWaitStartUs = static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
             while (!th08::psp::SwapDisplayShows(frontBase))
                 sceDisplayWaitVblankStart();
+            th08_psp_auto_cadence_note_wait(static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - autoWaitStartUs);
             (void)pspSwapVcount;
         }
         pspSwapFlipPending = false;
@@ -3104,24 +3432,21 @@ class LinuxDevice : public IDirect3DDevice8
             static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
         th08::psp::PerfEnvNoteFlipWait(
             waitEndUs >= waitStartUs ? waitEndUs - waitStartUs : 0U);
+#if TH08_PSP_USAGE_METER_ENABLED
+            th08::psp::UsageMeterNoteWait(waitEndUs >= waitStartUs ? waitEndUs - waitStartUs : 0U);
+#endif
 #else
         (void)waitStartUs;
 #endif
     }
 #endif
-    HRESULT BeginScene()
-    {
-#if TH08_PSP_SWAP_NOWAIT_ENABLED
-        PspWaitForPendingFlip();
-#endif
-#if TH08_PSP_PREPARE_STATE_CACHE_ENABLED
-        PspPrepareStateBoundary stateBoundary(&pspPrepareStateCache);
-#endif
-#if defined(PSP)
 #if TH08_PSP_BULLET_DIRECT_GE_ENABLED
-        // Present waits for the displayed color target's PSPGL lists before it
-        // returns.  Reset only after observing that fence; a repeated
-        // BeginScene without Present must keep the append-only arena intact.
+    // Present waits for the displayed color target's PSPGL lists before it
+    // returns.  Reset only after observing that fence; a repeated BeginScene
+    // without Present must keep the append-only arena intact.  Also called by
+    // the ME bullet reservation, which runs before BeginScene in the frame.
+    void RolloverPspBulletDirectGeArena()
+    {
         if (pspBulletDirectGeArenaPresent != presentCount)
         {
 #if TH08_PSP_SWAP_TRIPLE_ENABLED
@@ -3146,6 +3471,323 @@ class LinuxDevice : public IDirect3DDevice8
             pspBulletDirectGeVertexCursor = 0U;
             pspBulletDirectGeArenaPresent = presentCount;
         }
+    }
+    // ME bullet writer: reserve quadCount quads at the arena cursor.  A
+    // reservation nobody appended after (the draw was skipped by the render
+    // cadence) is reclaimed by the next one: the GE never read it.
+    UINT pspBulletMeReserveStart = 0U;
+    UINT pspBulletMeReserveEnd = 0U;
+    unsigned long pspBulletMeReservePresent = ~0UL;
+    void *ReservePspBulletDirectGeForMe(UINT quadCount)
+    {
+        if (pspBulletDirectGeVertices == NULL || quadCount == 0U ||
+            quadCount > kPspBulletDirectGeMaxQuads)
+            return NULL;
+        RolloverPspBulletDirectGeArena();
+        if (pspBulletMeReservePresent == pspBulletDirectGeArenaPresent &&
+            pspBulletDirectGeVertexCursor == pspBulletMeReserveEnd &&
+            pspBulletMeReserveEnd > pspBulletMeReserveStart)
+        {
+            pspBulletDirectGeVertexCursor = pspBulletMeReserveStart;
+        }
+        const UINT vertexCount = quadCount * 4U;
+        if (pspBulletDirectGeVertexCursor >
+            kPspBulletDirectGeVertexCapacity - vertexCount)
+            return NULL;
+        PspClientVertex *const out =
+            pspBulletDirectGeVertices + pspBulletDirectGeVertexCursor;
+        pspBulletMeReserveStart = pspBulletDirectGeVertexCursor;
+        pspBulletDirectGeVertexCursor += vertexCount;
+        pspBulletMeReserveEnd = pspBulletDirectGeVertexCursor;
+        pspBulletMeReservePresent = pspBulletDirectGeArenaPresent;
+        if (pspBulletDirectGeArenaHighWater < pspBulletDirectGeVertexCursor)
+            pspBulletDirectGeArenaHighWater = pspBulletDirectGeVertexCursor;
+        return out;
+    }
+    // Submit a compacted run of ME-built quads (same path as the direct-GE
+    // flush after the AnmManager state calls).
+    // Keep the last reservation: the next ReservePspBulletDirectGeForMe
+    // allocates fresh space instead of rewinding over it (the GE may still
+    // be reading it).
+    void CommitPspBulletMeReserve()
+    {
+        pspBulletMeReserveStart = pspBulletMeReserveEnd;
+    }
+    int SubmitPspBulletMeQuads(const void *vertices, UINT quadCount,
+                               const unsigned short *indices)
+    {
+        if (vertices == NULL || indices == NULL || quadCount == 0U)
+            return 0;
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+        // One of sixteen presentations; never time individual glyphs.
+        const bool sample = (presentCount & 15UL) == 0UL;
+        const unsigned int start = sample ? sceKernelGetSystemTimeLow() : 0U;
+        if (sample) { ++pspSubmitSamples; pspSubmitQuads += quadCount; }
+#endif
+        FlushPspQuadBatch();
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+        const unsigned int flushed = sample ? sceKernelGetSystemTimeLow() : 0U;
+        pspSubmitPrepareSample = sample;
+#endif
+        PrepareState(true);
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+        pspSubmitPrepareSample = false;
+        const unsigned int prepared = sample ? sceKernelGetSystemTimeLow() : 0U;
+#endif
+        const UINT indexCount = quadCount * 6U;
+        const int submitted = __pspgl_th08_draw_native_indexed_triangles(
+            vertices, quadCount * 4U * sizeof(PspClientVertex), indices,
+            indexCount * sizeof(unsigned short), indexCount);
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+        const unsigned int drawn = sample ? sceKernelGetSystemTimeLow() : 0U;
+#endif
+        if (submitted != 0)
+        {
+            ++pspBulletDirectGeSubmittedBatches;
+            pspBulletDirectGeSubmittedQuads += quadCount;
+            th08::psp::RenderPerfNoteDraw(indexCount); PspGeKickNoteDraw();
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+            th08::psp::DrawPrioritySubprofileNoteDraw(indexCount);
+#endif
+        }
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+        ++pspSubmitCalls;
+        if (submitted == 0) ++pspSubmitRejected;
+        if (sample)
+        {
+            const unsigned int end = sceKernelGetSystemTimeLow();
+            pspSubmitFlushUs += flushed - start;
+            pspSubmitPrepareUs += prepared - flushed;
+            pspSubmitNativeUs += drawn - prepared;
+            pspSubmitKickUs += end - drawn;
+            if (end - start > pspSubmitMaxUs) pspSubmitMaxUs = end - start;
+        }
+#endif
+        return submitted;
+    }
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+    bool pspSubmitPrepareSample = false;
+    unsigned long pspSubmitCalls = 0, pspSubmitRejected = 0;
+    unsigned long pspSubmitSamples = 0, pspSubmitQuads = 0, pspSubmitMaxUs = 0;
+    unsigned long pspSubmitFlushUs = 0, pspSubmitPrepareUs = 0, pspSubmitNativeUs = 0, pspSubmitKickUs = 0;
+    unsigned long pspSubmitMatricesUs = 0, pspSubmitRenderUs = 0, pspSubmitTextureUs = 0;
+    void EmitPspSubmitSubprofile()
+    {
+        if ((presentCount % 600UL) != 0UL) return;
+        th08::psp::BootLog("SUBMIT_SUB stats presents=%lu calls=%lu rejected=%lu sample_calls=%lu sample_quads=%lu "
+            "flush_us=%lu prepare_us=%lu native_us=%lu kick_us=%lu max_us=%lu "
+            "prep_matrices_us=%lu prep_render_us=%lu prep_texture_us=%lu period=16 cumulative=1\n",
+            presentCount, pspSubmitCalls, pspSubmitRejected, pspSubmitSamples, pspSubmitQuads,
+            pspSubmitFlushUs, pspSubmitPrepareUs, pspSubmitNativeUs, pspSubmitKickUs, pspSubmitMaxUs,
+            pspSubmitMatricesUs, pspSubmitRenderUs, pspSubmitTextureUs);
+    }
+#endif
+    // 1 when EffectiveColor is the identity for the current texture stage
+    // state (the ME packs the diffuse color unchanged).
+    int PspEffectiveColorIsIdentity()
+    {
+        static const D3DCOLOR probes[4] = {0x00000000u, 0xffffffffu,
+                                           0x80402010u, 0x7f3f1f0fu};
+        for (int i = 0; i < 4; ++i)
+            if (EffectiveColor(probes[i]) != probes[i])
+                return 0;
+        return 1;
+    }
+#endif
+#if TH08_PSP_QUAD_BATCH_ENABLED
+    // Consecutive 4-vertex triangle strips (Background Draw3D quads, GUI and
+    // ASCII squares) are converted at call time and held in the native prims
+    // arena; one native indexed submit draws the run.  Untransformed quads are
+    // moved to world space here so the GE keeps modelview = view for the whole
+    // run (no per-quad matrix upload).  Every state setter, other draw, clear,
+    // present and texture update flushes first, so order and state match the
+    // canonical per-quad path.
+    bool pspQuadBatchActive = false;
+    bool pspQuadBatchTransformed = false;
+    bool pspQuadBatchIdentityWorld = false;
+    UINT pspQuadBatchStart = 0U;
+    UINT pspQuadBatchQuads = 0U;
+    unsigned long pspQuadBatchStatQuads = 0UL, pspQuadBatchStatFlushes = 0UL, pspQuadBatchStatSingles = 0UL,
+                  pspQuadBatchStatFallbacks = 0UL, pspQuadBatchStatRejected = 0UL;
+    // Flush reasons: 0 other draw, 1 render state, 2 texture, 3 tex stage, 4 viewport,
+    // 5 transform, 6 clear/scene/present/copy, 7 texture update, 8 capacity/mode.
+    unsigned long pspQuadBatchReason[9] = {0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL, 0UL};
+    unsigned pspQuadBatchLastReason = 8U;
+    void FlushPspQuadBatchFor(unsigned reason)
+    {
+        if (pspQuadBatchActive && pspQuadBatchQuads != 0U && reason < 9U)
+            ++pspQuadBatchReason[reason];
+        FlushPspQuadBatch();
+    }
+    static constexpr UINT kPspQuadBatchMaxQuads = kPspDrawNativeMaxBatch / 4U;
+    bool EnsurePspDrawNativeArena()
+    {
+        if (pspDrawNativeVertices == NULL && !pspDrawNativeAllocAttempted)
+        {
+            pspDrawNativeAllocAttempted = true;
+            PspNativeIndicesInit();
+            pspDrawNativeVertices = static_cast<PspClientVertex *>(
+                th08::psp::RenderResourceArenaAllocate(kPspDrawNativeArenaBytes, 64U, "draw native prims"));
+            th08::psp::BootLog("NATIVE_PRIMS arena=%s bytes=%lu capacity=%lu max_batch=%lu\n",
+                               pspDrawNativeVertices != NULL ? "READY" : "FAILED",
+                               static_cast<unsigned long>(kPspDrawNativeArenaBytes),
+                               static_cast<unsigned long>(kPspDrawNativeVertexCapacity),
+                               static_cast<unsigned long>(kPspDrawNativeMaxBatch));
+        }
+        return pspDrawNativeVertices != NULL;
+    }
+    void FlushPspQuadBatch()
+    {
+        if (!pspQuadBatchActive)
+            return;
+        pspQuadBatchActive = false;
+        const UINT quads = pspQuadBatchQuads;
+        pspQuadBatchQuads = 0U;
+        if (quads == 0U)
+            return;
+        pspQuadBatchIdentityWorld = !pspQuadBatchTransformed;
+#if TH08_PSP_GE_2D_DIRECT_ENABLED
+        pspGe2dSkipMatrices = pspQuadBatchTransformed;
+        PrepareState(pspQuadBatchTransformed);
+        pspGe2dSkipMatrices = false;
+#else
+        PrepareState(pspQuadBatchTransformed);
+#endif
+        pspQuadBatchIdentityWorld = false;
+        PspClientVertex *const vertices = pspDrawNativeVertices + pspQuadBatchStart;
+        const UINT indexCount = quads * 6U;
+#if TH08_PSP_GE_2D_DIRECT_ENABLED
+        if (pspQuadBatchTransformed)
+        {
+            ++pspQuadBatchStatFlushes;
+            if (quads == 1U)
+                ++pspQuadBatchStatSingles;
+            if (PspGe2dSubmit(vertices, quads * 4U, vertices, gPspNativeQuadIndices, indexCount))
+                return;
+            --pspQuadBatchStatFlushes;
+            if (quads == 1U)
+                --pspQuadBatchStatSingles;
+        }
+#endif
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+        std::uint64_t submitStart = 0U;
+        const bool submitOn = th08::psp::DrawPrioritySubprofileBeginSlot(th08::psp::kDrawPrioritySlotSubmit, submitStart);
+#endif
+        const int submitted = __pspgl_th08_draw_native_indexed_triangles(
+            vertices, quads * 4U * sizeof(PspClientVertex), gPspNativeQuadIndices,
+            indexCount * sizeof(unsigned short), indexCount);
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+        if (submitOn)
+            th08::psp::DrawPrioritySubprofileEndSlot(th08::psp::kDrawPrioritySlotSubmit, submitStart);
+        th08::psp::DrawPrioritySubprofileNoteDraw(static_cast<std::uint32_t>(quads * 4U));
+#endif
+        ++pspQuadBatchStatFlushes;
+        if (quads == 1U)
+            ++pspQuadBatchStatSingles;
+        if (submitted == 0)
+        {
+            // Native hook refused: draw the same run through client arrays.
+            ++pspQuadBatchStatFallbacks;
+            glEnableClientState(GL_VERTEX_ARRAY);
+            glEnableClientState(GL_COLOR_ARRAY);
+            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+            glVertexPointer(3, GL_FLOAT, sizeof(PspClientVertex), &vertices[0].x);
+            glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(PspClientVertex), &vertices[0].r);
+            glTexCoordPointer(2, GL_FLOAT, sizeof(PspClientVertex), &vertices[0].u);
+            glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(indexCount), GL_UNSIGNED_SHORT, gPspNativeQuadIndices);
+            glDisableClientState(GL_VERTEX_ARRAY);
+            glDisableClientState(GL_COLOR_ARRAY);
+            glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        }
+        th08::psp::RenderPerfNoteStateEmitted(1U);
+    }
+    // Returns true when the quad was taken into the batch.
+    bool PspQuadBatchAppend(const BYTE *data, UINT stride, bool transformed, bool hasDiffuse,
+                            UINT colorOffset, bool hasTexture, UINT textureOffset)
+    {
+        if (!EnsurePspDrawNativeArena())
+            return false;
+        if (pspQuadBatchActive &&
+            (pspQuadBatchTransformed != transformed || pspQuadBatchQuads >= kPspQuadBatchMaxQuads))
+            FlushPspQuadBatchFor(8U);
+        if (pspDrawNativeCursor > kPspDrawNativeVertexCapacity - 4U)
+        {
+            FlushPspQuadBatchFor(8U);
+            ++pspQuadBatchStatRejected;
+            return false;
+        }
+        if (!pspQuadBatchActive)
+        {
+            pspQuadBatchActive = true;
+            pspQuadBatchTransformed = transformed;
+            pspQuadBatchStart = pspDrawNativeCursor;
+            pspQuadBatchQuads = 0U;
+        }
+        PspClientVertex *out = pspDrawNativeVertices + pspDrawNativeCursor;
+        const float *w = reinterpret_cast<const float *>(&world);
+        for (UINT k = 0U; k < 4U; ++k)
+        {
+            const BYTE *vertex = data + k * stride;
+            const float *position = reinterpret_cast<const float *>(vertex);
+            PspClientVertex &output = out[k];
+            if (transformed)
+            {
+                float ignoredFogCoordinate;
+                TransformPosition(position, true, &output.x, &output.y, &output.z, &ignoredFogCoordinate);
+                output.z = 1.0f - 2.0f * output.z;
+            }
+            else
+            {
+                // Row-vector D3D convention: out = in * world (affine).
+                const float x = position[0], y = position[1], z = position[2];
+                output.x = x * w[0] + y * w[4] + z * w[8] + w[12];
+                output.y = x * w[1] + y * w[5] + z * w[9] + w[13];
+                output.z = x * w[2] + y * w[6] + z * w[10] + w[14];
+            }
+            D3DCOLOR color = hasDiffuse ? *reinterpret_cast<const D3DCOLOR *>(vertex + colorOffset) : 0xffffffffu;
+            color = EffectiveColor(color);
+            output.r = static_cast<GLubyte>((color >> 16) & 255);
+            output.g = static_cast<GLubyte>((color >> 8) & 255);
+            output.b = static_cast<GLubyte>(color & 255);
+            output.a = static_cast<GLubyte>((color >> 24) & 255);
+            output.u = output.v = 0.0f;
+            if (hasTexture)
+            {
+                const float *uv = reinterpret_cast<const float *>(vertex + textureOffset);
+                output.u = uv[0];
+                output.v = uv[1];
+                if (!transformed)
+                {
+                    output.u = uv[0] * textureTransform._11 + uv[1] * textureTransform._21 + textureTransform._31;
+                    output.v = uv[0] * textureTransform._12 + uv[1] * textureTransform._22 + textureTransform._32;
+                }
+            }
+        }
+        pspDrawNativeCursor += 4U;
+        ++pspQuadBatchQuads;
+        ++pspQuadBatchStatQuads;
+        return true;
+    }
+#else
+    void FlushPspQuadBatch() {}
+#endif
+    HRESULT BeginScene()
+    {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        gPspQuadBatchDevice = this;
+#endif
+#if TH08_PSP_GE_KICK_ENABLED
+        gPspGeKickDraws = 0U;
+#endif
+#if TH08_PSP_SWAP_NOWAIT_ENABLED
+        PspWaitForPendingFlip();
+#endif
+#if TH08_PSP_PREPARE_STATE_CACHE_ENABLED
+        PspPrepareStateBoundary stateBoundary(&pspPrepareStateCache);
+#endif
+#if defined(PSP)
+#if TH08_PSP_BULLET_DIRECT_GE_ENABLED
+        RolloverPspBulletDirectGeArena();
 #endif
 #if TH08_PSP_PSPGL_STREAM_ARENA_ENABLED
         BeginPspglStreamArenaFrame();
@@ -3156,8 +3798,27 @@ class LinuxDevice : public IDirect3DDevice8
         // frontend/dialogue paths, so it must not recycle storage by itself.
         if (pspItemDirectGeArenaPresent != presentCount)
         {
+#if TH08_PSP_SWAP_TRIPLE_ENABLED
+        // Triple buffering: the previous frame's lists may still read this
+        // storage; fence them before recycling (free once the calc-end
+        // bullet-arena rollover already waited).
+        th08::psp::SwapTripleWaitPendingDone();
+#endif
             pspItemDirectGeVertexCursor = 0U;
             pspItemDirectGeArenaPresent = presentCount;
+        }
+#endif
+#if TH08_PSP_DRAW_NATIVE_PRIMS_ENABLED
+        if (pspDrawNativePresent != presentCount)
+        {
+#if TH08_PSP_SWAP_TRIPLE_ENABLED
+        // Triple buffering: the previous frame's lists may still read this
+        // storage; fence them before recycling (free once the calc-end
+        // bullet-arena rollover already waited).
+        th08::psp::SwapTripleWaitPendingDone();
+#endif
+            pspDrawNativeCursor = 0U;
+            pspDrawNativePresent = presentCount;
         }
 #endif
         if (backbuffer != NULL)
@@ -3178,9 +3839,18 @@ class LinuxDevice : public IDirect3DDevice8
         wasDialogPresent = dialogPresent;
         return S_OK;
     }
-    HRESULT EndScene() { return S_OK; }
+    HRESULT EndScene()
+    {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        FlushPspQuadBatchFor(6U);
+#endif
+        return S_OK;
+    }
     HRESULT Clear(DWORD, const D3DRECT *, DWORD flags, D3DCOLOR color, float depth, DWORD)
     {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        FlushPspQuadBatchFor(6U);
+#endif
 #if TH08_PSP_SWAP_NOWAIT_ENABLED
 #if TH08_PSP_FLIP_GUARD_COLOR_ONLY_ENABLED
         // A depth-only clear never writes the colour buffer (PSPGL glClear:
@@ -3196,6 +3866,7 @@ class LinuxDevice : public IDirect3DDevice8
 #if TH08_PSP_PREPARE_STATE_CACHE_ENABLED
         PspPrepareStateBoundary stateBoundary(&pspPrepareStateCache);
 #endif
+#if !defined(PSP) || !defined(TH08_PSP_LOGGING) || TH08_PSP_LOGGING
         if ((flags & D3DCLEAR_TARGET) && getenv("TH08_LINUX_RENDER_TRACE") != NULL)
         {
             FILE *trace = fopen("modern-render.txt", "ab");
@@ -3211,6 +3882,7 @@ class LinuxDevice : public IDirect3DDevice8
             }
         }
 
+#endif
         GLbitfield mask = 0;
         if (flags & D3DCLEAR_TARGET)
         {
@@ -3257,6 +3929,15 @@ class LinuxDevice : public IDirect3DDevice8
         th08::psp::RenderPerfNoteStateRequested();
 #endif
         if (matrix == NULL) return E_INVALIDARG;
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        // World and texture transforms are folded into the batched vertices
+        // at append time; view/projection change the GE transform of queued
+        // quads and must flush first.
+        if (state != D3DTS_WORLD && state != D3DTS_TEXTURE0 &&
+            !(state == D3DTS_VIEW && memcmp(&view, matrix, sizeof(view)) == 0) &&
+            !(state == D3DTS_PROJECTION && memcmp(&projection, matrix, sizeof(projection)) == 0))
+            FlushPspQuadBatchFor(5U);
+#endif
 #if TH08_PSP_PREPARE_STATE_CACHE_ENABLED
         // Version changes are based on the 16 raw float words, not numerical
         // equality.  This preserves signed zero/NaN distinctions while making
@@ -3277,6 +3958,10 @@ class LinuxDevice : public IDirect3DDevice8
     }
     HRESULT SetViewport(const D3DVIEWPORT8 *value)
     {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        if (value != NULL && memcmp(&viewport, value, sizeof(viewport)) != 0)
+            FlushPspQuadBatchFor(4U);
+#endif
 #if defined(PSP)
         th08::psp::RenderPerfNoteStateRequested();
 #endif
@@ -3289,6 +3974,11 @@ class LinuxDevice : public IDirect3DDevice8
     { if (value == NULL) return E_INVALIDARG; *value = viewport; return S_OK; }
     HRESULT SetRenderState(D3DRENDERSTATETYPE state, DWORD value)
     {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        // An unchanged value leaves the GE state of queued quads intact.
+        if (!(static_cast<UINT>(state) < 256 && renderStates[state] == value))
+            FlushPspQuadBatchFor(1U);
+#endif
 #if defined(PSP)
         th08::psp::RenderPerfNoteStateRequested();
 #endif
@@ -3298,6 +3988,10 @@ class LinuxDevice : public IDirect3DDevice8
     }
     HRESULT SetTexture(DWORD stage, IDirect3DTexture8 *value)
     {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        if (stage == 0 && static_cast<LinuxTexture *>(value) != texture)
+            FlushPspQuadBatchFor(2U);
+#endif
 #if defined(PSP)
         th08::psp::RenderPerfNoteStateRequested();
 #endif
@@ -3311,6 +4005,10 @@ class LinuxDevice : public IDirect3DDevice8
     }
     HRESULT SetTextureStageState(DWORD stage, D3DTEXTURESTAGESTATETYPE state, DWORD value)
     {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        if (!(stage == 0 && static_cast<UINT>(state) < 32 && textureStates[state] == value))
+            FlushPspQuadBatchFor(3U);
+#endif
 #if defined(PSP)
         th08::psp::RenderPerfNoteStateRequested();
 #endif
@@ -3338,6 +4036,9 @@ class LinuxDevice : public IDirect3DDevice8
     }
     HRESULT DrawPrimitive(D3DPRIMITIVETYPE type, UINT startVertex, UINT primitiveCount)
     {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        FlushPspQuadBatchFor(0U);
+#endif
         if (vertexBuffer == NULL || streamStride == 0) return E_FAIL;
         UINT offset = startVertex * streamStride, count = VertexCount(type, primitiveCount);
         if (offset + count * streamStride > vertexBuffer->bytes.size()) return E_INVALIDARG;
@@ -3967,26 +4668,11 @@ class LinuxDevice : public IDirect3DDevice8
         *zOut = viewport.MinZ + vector[2] * reciprocal * (viewport.MaxZ - viewport.MinZ);
     }
 #if TH08_PSP_PREPARE_STATE_CACHE_ENABLED
-    void PrepareStateCachedPsp(bool transformed)
+    // The ortho viewport/projection/identity model-view of the pre-transformed
+    // path (split out so the 2D direct path can skip it).
+    void PspApplyTransformedMatrices(UINT width, UINT height, UINT *pspStateEmittedPtr)
     {
-        const UINT width = backbuffer != NULL ? backbuffer->width : viewport.Width;
-        const UINT height = backbuffer != NULL ? backbuffer->height : viewport.Height;
-        UINT pspStateEmitted = 0;
-
-        ApplyPspCachedCapability(GL_SCISSOR_TEST, true,
-                                 &pspPrepareStateCache.scissorEnableValid,
-                                 &pspPrepareStateCache.scissorEnabled,
-                                 &pspStateEmitted);
-        const PspPhysicalRect scissor = MakePspPhysicalRect(
-            static_cast<int>(viewport.X), static_cast<int>(viewport.Y),
-            static_cast<int>(viewport.X + viewport.Width),
-            static_cast<int>(viewport.Y + viewport.Height), width, height);
-        ApplyPspCachedScissor(&pspPrepareStateCache, scissor.left,
-                              scissor.bottom, scissor.width, scissor.height,
-                              &pspStateEmitted);
-
-        if (transformed)
-        {
+        UINT &pspStateEmitted = *pspStateEmittedPtr;
             ApplyPspCachedViewport(&pspPrepareStateCache, kPspFitLeft, 0,
                                    kPspFitWidth, kPspScreenHeight,
                                    &pspStateEmitted);
@@ -4021,6 +4707,61 @@ class LinuxDevice : public IDirect3DDevice8
                 pspPrepareStateCache.modelViewValid = true;
                 pspPrepareStateCache.modelViewTransformed = true;
             }
+    }
+#if TH08_PSP_GE_2D_DIRECT_ENABLED
+    bool pspGe2dSkipMatrices = false;
+    // Direct through-mode submit of pre-transformed vertices; falls back to
+    // the PSPGL path (matrices applied first) when refused.
+    bool PspGe2dSubmit(const PspClientVertex *source, UINT count, PspClientVertex *destination,
+                       const unsigned short *indices, UINT indexCount)
+    {
+        const int ok = th08_ge2d_direct_submit(
+            reinterpret_cast<const Th08Ge2dVertex *>(source), count,
+            reinterpret_cast<Th08Ge2dVertex *>(destination), indices, indexCount,
+            static_cast<float>(kPspFitLeft), static_cast<float>(kPspFitWidth) / 640.0f,
+            static_cast<float>(kPspScreenHeight) / 480.0f);
+        if (ok != 0)
+        {
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+            th08::psp::DrawPrioritySubprofileNoteDraw(static_cast<std::uint32_t>(count));
+#endif
+            th08::psp::RenderPerfNoteDraw(indexCount); PspGeKickNoteDraw();
+            return true;
+        }
+        const UINT width = backbuffer != NULL ? backbuffer->width : viewport.Width;
+        const UINT height = backbuffer != NULL ? backbuffer->height : viewport.Height;
+        UINT emitted = 0U;
+        PspApplyTransformedMatrices(width, height, &emitted);
+        return false;
+    }
+#endif
+    void PrepareStateCachedPsp(bool transformed)
+    {
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+        const unsigned int sampleStart = pspSubmitPrepareSample ? sceKernelGetSystemTimeLow() : 0U;
+#endif
+        const UINT width = backbuffer != NULL ? backbuffer->width : viewport.Width;
+        const UINT height = backbuffer != NULL ? backbuffer->height : viewport.Height;
+        UINT pspStateEmitted = 0;
+
+        ApplyPspCachedCapability(GL_SCISSOR_TEST, true,
+                                 &pspPrepareStateCache.scissorEnableValid,
+                                 &pspPrepareStateCache.scissorEnabled,
+                                 &pspStateEmitted);
+        const PspPhysicalRect scissor = MakePspPhysicalRect(
+            static_cast<int>(viewport.X), static_cast<int>(viewport.Y),
+            static_cast<int>(viewport.X + viewport.Width),
+            static_cast<int>(viewport.Y + viewport.Height), width, height);
+        ApplyPspCachedScissor(&pspPrepareStateCache, scissor.left,
+                              scissor.bottom, scissor.width, scissor.height,
+                              &pspStateEmitted);
+
+        if (transformed)
+        {
+#if TH08_PSP_GE_2D_DIRECT_ENABLED
+            if (!pspGe2dSkipMatrices)
+#endif
+                PspApplyTransformedMatrices(width, height, &pspStateEmitted);
         }
         else
         {
@@ -4033,14 +4774,26 @@ class LinuxDevice : public IDirect3DDevice8
                 !pspPrepareStateCache.projectionTransformed &&
                 pspPrepareStateCache.projectionRawVersion ==
                     pspProjectionRawVersion;
+#if TH08_PSP_QUAD_BATCH_ENABLED
+            const bool identityWorld = pspQuadBatchIdentityWorld;
+#else
+            const bool identityWorld = false;
+#endif
             const bool modelViewMatches =
                 pspPrepareStateCache.modelViewValid &&
                 !pspPrepareStateCache.modelViewTransformed &&
-                pspPrepareStateCache.worldRawVersion == pspWorldRawVersion &&
+                pspPrepareStateCache.modelViewIdentityWorld == identityWorld &&
+                (identityWorld ||
+                 pspPrepareStateCache.worldRawVersion == pspWorldRawVersion) &&
                 pspPrepareStateCache.viewRawVersion == pspViewRawVersion;
 
             D3DMATRIX modelView;
-            if (!modelViewMatches)
+            if (!modelViewMatches && identityWorld)
+            {
+                // Quad batch: vertices are already in world space.
+                modelView = view;
+            }
+            else if (!modelViewMatches)
             {
                 const float *worldValues = reinterpret_cast<const float *>(&world);
                 const float *viewValues = reinterpret_cast<const float *>(&view);
@@ -4097,6 +4850,7 @@ class LinuxDevice : public IDirect3DDevice8
                 ++pspStateEmitted;
                 pspPrepareStateCache.modelViewValid = true;
                 pspPrepareStateCache.modelViewTransformed = false;
+                pspPrepareStateCache.modelViewIdentityWorld = identityWorld;
                 pspPrepareStateCache.worldRawVersion = pspWorldRawVersion;
                 pspPrepareStateCache.viewRawVersion = pspViewRawVersion;
             }
@@ -4108,6 +4862,9 @@ class LinuxDevice : public IDirect3DDevice8
 
         const bool blendEnabled =
             renderStates[D3DRS_ALPHABLENDENABLE] != 0;
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+        const unsigned int sampleMatrices = pspSubmitPrepareSample ? sceKernelGetSystemTimeLow() : 0U;
+#endif
         ApplyPspCachedCapability(GL_BLEND, blendEnabled,
                                  &pspPrepareStateCache.blendEnableValid,
                                  &pspPrepareStateCache.blendEnabled,
@@ -4236,6 +4993,9 @@ class LinuxDevice : public IDirect3DDevice8
             }
         }
 
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+        const unsigned int sampleRender = pspSubmitPrepareSample ? sceKernelGetSystemTimeLow() : 0U;
+#endif
         const bool colorUsesTexture = TextureOperationUsesTexture(
             textureStates[D3DTSS_COLOROP], textureStates[D3DTSS_COLORARG1],
             textureStates[D3DTSS_COLORARG2]);
@@ -4328,6 +5088,15 @@ class LinuxDevice : public IDirect3DDevice8
                                      &pspStateEmitted);
         }
         th08::psp::RenderPerfNoteStateEmitted(pspStateEmitted);
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+        if (pspSubmitPrepareSample)
+        {
+            const unsigned int end = sceKernelGetSystemTimeLow();
+            pspSubmitMatricesUs += sampleMatrices - sampleStart;
+            pspSubmitRenderUs += sampleRender - sampleMatrices;
+            pspSubmitTextureUs += end - sampleRender;
+        }
+#endif
     }
 #endif
 
@@ -4802,6 +5571,9 @@ class LinuxDevice : public IDirect3DDevice8
                         const void *indexData, D3DFORMAT indexFormat,
                         const BYTE *data, UINT stride)
     {
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        FlushPspQuadBatchFor(0U);
+#endif
 #if TH08_PSP_SWAP_NOWAIT_ENABLED
         PspWaitForPendingFlip();
 #endif
@@ -5077,7 +5849,7 @@ class LinuxDevice : public IDirect3DDevice8
                                 }
                                 ++pspItemDirectGeSubmittedBatches;
                                 pspItemDirectGeSubmittedQuads += quadCount;
-                                th08::psp::RenderPerfNoteDraw(indexCount);
+                                th08::psp::RenderPerfNoteDraw(indexCount); PspGeKickNoteDraw();
 #if defined(TH08_PSP_RENDER_PERF_DIAG)
                                 perfDrawTicks +=
                                     SDL_GetPerformanceCounter() - drawStart;
@@ -5160,7 +5932,7 @@ class LinuxDevice : public IDirect3DDevice8
                         }
                         ++pspBulletDirectGeSubmittedBatches;
                         pspBulletDirectGeSubmittedQuads += quadCount;
-                        th08::psp::RenderPerfNoteDraw(indexCount);
+                        th08::psp::RenderPerfNoteDraw(indexCount); PspGeKickNoteDraw();
 #if defined(TH08_PSP_RENDER_PERF_DIAG)
                         perfDrawTicks +=
                             SDL_GetPerformanceCounter() - drawStart;
@@ -5225,7 +5997,7 @@ class LinuxDevice : public IDirect3DDevice8
 
             if (vertexRangeEnd <= pspDrawVertexCapacity)
             {
-                th08::psp::RenderPerfNoteDraw(indexCount);
+                th08::psp::RenderPerfNoteDraw(indexCount); PspGeKickNoteDraw();
                 const bool transformed =
                     (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
                 UINT offset = transformed ? 16U : 12U;
@@ -5439,7 +6211,7 @@ class LinuxDevice : public IDirect3DDevice8
         // Canonical DrawPrimitiveUP accounts six submitted triangle-list
         // vertices.  Keep that logical draw workload unchanged even though
         // only four unique backend vertices are materialized.
-        th08::psp::RenderPerfNoteDraw(indexCount);
+        th08::psp::RenderPerfNoteDraw(indexCount); PspGeKickNoteDraw();
         PrepareState(true);
 
         static const UINT kUniqueCanonicalCorners[4] = {0U, 1U, 2U, 5U};
@@ -5798,7 +6570,7 @@ class LinuxDevice : public IDirect3DDevice8
                 authoritativeQuads;
             ++pspBulletDirectGeSubmittedBatches;
             pspBulletDirectGeSubmittedQuads += authoritativeQuads;
-            th08::psp::RenderPerfNoteDraw(authoritativeIndexCount);
+            th08::psp::RenderPerfNoteDraw(authoritativeIndexCount); PspGeKickNoteDraw();
 #if defined(TH08_PSP_RENDER_PERF_DIAG)
             ++perfDrawCalls;
             perfVertices += authoritativeIndexCount;
@@ -5831,7 +6603,7 @@ class LinuxDevice : public IDirect3DDevice8
             pspBulletPackedVertexFastpath.clientFallbackQuads +=
                 authoritativeQuads;
             ++pspBulletDirectGeFallbacks;
-            th08::psp::RenderPerfNoteDraw(authoritativeIndexCount);
+            th08::psp::RenderPerfNoteDraw(authoritativeIndexCount); PspGeKickNoteDraw();
 #if defined(TH08_PSP_RENDER_PERF_DIAG)
             ++perfDrawCalls;
             perfVertices += authoritativeIndexCount;
@@ -5859,7 +6631,7 @@ class LinuxDevice : public IDirect3DDevice8
                 th08::psp::DrawPrioritySubprofileNoteDraw(4U);
 #endif
                 glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-                th08::psp::RenderPerfNoteDraw(4U);
+                th08::psp::RenderPerfNoteDraw(4U); PspGeKickNoteDraw();
             }
             glDisableClientState(GL_VERTEX_ARRAY);
             glDisableClientState(GL_COLOR_ARRAY);
@@ -5986,7 +6758,7 @@ class LinuxDevice : public IDirect3DDevice8
 #if defined(TH08_PSP_RENDER_PERF_DIAG)
         const Uint64 drawStart = SDL_GetPerformanceCounter();
 #endif
-        th08::psp::RenderPerfNoteDraw(vertexCount);
+        th08::psp::RenderPerfNoteDraw(vertexCount); PspGeKickNoteDraw();
         PrepareState(true);
         for (UINT index = 0U; index < vertexCount; ++index)
         {
@@ -6145,7 +6917,7 @@ class LinuxDevice : public IDirect3DDevice8
         {
             return false;
         }
-        th08::psp::RenderPerfNoteDraw(vertexCount);
+        th08::psp::RenderPerfNoteDraw(vertexCount); PspGeKickNoteDraw();
 #if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
         th08::psp::DrawPrioritySubprofileNoteDraw(static_cast<std::uint32_t>(vertexCount));
 #endif
@@ -6393,7 +7165,7 @@ class LinuxDevice : public IDirect3DDevice8
             pspBulletDirectGeSubmittedQuads += pairCount + quadCount;
         }
         const UINT submittedVertices = pairVertexCount + quadIndexCount;
-        th08::psp::RenderPerfNoteDraw(submittedVertices);
+        th08::psp::RenderPerfNoteDraw(submittedVertices); PspGeKickNoteDraw();
 #if defined(TH08_PSP_RENDER_PERF_DIAG)
         perfDrawTicks += SDL_GetPerformanceCounter() - drawStart;
         ++perfDrawCalls;
@@ -6415,7 +7187,7 @@ class LinuxDevice : public IDirect3DDevice8
 #endif
         UINT count = VertexCount(type, primitiveCount);
 #if defined(PSP)
-        th08::psp::RenderPerfNoteDraw(count);
+        th08::psp::RenderPerfNoteDraw(count); PspGeKickNoteDraw();
 #endif
         bool transformed = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
         UINT offset = transformed ? 16 : 12;
@@ -6425,7 +7197,31 @@ class LinuxDevice : public IDirect3DDevice8
         if (hasDiffuse) offset += 4;
         if (fvf & D3DFVF_SPECULAR) offset += 4;
         bool hasTexture = (fvf & D3DFVF_TEXCOUNT_MASK) != 0; UINT textureOffset = offset;
+#if TH08_PSP_QUAD_BATCH_ENABLED
+        if (type == D3DPT_TRIANGLESTRIP && count == 4U &&
+            PspQuadBatchAppend(data, stride, transformed, hasDiffuse, colorOffset, hasTexture, textureOffset))
+            return S_OK;
+        FlushPspQuadBatchFor(0U);
+#endif
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+        std::uint64_t prepStart = 0U;
+        const bool prepOn = th08::psp::DrawPrioritySubprofileBeginSlot(th08::psp::kDrawPrioritySlotPrep, prepStart);
+#endif
+#if TH08_PSP_GE_2D_DIRECT_ENABLED
+        const bool ge2dCandidate = transformed && count >= 3U && count <= kPspDrawNativeMaxBatch &&
+                                   (type == D3DPT_TRIANGLELIST || type == D3DPT_TRIANGLESTRIP ||
+                                    type == D3DPT_TRIANGLEFAN) &&
+                                   !(type == D3DPT_TRIANGLELIST && (count % 3U) != 0U);
+        pspGe2dSkipMatrices = ge2dCandidate;
         PrepareState(transformed);
+        pspGe2dSkipMatrices = false;
+#else
+        PrepareState(transformed);
+#endif
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+        if (prepOn)
+            th08::psp::DrawPrioritySubprofileEndSlot(th08::psp::kDrawPrioritySlotPrep, prepStart);
+#endif
 #if defined(PSP)
         // PSPGL immediate mode performs several guest calls for every vertex.
         // TH07's successful renderer submits whole batches to GE; use the GL
@@ -6451,6 +7247,17 @@ class LinuxDevice : public IDirect3DDevice8
             }
             if (count <= pspDrawVertexCapacity)
             {
+#if TH08_PSP_GE_2D_DIRECT_ENABLED
+                // Single pass: pre-transformed vertices are written directly
+                // in GE through-mode form into the native arena.
+                Th08Ge2dParams ge2dParams;
+                const bool ge2dPrepared = ge2dCandidate && EnsurePspDrawNativeArena() &&
+                                          pspDrawNativeCursor <= kPspDrawNativeVertexCapacity - count &&
+                                          th08_ge2d_direct_params(&ge2dParams) != 0;
+                PspClientVertex *const ge2dOut = ge2dPrepared ? pspDrawNativeVertices + pspDrawNativeCursor : NULL;
+                const float ge2dScaleX = static_cast<float>(kPspFitWidth) / 640.0f;
+                const float ge2dScaleY = static_cast<float>(kPspScreenHeight) / 480.0f;
+#endif
                 for (UINT index = 0; index < count; ++index)
                 {
                     const BYTE *vertex = data + index * stride;
@@ -6491,8 +7298,64 @@ class LinuxDevice : public IDirect3DDevice8
                                        uv[1] * textureTransform._22 + textureTransform._32;
                         }
                     }
+#if TH08_PSP_GE_2D_DIRECT_ENABLED
+                    if (ge2dPrepared)
+                    {
+                        PspClientVertex &out2d = ge2dOut[index];
+                        out2d.u = output.u * ge2dParams.texW;
+                        out2d.v = (ge2dParams.flipped ? 1.0f - output.v : output.v) * ge2dParams.texH;
+                        out2d.r = output.r; out2d.g = output.g; out2d.b = output.b; out2d.a = output.a;
+                        out2d.x = static_cast<float>(kPspFitLeft) + output.x * ge2dScaleX;
+                        out2d.y = output.y * ge2dScaleY;
+                        out2d.z = ge2dParams.sz * (-output.z) + ge2dParams.tz;
+                    }
+#endif
                 }
 
+#if TH08_PSP_GE_2D_DIRECT_ENABLED
+                if (ge2dCandidate && ge2dPrepared)
+                {
+                    // Converted straight into the arena above.
+                    const unsigned short *ge2dIndices =
+                        type == D3DPT_TRIANGLELIST ? gPspNativeListIndices
+                        : type == D3DPT_TRIANGLESTRIP ? gPspNativeStripIndices : gPspNativeFanIndices;
+                    const UINT ge2dIndexCount = type == D3DPT_TRIANGLELIST ? count : (count - 2U) * 3U;
+                    PspClientVertex *ge2dDestination = pspDrawNativeVertices + pspDrawNativeCursor;
+                    if (th08_ge2d_direct_submit_prepared(reinterpret_cast<const Th08Ge2dVertex *>(ge2dDestination),
+                                                         count, ge2dIndices, ge2dIndexCount) != 0)
+                    {
+                        pspDrawNativeCursor += count;
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+                        th08::psp::DrawPrioritySubprofileNoteDraw(static_cast<std::uint32_t>(count));
+#endif
+                        th08::psp::RenderPerfNoteDraw(ge2dIndexCount); PspGeKickNoteDraw();
+                        return S_OK;
+                    }
+                    // Refused: fall back with the 3D-form vertices in pspDrawVertices.
+                    const UINT width2 = backbuffer != NULL ? backbuffer->width : viewport.Width;
+                    const UINT height2 = backbuffer != NULL ? backbuffer->height : viewport.Height;
+                    UINT emitted2 = 0U;
+                    PspApplyTransformedMatrices(width2, height2, &emitted2);
+                }
+                else if (ge2dCandidate)
+                {
+                    const UINT width2 = backbuffer != NULL ? backbuffer->width : viewport.Width;
+                    const UINT height2 = backbuffer != NULL ? backbuffer->height : viewport.Height;
+                    UINT emitted2 = 0U;
+                    PspApplyTransformedMatrices(width2, height2, &emitted2);
+                }
+#endif
+#if TH08_PSP_DRAW_NATIVE_PRIMS_ENABLED
+                if ((type == D3DPT_TRIANGLESTRIP || type == D3DPT_TRIANGLELIST ||
+                     type == D3DPT_TRIANGLEFAN) &&
+                    DrawNativePrims(type, count))
+                {
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+                    th08::psp::DrawPrioritySubprofileNoteDraw(static_cast<std::uint32_t>(count));
+#endif
+                    return S_OK;
+                }
+#endif
                 glEnableClientState(GL_VERTEX_ARRAY);
                 glEnableClientState(GL_COLOR_ARRAY);
                 glVertexPointer(3, GL_FLOAT, sizeof(PspClientVertex), &pspDrawVertices[0].x);
@@ -6616,6 +7479,7 @@ class LinuxDevice : public IDirect3DDevice8
     UINT pspDrawVertexCapacity;
 #if TH08_PSP_PSPGL_STREAM_ARENA_ENABLED
     void *pspStreamArenaLease;
+    bool pspStreamArenaDeferred;
     unsigned long pspStreamArenaPresent;
     unsigned long pspStreamArenaLeaseFrames;
     unsigned long pspStreamArenaAllocationFailures;
@@ -6665,6 +7529,84 @@ class LinuxDevice : public IDirect3DDevice8
     unsigned long pspItemMixedGeFallbacks = 0U;
     unsigned long pspItemMixedGeArenaExhaustions = 0U;
 #endif
+#endif
+#if TH08_PSP_DRAW_NATIVE_PRIMS_ENABLED
+    PspClientVertex *pspDrawNativeVertices = NULL;
+    bool pspDrawNativeAllocAttempted = false;
+    UINT pspDrawNativeCursor = 0U;
+    unsigned long pspDrawNativePresent = ~0UL;
+    unsigned long pspDrawNativeSubmits = 0UL;
+    unsigned long pspDrawNativeVertexTotal = 0UL;
+    unsigned long pspDrawNativeFallbackRoom = 0UL;
+    unsigned long pspDrawNativeFallbackHook = 0UL;
+    // Copies the packed pspDrawVertices batch into the per-Present partition
+    // and submits it through the no-copy indexed hook.  false = use the
+    // client-array path.
+    bool DrawNativePrims(D3DPRIMITIVETYPE type, UINT count)
+    {
+        if (count < 3U || count > kPspDrawNativeMaxBatch)
+            return false;
+        const unsigned short *indices = NULL;
+        UINT indexCount = 0U;
+        switch (type)
+        {
+        case D3DPT_TRIANGLELIST:
+            if ((count % 3U) != 0U)
+                return false;
+            indices = gPspNativeListIndices;
+            indexCount = count;
+            break;
+        case D3DPT_TRIANGLESTRIP:
+            indices = gPspNativeStripIndices;
+            indexCount = (count - 2U) * 3U;
+            break;
+        case D3DPT_TRIANGLEFAN:
+            indices = gPspNativeFanIndices;
+            indexCount = (count - 2U) * 3U;
+            break;
+        default:
+            return false;
+        }
+        if (pspDrawNativeVertices == NULL && !pspDrawNativeAllocAttempted)
+        {
+            pspDrawNativeAllocAttempted = true;
+            PspNativeIndicesInit();
+            pspDrawNativeVertices = static_cast<PspClientVertex *>(
+                th08::psp::RenderResourceArenaAllocate(kPspDrawNativeArenaBytes, 64U, "draw native prims"));
+            th08::psp::BootLog("NATIVE_PRIMS arena=%s bytes=%lu capacity=%lu max_batch=%lu\n",
+                               pspDrawNativeVertices != NULL ? "READY" : "FAILED",
+                               static_cast<unsigned long>(kPspDrawNativeArenaBytes),
+                               static_cast<unsigned long>(kPspDrawNativeVertexCapacity),
+                               static_cast<unsigned long>(kPspDrawNativeMaxBatch));
+        }
+        if (pspDrawNativeVertices == NULL || pspDrawNativeCursor > kPspDrawNativeVertexCapacity - count)
+        {
+            ++pspDrawNativeFallbackRoom;
+            return false;
+        }
+        PspClientVertex *destination = pspDrawNativeVertices + pspDrawNativeCursor;
+        memcpy(destination, pspDrawVertices, static_cast<size_t>(count) * sizeof(PspClientVertex));
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+        std::uint64_t submitStart = 0U;
+        const bool submitOn = th08::psp::DrawPrioritySubprofileBeginSlot(th08::psp::kDrawPrioritySlotSubmit, submitStart);
+#endif
+        const int submitted = __pspgl_th08_draw_native_indexed_triangles(
+            destination, count * sizeof(PspClientVertex), indices,
+            indexCount * sizeof(unsigned short), indexCount);
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+        if (submitOn)
+            th08::psp::DrawPrioritySubprofileEndSlot(th08::psp::kDrawPrioritySlotSubmit, submitStart);
+#endif
+        if (submitted == 0)
+        {
+            ++pspDrawNativeFallbackHook;
+            return false;
+        }
+        pspDrawNativeCursor += count;
+        ++pspDrawNativeSubmits;
+        pspDrawNativeVertexTotal += count;
+        return true;
+    }
 #endif
 #if TH08_PSP_ITEM_DIRECT_GE_ENABLED
     PspClientVertex *pspItemDirectGeVertices = NULL;
@@ -6743,15 +7685,54 @@ class LinuxDirect3D : public IDirect3D8
 };
 } // namespace
 
+// Texture updates outside the device flush queued quads first (GE order).
+static void PspQuadBatchFlushGlobal()
+{
+#if TH08_PSP_QUAD_BATCH_ENABLED
+    if (gPspQuadBatchDevice != NULL)
+        gPspQuadBatchDevice->FlushPspQuadBatchFor(7U);
+#endif
+}
 #if TH08_PSP_BULLET_DIRECT_GE_ENABLED
 void th08_psp_bullet_direct_ge_set_batch(bool active)
 {
     g_PspBulletDirectGeBatchActive = active;
 }
+void *th08_psp_bullet_me_reserve(void *deviceRaw, unsigned int quadCount)
+{
+    if (deviceRaw == NULL)
+        return NULL;
+    return static_cast<LinuxDevice *>(static_cast<IDirect3DDevice8 *>(deviceRaw))
+        ->ReservePspBulletDirectGeForMe(quadCount);
+}
+int th08_psp_bullet_me_submit(void *deviceRaw, const void *vertices, unsigned int quadCount,
+                              const unsigned short *indices)
+{
+    if (deviceRaw == NULL)
+        return 0;
+    return static_cast<LinuxDevice *>(static_cast<IDirect3DDevice8 *>(deviceRaw))
+        ->SubmitPspBulletMeQuads(vertices, quadCount, indices);
+}
+void th08_psp_bullet_me_reserve_commit(void *deviceRaw)
+{
+    if (deviceRaw != NULL)
+        static_cast<LinuxDevice *>(static_cast<IDirect3DDevice8 *>(deviceRaw))->CommitPspBulletMeReserve();
+}
+int th08_psp_bullet_me_color_identity(void *deviceRaw)
+{
+    if (deviceRaw == NULL)
+        return 0;
+    return static_cast<LinuxDevice *>(static_cast<IDirect3DDevice8 *>(deviceRaw))
+        ->PspEffectiveColorIsIdentity();
+}
 #elif defined(PSP)
 void th08_psp_bullet_direct_ge_set_batch(bool)
 {
 }
+void *th08_psp_bullet_me_reserve(void *, unsigned int) { return NULL; }
+void th08_psp_bullet_me_reserve_commit(void *) {}
+int th08_psp_bullet_me_submit(void *, const void *, unsigned int, const unsigned short *) { return 0; }
+int th08_psp_bullet_me_color_identity(void *) { return 0; }
 #endif
 
 #if TH08_PSP_ITEM_MIXED_QUADS_FASTPATH_ENABLED
@@ -7131,6 +8112,7 @@ bool th08_linux_capture_direct_to_texture(IDirect3DSurface8 *destinationRaw, con
                 }
             }
         }
+        PspQuadBatchFlushGlobal();
         glTexSubImage2D(GL_TEXTURE_2D, 0, destinationRect.left, destinationRect.top + static_cast<GLint>(y0),
                         static_cast<GLsizei>(destinationWidth), static_cast<GLsizei>(rows), glFormat, glType,
                         gPspCaptureBand);
@@ -7252,11 +8234,17 @@ static void PspNoteAnmTextureUpload(LinuxTexture *texture, LinuxSurface *surface
     ++gPspAnmTexUploads;
     const unsigned long bytes = static_cast<unsigned long>(surface->width) * surface->height *
                                 (texture->pspGlType == GL_UNSIGNED_BYTE ? 4UL : 2UL);
-    th08::psp::BootLog("ANM_TEX owner=%s size=%lux%lu d3d=%lu gl=0x%04x bytes=%lu conv=%d\n",
+    th08::psp::BootLog("ANM_TEX owner=%s size=%lux%lu d3d=%lu gl=0x%04x bytes=%lu conv=%d hot=%d\n",
                        gPspTextureUploadOwner[0] != '\0' ? gPspTextureUploadOwner : "?",
                        static_cast<unsigned long>(surface->width), static_cast<unsigned long>(surface->height),
                        static_cast<unsigned long>(surface->format), static_cast<unsigned int>(texture->pspGlType),
-                       bytes, converted);
+                       bytes, converted,
+#if TH08_PSP_GE4_HOT_TEXTURES_ENABLED
+                       PspGe4OwnerIsHot(gPspTextureUploadOwner) ? 1 : 0
+#else
+                       1
+#endif
+                       );
 }
 bool th08_linux_texture_upload_static(IDirect3DTexture8 *textureRaw, const void *sourceRaw,
                                       UINT sourcePitch, D3DFORMAT sourceFormat)
@@ -7281,7 +8269,31 @@ bool th08_linux_texture_upload_static(IDirect3DTexture8 *textureRaw, const void 
     th08::psp::RenderResourceAllocationScope arenaScope(
         gPspTextureUploadOwner[0] != '\0' ? gPspTextureUploadOwner : "static ANM texture");
 #if TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE_ENABLED
+#if TH08_PSP_GE4_HOT_TEXTURES_ENABLED
+    const bool pspOwnerHot = PspGe4OwnerIsHot(gPspTextureUploadOwner);
+    if (!pspOwnerHot)
+        ++gPspGe4HotSkipped;
+#if TH08_PSP_PORTRAIT_LOWER_VRAM_ENABLED
+    // A fresh, single tight RGBA image takes the existing in-place 16-bit
+    // upload below. Let PSPGL try lower eDRAM, but never promote this image
+    // into the upper shelf used by battle textures and the third framebuffer.
+    // STATIC_DRAW falls back to Main RAM if fragmented; it never evicts.
+    const bool portraitEligible = !pspOwnerHot && !pspSuppressStaticUploadPromotion &&
+        texture->glName == 0 && !texture->uploaded && th08_psp_ge4_active() != 0 &&
+        sourceFormat == D3DFMT_A8R8G8B8 && surface->format == D3DFMT_A8R8G8B8 &&
+        sourcePitch == surface->width * 4U;
+    const std::size_t portraitAvailable = portraitEligible ? __pspgl_vidmem_avail() : 0U;
+    const std::size_t portraitBytes = portraitEligible
+        ? th08::psp::PortraitLowerBytes(gPspTextureUploadOwner, surface->width, surface->height,
+                                        portraitAvailable) : 0U;
+    PspGe4StaticUploadScope staticUpload(
+        !pspSuppressStaticUploadPromotion && (pspOwnerHot || portraitBytes != 0U), portraitBytes == 0U);
+#else
+    PspGe4StaticUploadScope staticUpload(!pspSuppressStaticUploadPromotion && pspOwnerHot);
+#endif
+#else
     PspGe4StaticUploadScope staticUpload(!pspSuppressStaticUploadPromotion);
+#endif
 #else
     PspGe4StaticUploadScope staticUpload(true);
 #endif
@@ -7376,6 +8388,13 @@ bool th08_linux_texture_upload_static(IDirect3DTexture8 *textureRaw, const void 
         texture->pspGlFormat = uploadFormat;
         texture->pspGlType = uploadType;
         PspNoteAnmTextureUpload(texture, surface, 1);
+#if TH08_PSP_PORTRAIT_LOWER_VRAM_ENABLED && TH08_PSP_LOGGING
+        if (portraitBytes != 0U)
+            th08::psp::BootLog("PORTRAIT_LOWER owner=%s bytes=%lu avail_before=%lu avail_after=%lu\n",
+                gPspTextureUploadOwner, static_cast<unsigned long>(portraitBytes),
+                static_cast<unsigned long>(portraitAvailable),
+                static_cast<unsigned long>(__pspgl_vidmem_avail()));
+#endif
         return true;
     }
 #endif
@@ -7545,6 +8564,7 @@ bool th08_linux_texture_upload_static(IDirect3DTexture8 *textureRaw, const void 
                 converted[row * surface->width + x] = packed;
             }
         }
+        PspQuadBatchFlushGlobal();
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, top, surface->width, rows,
                         uploadFormat, uploadType, converted);
         th08::psp::RenderPerfNoteActualUpload(surface->width * rows * 2U);

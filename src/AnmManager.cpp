@@ -6,8 +6,23 @@ extern "C" void th08_linux_set_texture_upload_owner(const char *name);
 #if defined(PSP)
 #include "anm_scratch.hpp"
 #include "fileio.hpp"
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+extern "C" unsigned long g_PspRngTraceFrame;
+#define TH08_PSP_ANM_RAND_TRACE(op)                                                                              \
+    do                                                                                                            \
+    {                                                                                                             \
+        if (g_PspRngTraceFrame != 0)                                                                              \
+            th08::psp::BootLog("ANM_RAND f=%lu op=%s vm=%08lx anm=%d script=%d sprite=%d base=%d\n",             \
+                               g_PspRngTraceFrame, op, (unsigned long)(uintptr_t)vm, (int)vm->anmFileIndex,        \
+                               (int)vm->scriptIndex, (int)vm->activeSpriteIndex, (int)vm->baseSpriteIndex);       \
+    } while (0)
+#else
+#define TH08_PSP_ANM_RAND_TRACE(op) do { } while (0)
+#endif
+#include "me_effect_shadow.hpp"
 #include "modern/linux/d3d8_internal.hpp"
 #include "render_math.hpp"
+#include "render_quad_vfpu.hpp"
 #include "render_perf_telemetry.hpp"
 #include "gui_border_replay.hpp"
 #if defined(TH08_PSP_STAGE_POOL_ARENA)
@@ -444,6 +459,10 @@ VertexDiffuseXyzrhw::VertexDiffuseXyzrhw()
 
 DIFFABLE_STATIC(AnmManager *, g_AnmManager);
 DIFFABLE_STATIC_ARRAY(VertexTex1DiffuseXyzrhw, 4, g_QuadVertices);
+#if TH08_PSP_QUAD_VFPU_ENABLED
+static_assert(sizeof(VertexTex1DiffuseXyzrhw) == 28U && offsetof(VertexTex1DiffuseXyzrhw, pos) == 0U,
+              "VFPU quad stores require 28-byte vertices with XY at offset zero");
+#endif
 DIFFABLE_STATIC_ARRAY(VertexTex0Xyzrhw, 4, g_AnmManagerUntexturedQuadVertices);
 DIFFABLE_STATIC_ARRAY(VertexTex0Xyzrhw, 4, g_BackgroundQuadVertices);
 
@@ -1363,7 +1382,7 @@ i32 *AnmVm::GetIntVarPtr(i32 *varPtr, u16 varMask, u32 variableNumber)
 }
 
 #pragma var_order(instruction, nextInstruction, i, interp)
-ZunBool AnmManager::ExecuteScript(AnmVm *vm)
+ZunBool AnmManager::ExecuteScript(AnmVm *vm, int *pspMeAbort)
 {
     AnmRawInstr *instruction;
     AnmRawInstr *nextInstruction;
@@ -1809,9 +1828,21 @@ ZunBool AnmManager::ExecuteScript(AnmVm *vm)
             *GET_FLOAT_VAR_PTR(0) = fmodf(GET_FLOAT_VAR(0), GET_FLOAT_VAR(1));
             break;
         case AnmOpcode_ISetRand:
+            if (pspMeAbort != NULL)
+            {
+                *pspMeAbort = 1;
+                return FALSE;
+            }
+            TH08_PSP_ANM_RAND_TRACE("irand");
             *GET_INT_VAR_PTR(0) = g_Rng.GetRandomU32InRange(GET_INT_VAR(1));
             break;
         case AnmOpcode_FSetRand:
+            if (pspMeAbort != NULL)
+            {
+                *pspMeAbort = 1;
+                return FALSE;
+            }
+            TH08_PSP_ANM_RAND_TRACE("frand");
             *GET_FLOAT_VAR_PTR(0) = g_Rng.GetRandomF32InRange(GET_FLOAT_VAR(1));
             break;
         case AnmOpcode_FSin:
@@ -2076,7 +2107,8 @@ stop:
     }
 
     vm->currentTimeInScript++;
-    this->scriptsExecutedThisFrame++;
+    if (pspMeAbort == NULL)
+        this->scriptsExecutedThisFrame++;
 
     return FALSE;
 }
@@ -2369,6 +2401,10 @@ ZunResult AnmManager::DrawInner(AnmVm *vm, i32 flags)
         triangleX2 > (g_Supervisor.viewport.X + g_Supervisor.viewport.Width) ||
         triangleY2 > (g_Supervisor.viewport.Y + g_Supervisor.viewport.Height))
     {
+#if TH08_PSP_ME_EFFECT_SHADOW_ENABLED
+        th08_me_effect_capture_cull_note(g_QuadVertices);
+        th08_me_effect_capture_end(NULL);
+#endif
         return ZUN_SUCCESS;
     }
 
@@ -2403,11 +2439,75 @@ ZunResult AnmManager::DrawInner(AnmVm *vm, i32 flags)
         g_QuadVertices[3].diffuse = color.d3dColor;
     }
 
+#if TH08_PSP_ME_EFFECT_SHADOW_ENABLED
+    th08_me_effect_capture_end(g_QuadVertices);
+#endif
     this->SetRenderStateForVm(vm);
     this->AddSpriteToDrawBuffer(g_QuadVertices);
 
     return ZUN_SUCCESS;
 }
+
+#if defined(PSP) && ((defined(TH08_PSP_ME_EFFECT_ADOPT) && TH08_PSP_ME_EFFECT_ADOPT) || \
+    (defined(TH08_PSP_ME_EFFECT_ADOPT_AUDIT) && TH08_PSP_ME_EFFECT_ADOPT_AUDIT))
+// DrawInner's tail after the viewport cull, fed with ME-computed vertices.
+ZunResult AnmManager::DrawPspMeQuad(AnmVm *vm, const float *x4, const float *y4, const float *z4, const float *u4,
+                                    const float *v4, unsigned int color)
+{
+    for (int k = 0; k < 4; ++k)
+    {
+        g_QuadVertices[k].pos.x = x4[k];
+        g_QuadVertices[k].pos.y = y4[k];
+        g_QuadVertices[k].pos.z = z4[k];
+        g_QuadVertices[k].textureUV.x = u4[k];
+        g_QuadVertices[k].textureUV.y = v4[k];
+        g_QuadVertices[k].diffuse = color;
+    }
+    if (this->currentTexture != vm->loadedSprite->texture)
+    {
+        this->currentTexture = vm->loadedSprite->texture;
+        this->FlushVertexBuffer();
+        g_Supervisor.d3dDevice->SetTexture(0, this->currentTexture);
+    }
+    if (this->currentVertexShader != 1)
+    {
+        this->FlushVertexBuffer();
+        this->currentVertexShader = 1;
+    }
+    this->SetRenderStateForVm(vm);
+    this->AddSpriteToDrawBuffer(g_QuadVertices);
+    return ZUN_SUCCESS;
+}
+#endif
+
+#if defined(PSP) && ((defined(TH08_PSP_ME_BULLET_ADOPT) && TH08_PSP_ME_BULLET_ADOPT) || \
+    (defined(TH08_PSP_ME_BULLET_ADOPT_AUDIT) && TH08_PSP_ME_BULLET_ADOPT_AUDIT) || \
+    (defined(TH08_PSP_ME_BG_ADOPT_AUDIT) && TH08_PSP_ME_BG_ADOPT_AUDIT))
+void AnmManager::PspMeApplySpriteState(AnmVm *vm)
+{
+    if (this->currentTexture != vm->loadedSprite->texture)
+    {
+        this->currentTexture = vm->loadedSprite->texture;
+        this->FlushVertexBuffer();
+        g_Supervisor.d3dDevice->SetTexture(0, this->currentTexture);
+    }
+    if (this->currentVertexShader != 1)
+    {
+        this->FlushVertexBuffer();
+        this->currentVertexShader = 1;
+    }
+    this->SetRenderStateForVm(vm);
+}
+
+const u16 *AnmManager::PspBulletUnifiedQuadIndices() const
+{
+#if defined(PSP) && defined(TH08_PSP_BULLET_UNIFIED_QUADS) && TH08_PSP_BULLET_UNIFIED_QUADS
+    return g_PspBulletUnifiedQuadIndicesReady ? g_PspBulletUnifiedQuadIndices : NULL;
+#else
+    return NULL;
+#endif
+}
+#endif
 
 #if TH08_PSP_ANY_MIXED_QUADS_PRODUCT_ENABLED
 namespace
@@ -3555,8 +3655,22 @@ void AnmManager::EndPspItemUnifiedQuadBatch()
 /* This function copies 4 vertices creating a quad into 6 vertices
  * (2 triangles) for rendering.
  */
+#if defined(PSP) && ((defined(TH08_PSP_EFFECT_EARLY_CULL_AUDIT) && TH08_PSP_EFFECT_EARLY_CULL_AUDIT) || \
+    (defined(TH08_PSP_ME_EFFECT_ADOPT_AUDIT) && TH08_PSP_ME_EFFECT_ADOPT_AUDIT) || \
+    (defined(TH08_PSP_ME_BULLET_ADOPT_AUDIT) && TH08_PSP_ME_BULLET_ADOPT_AUDIT) || \
+    (defined(TH08_PSP_ME_BG_ADOPT_AUDIT) && TH08_PSP_ME_BG_ADOPT_AUDIT))
+// Audit counter for the effect early cull: every sprite that reaches the draw buffer.
+extern "C" unsigned int g_PspSpritesAddedCount = 0U; // C linkage: defined inside namespace th08
+#endif
+
 ZunResult AnmManager::AddSpriteToDrawBuffer(VertexTex1DiffuseXyzrhw *vertices)
 {
+#if defined(PSP) && ((defined(TH08_PSP_EFFECT_EARLY_CULL_AUDIT) && TH08_PSP_EFFECT_EARLY_CULL_AUDIT) || \
+    (defined(TH08_PSP_ME_EFFECT_ADOPT_AUDIT) && TH08_PSP_ME_EFFECT_ADOPT_AUDIT) || \
+    (defined(TH08_PSP_ME_BULLET_ADOPT_AUDIT) && TH08_PSP_ME_BULLET_ADOPT_AUDIT) || \
+    (defined(TH08_PSP_ME_BG_ADOPT_AUDIT) && TH08_PSP_ME_BG_ADOPT_AUDIT))
+    ++g_PspSpritesAddedCount;
+#endif
 #if defined(PSP) && defined(TH08_PSP_ITEM_MIXED_QUADS_AUDIT) && \
     TH08_PSP_ITEM_MIXED_QUADS_AUDIT
     PspSpritePairRunState &itemAuditRun =
@@ -3848,6 +3962,12 @@ ZunResult AnmManager::DrawNoRotation(AnmVm *vm)
 
     g_QuadVertices[0].pos.z = g_QuadVertices[1].pos.z = g_QuadVertices[2].pos.z = g_QuadVertices[3].pos.z = vm->pos.z;
 
+#if TH08_PSP_ME_EFFECT_SHADOW_ENABLED
+    th08_me_effect_capture_begin(vm->pos.x, vm->pos.y, vm->pos.z, vm->scale.x, vm->scale.y, vm->spriteSize.x,
+                                 vm->spriteSize.y, 0.0f, 1.0f, vm->loadedSprite->uvStart.x, vm->loadedSprite->uvEnd.x,
+                                 vm->loadedSprite->uvStart.y, vm->loadedSprite->uvEnd.y, vm->uvScrollPos.x, vm->uvScrollPos.y,
+                                 vm->color1.d3dColor, vm->color2.d3dColor, vm->anchor, 0U, vm->flag17 ? 1U : 0U, 0U, NULL);
+#endif
     return this->DrawInner(vm, 1);
 }
 
@@ -4953,6 +5073,38 @@ void BuildPspAsciiPopupQuad(VertexTex1DiffuseXyzrhw *quad, const AnmVm *vm,
         sprite->uvEnd.y + vm->uvScrollPos.y;
 }
 
+#if defined(PSP) && ((defined(TH08_PSP_ME_POPUP_AUDIT) && TH08_PSP_ME_POPUP_AUDIT) || \
+                     (defined(TH08_PSP_HUD_TEXT_NATIVE) && TH08_PSP_HUD_TEXT_NATIVE))
+#if defined(TH08_PSP_HUD_TEXT_NATIVE_AUDIT) && TH08_PSP_HUD_TEXT_NATIVE_AUDIT
+// HUD text audit: the quad DrawNoRotation just built (before DrawInner).
+extern "C" void th08_psp_ascii_last_quad(float *xyz12, float *uv8)
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        xyz12[i * 3] = g_QuadVertices[i].pos.x;
+        xyz12[i * 3 + 1] = g_QuadVertices[i].pos.y;
+        xyz12[i * 3 + 2] = g_QuadVertices[i].pos.z;
+        uv8[i * 2] = g_QuadVertices[i].textureUV.x;
+        uv8[i * 2 + 1] = g_QuadVertices[i].textureUV.y;
+    }
+}
+#endif
+// ME popup audit / HUD text: the batch's quad math for one glyph (xyz per vertex, uv per vertex).
+extern "C" void th08_psp_ascii_popup_build_quad(AnmVm *vm, const AnmLoadedSprite *sprite, float widthPx, float scaleX,
+                                                float scaleY, float *xyz12, float *uv8)
+{
+    VertexTex1DiffuseXyzrhw quad[4] = {g_QuadVertices[0], g_QuadVertices[1], g_QuadVertices[2], g_QuadVertices[3]};
+    BuildPspAsciiPopupQuad(quad, vm, sprite, widthPx, scaleX, scaleY, g_AnmManager->screenShakeOffset);
+    for (int i = 0; i < 4; ++i)
+    {
+        xyz12[i * 3] = quad[i].pos.x;
+        xyz12[i * 3 + 1] = quad[i].pos.y;
+        xyz12[i * 3 + 2] = quad[i].pos.z;
+        uv8[i * 2] = quad[i].textureUV.x;
+        uv8[i * 2 + 1] = quad[i].textureUV.y;
+    }
+}
+#endif
 bool PspAsciiPopupQuadVisible(const VertexTex1DiffuseXyzrhw *quad)
 {
     f32 triangleX1 = ZUN_MAX(quad[0].pos.x, quad[1].pos.x);
@@ -5610,6 +5762,12 @@ ZunResult AnmManager::Draw2D(AnmVm *vm)
 #else
     sincos(rotation, sine, cosine);
 #endif
+#if TH08_PSP_ME_EFFECT_SHADOW_ENABLED
+    th08_me_effect_capture_begin(vm->pos.x, vm->pos.y, vm->pos.z, vm->scale.x, vm->scale.y, vm->spriteSize.x,
+                                 vm->spriteSize.y, sine, cosine, vm->loadedSprite->uvStart.x, vm->loadedSprite->uvEnd.x,
+                                 vm->loadedSprite->uvStart.y, vm->loadedSprite->uvEnd.y, vm->uvScrollPos.x, vm->uvScrollPos.y,
+                                 vm->color1.d3dColor, vm->color2.d3dColor, vm->anchor, 1U, vm->flag17 ? 1U : 0U, 1U, NULL);
+#endif
 
     xOffset = vm->pos.x;
     yOffset = vm->pos.y;
@@ -5617,10 +5775,15 @@ ZunResult AnmManager::Draw2D(AnmVm *vm)
     x = (vm->spriteSize.x * vm->scale.x) / 2.0f;
     y = (vm->spriteSize.y * vm->scale.y) / 2.0f;
 
-    this->TranslateRotation(&g_QuadVertices[0], -x, -y, sine, cosine, xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[1], x, -y, sine, cosine, xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[2], -x, y, sine, cosine, xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[3], x, y, sine, cosine, xOffset, yOffset);
+#if TH08_PSP_QUAD_VFPU_ENABLED
+    if (!psp::RenderQuadRotateVfpu(g_QuadVertices, x, y, sine, cosine, xOffset, yOffset))
+#endif
+    {
+        this->TranslateRotation(&g_QuadVertices[0], -x, -y, sine, cosine, xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[1], x, -y, sine, cosine, xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[2], -x, y, sine, cosine, xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[3], x, y, sine, cosine, xOffset, yOffset);
+    }
 
     g_QuadVertices[0].pos.z = g_QuadVertices[1].pos.z = g_QuadVertices[2].pos.z = g_QuadVertices[3].pos.z = vm->pos.z;
 
@@ -5663,14 +5826,19 @@ ZunResult AnmManager::Draw2DWithPrecomputedRotation(AnmVm *vm, f32 sine,
     const f32 x = (vm->spriteSize.x * vm->scale.x) / 2.0f;
     const f32 y = (vm->spriteSize.y * vm->scale.y) / 2.0f;
 
-    this->TranslateRotation(&g_QuadVertices[0], -x, -y, sine, cosine,
-                            xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[1], x, -y, sine, cosine,
-                            xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[2], -x, y, sine, cosine,
-                            xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[3], x, y, sine, cosine,
-                            xOffset, yOffset);
+#if TH08_PSP_QUAD_VFPU_ENABLED
+    if (!psp::RenderQuadRotateVfpu(g_QuadVertices, x, y, sine, cosine, xOffset, yOffset))
+#endif
+    {
+        this->TranslateRotation(&g_QuadVertices[0], -x, -y, sine, cosine,
+                                xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[1], x, -y, sine, cosine,
+                                xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[2], -x, y, sine, cosine,
+                                xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[3], x, y, sine, cosine,
+                                xOffset, yOffset);
+    }
 
     g_QuadVertices[0].pos.z = g_QuadVertices[1].pos.z =
         g_QuadVertices[2].pos.z = g_QuadVertices[3].pos.z = vm->pos.z;
@@ -6066,10 +6234,15 @@ ZunResult AnmManager::Draw2DRotatedOrAxisAligned(AnmVm *vm)
         halfWidth = vm->spriteSize.x * vm->scale.x / 2.0f;
         halfHeight = vm->spriteSize.y * vm->scale.y / 2.0f;
 
-        this->TranslateRotation(&g_QuadVertices[0], -halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
-        this->TranslateRotation(&g_QuadVertices[1], halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
-        this->TranslateRotation(&g_QuadVertices[2], -halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
-        this->TranslateRotation(&g_QuadVertices[3], halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
+#if TH08_PSP_QUAD_VFPU_ENABLED
+        if (!psp::RenderQuadRotateVfpu(g_QuadVertices, halfWidth, halfHeight, sine, cosine, xOffset, yOffset))
+#endif
+        {
+            this->TranslateRotation(&g_QuadVertices[0], -halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
+            this->TranslateRotation(&g_QuadVertices[1], halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
+            this->TranslateRotation(&g_QuadVertices[2], -halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
+            this->TranslateRotation(&g_QuadVertices[3], halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
+        }
 
         g_QuadVertices[3].pos.z = vm->pos.z;
         g_QuadVertices[2].pos.z = g_QuadVertices[3].pos.z;
@@ -6231,10 +6404,15 @@ ZunResult AnmManager::ProjectCameraFacingQuad(AnmVm *vm)
     xOffset = projectedPosition.x;
     yOffset = projectedPosition.y;
 
-    this->TranslateRotation(&g_QuadVertices[0], -halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[1], halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[2], -halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[3], halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
+#if TH08_PSP_QUAD_VFPU_ENABLED
+    if (!psp::RenderQuadRotateVfpu(g_QuadVertices, halfWidth, halfHeight, sine, cosine, xOffset, yOffset))
+#endif
+    {
+        this->TranslateRotation(&g_QuadVertices[0], -halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[1], halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[2], -halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[3], halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
+    }
 
     g_QuadVertices[3].pos.z = projectedPosition.z;
     g_QuadVertices[2].pos.z = g_QuadVertices[3].pos.z;
@@ -6267,8 +6445,24 @@ ZunResult AnmManager::DrawCameraFacingQuad(AnmVm *vm)
         return ZUN_ERROR;
     if (vm->color1.a == 0)
         return ZUN_ERROR;
+#if TH08_PSP_ME_EFFECT_SHADOW_ENABLED
+    // kind 2
+    {
+        f32 pspMeSine, pspMeCosine;
+        th08::psp::RenderSinCos(vm->rotation.z, &pspMeSine, &pspMeCosine);
+        th08_me_effect_capture_begin(vm->pos.x, vm->pos.y, vm->pos.z, vm->scale.x, vm->scale.y, vm->spriteSize.x,
+                                     vm->spriteSize.y, pspMeSine, pspMeCosine, vm->loadedSprite->uvStart.x, vm->loadedSprite->uvEnd.x,
+                                     vm->loadedSprite->uvStart.y, vm->loadedSprite->uvEnd.y, vm->uvScrollPos.x, vm->uvScrollPos.y,
+                                     vm->color1.d3dColor, vm->color2.d3dColor, vm->anchor, 1U, vm->flag17 ? 1U : 0U, 2U, NULL);
+    }
+#endif
     if (this->ProjectCameraFacingQuad(vm) != ZUN_SUCCESS)
+    {
+#if TH08_PSP_ME_EFFECT_SHADOW_ENABLED
+        th08_me_effect_capture_end(NULL);
+#endif
         return ZUN_ERROR;
+    }
     return this->DrawInner(vm, 0);
 }
 
@@ -6339,6 +6533,14 @@ ZunResult AnmManager::DrawProjected3DQuad(AnmVm *vm)
     if (vm->color1.a == 0)
         return ZUN_ERROR;
     this->Project3DQuad(vm);
+#if TH08_PSP_ME_EFFECT_SHADOW_ENABLED
+    // kind 3
+    th08_me_effect_capture_begin(vm->pos.x, vm->pos.y, vm->pos.z, vm->scale.x, vm->scale.y, vm->spriteSize.x,
+                                 vm->spriteSize.y, 0.0f, 1.0f, vm->loadedSprite->uvStart.x, vm->loadedSprite->uvEnd.x,
+                                 vm->loadedSprite->uvStart.y, vm->loadedSprite->uvEnd.y, vm->uvScrollPos.x, vm->uvScrollPos.y,
+                                 vm->color1.d3dColor, vm->color2.d3dColor, vm->anchor, 0U, vm->flag17 ? 1U : 0U, 3U,
+                                 static_cast<const float *>(vm->matrix2));
+#endif
     return this->DrawInner(vm, 0);
 }
 
@@ -6393,10 +6595,15 @@ ZunResult AnmManager::ProjectCameraFacingQuadWithCallback(
 
     xOffset = projectedPosition.x;
     yOffset = projectedPosition.y;
-    this->TranslateRotation(&g_QuadVertices[0], -halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[1], halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[2], -halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
-    this->TranslateRotation(&g_QuadVertices[3], halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
+#if TH08_PSP_QUAD_VFPU_ENABLED
+    if (!psp::RenderQuadRotateVfpu(g_QuadVertices, halfWidth, halfHeight, sine, cosine, xOffset, yOffset))
+#endif
+    {
+        this->TranslateRotation(&g_QuadVertices[0], -halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[1], halfWidth, -halfHeight, sine, cosine, xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[2], -halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
+        this->TranslateRotation(&g_QuadVertices[3], halfWidth, halfHeight, sine, cosine, xOffset, yOffset);
+    }
 
     g_QuadVertices[3].pos.z = projectedPosition.z;
     g_QuadVertices[2].pos.z = g_QuadVertices[3].pos.z;
@@ -7831,8 +8038,20 @@ ZunResult AnmManager::LoadSurface(i32 surfaceIdx, const char *filename)
     UINT decodedWidth = 0;
     UINT decodedHeight = 0;
     IDirect3DSurface8 *decodedSurface = NULL;
+    UINT pspDecodeBytes = static_cast<UINT>(fileSize);
+#if defined(TH08_PSP_REPLAY_SURFACE_FAILS) && TH08_PSP_REPLAY_SURFACE_FAILS
+    // Test builds exercise the actual decoder failure and rollback lifetime.
+    // The compressed source is unchanged; only the decoder view is truncated.
+    static unsigned int pspFailuresRemaining = TH08_PSP_REPLAY_SURFACE_FAILS;
+    if (pspFailuresRemaining != 0U && strcmp(filename, "title/select00.png") == 0)
+    {
+        --pspFailuresRemaining;
+        pspDecodeBytes = 1U;
+        psp::BootLog("REPLAY_SURFACE injected_failure remaining=%u\n", pspFailuresRemaining);
+    }
+#endif
     if (!th08_linux_surface_load_image_memory(
-            g_Supervisor.d3dDevice, fileData, static_cast<UINT>(fileSize),
+            g_Supervisor.d3dDevice, fileData, pspDecodeBytes,
             &decodedSurface, &decodedWidth, &decodedHeight))
     {
         // A transient scope/contention failure must not destroy the last good

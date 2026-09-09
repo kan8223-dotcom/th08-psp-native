@@ -1,4 +1,16 @@
 #include "th_pch.h"
+#include "psp/me_bg_adopt.hpp"
+#if defined(PSP)
+extern "C" unsigned int sceKernelGetSystemTimeLow(void);
+namespace
+{
+// Where the background "sprites" slot spends its time (stage VMs, stage effect callback).
+struct PspBgSpritesSub
+{
+    unsigned long frames, vm0Us, vm1Us, cbUs, cbCalls, vm0Calls, vm1Calls;
+} g_PspBgSpritesSub;
+} // namespace
+#endif
 
 #include "AnmManager.hpp"
 #include "Background.hpp"
@@ -12,6 +24,7 @@
 #include "dialogue_snapshot_at_background.hpp"
 #include "dialogue_live_background.hpp"
 #include "dialogue_snapshot_diag.hpp"
+#include "bg_fast_project.hpp"
 #include "fileio.hpp"
 #include "modern/linux/d3d8_internal.hpp"
 #endif
@@ -886,6 +899,10 @@ ChainCallbackResult Background::OnDrawHighPrio(Background *background)
     }
     g_AnmManager->FlushVertexBuffer();
 
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    std::uint64_t bgSub_clear = 0U;
+    const bool bgSubOn_clear = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotBgClear, bgSub_clear);
+#endif
     if (background->clearPending != 0)
     {
         viewport.X = 32;
@@ -896,6 +913,10 @@ ChainCallbackResult Background::OnDrawHighPrio(Background *background)
         g_Supervisor.d3dDevice->Clear(0, NULL, D3DCLEAR_TARGET, COLOR_BLACK, 1.0f, 0);
         background->clearPending = 0;
     }
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    if (bgSubOn_clear)
+        psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotBgClear, bgSub_clear);
+#endif
     g_Supervisor.d3dDevice->SetViewport(&g_Supervisor.viewport);
 
     if (background->tint.a > 0)
@@ -907,24 +928,67 @@ ChainCallbackResult Background::OnDrawHighPrio(Background *background)
     background->tint.g = 0x80;
     background->tint.b = 0x80;
 
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    std::uint64_t bgSub_sprites = 0U;
+    const bool bgSubOn_sprites = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotBgSprites, bgSub_sprites);
+#endif
     if (background->spellBackgroundState <= SPELL_BACKGROUND_FADING_IN &&
         (TH08_PSP_DIALOGUE_LIVE_BACKGROUND_ENABLED || !g_Gui.IsDialoguePresent()))
     {
+#if defined(PSP)
+        unsigned int pspBgT0 = sceKernelGetSystemTimeLow();
+#endif
         if (background->stageVm0.activeSpriteIndex > 0)
         {
             g_AnmManager->Draw2DAndFlush(&background->stageVm0);
+#if defined(PSP)
+            ++g_PspBgSpritesSub.vm0Calls;
+#endif
         }
+#if defined(PSP)
+        unsigned int pspBgT1 = sceKernelGetSystemTimeLow();
+        g_PspBgSpritesSub.vm0Us += pspBgT1 - pspBgT0;
+#endif
         if (background->stageVm1.activeSpriteIndex > 0)
         {
             g_AnmManager->Draw2DAndFlush(&background->stageVm1);
+#if defined(PSP)
+            ++g_PspBgSpritesSub.vm1Calls;
+#endif
         }
+#if defined(PSP)
+        pspBgT0 = sceKernelGetSystemTimeLow();
+        g_PspBgSpritesSub.vm1Us += pspBgT0 - pspBgT1;
+#endif
         if (background->stageEffect != NULL)
         {
             effect = background->stageEffect;
             effect->drawCallback(effect);
+#if defined(PSP)
+            ++g_PspBgSpritesSub.cbCalls;
+#endif
         }
+#if defined(PSP)
+        pspBgT1 = sceKernelGetSystemTimeLow();
+        g_PspBgSpritesSub.cbUs += pspBgT1 - pspBgT0;
+        if ((++g_PspBgSpritesSub.frames % 600UL) == 0UL)
+        {
+            th08::psp::BootLog("BG_SPRITES_SUB stats frames=%lu vm0_us=%lu vm0_calls=%lu vm1_us=%lu vm1_calls=%lu cb_us=%lu cb_calls=%lu\n",
+                               g_PspBgSpritesSub.frames, g_PspBgSpritesSub.vm0Us, g_PspBgSpritesSub.vm0Calls,
+                               g_PspBgSpritesSub.vm1Us, g_PspBgSpritesSub.vm1Calls, g_PspBgSpritesSub.cbUs,
+                               g_PspBgSpritesSub.cbCalls);
+        }
+#endif
     }
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    if (bgSubOn_sprites)
+        psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotBgSprites, bgSub_sprites);
+#endif
 
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    std::uint64_t bgSub_zclear = 0U;
+    const bool bgSubOn_zclear = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotBgZClear, bgSub_zclear);
+#endif
     if ((background->clearColor & COLOR_ALPHA_MASK) == COLOR_ALPHA_MASK)
     {
         g_Supervisor.d3dDevice->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
@@ -943,7 +1007,15 @@ ChainCallbackResult Background::OnDrawHighPrio(Background *background)
     {
         g_Supervisor.d3dDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, background->clearColor, 1.0f, 0);
     }
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    if (bgSubOn_zclear)
+        psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotBgZClear, bgSub_zclear);
+#endif
 
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    std::uint64_t bgSub_state = 0U;
+    const bool bgSubOn_state = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotBgState, bgSub_state);
+#endif
     g_Supervisor.SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
     if (!g_AnmManager->useMixColor)
     {
@@ -965,12 +1037,32 @@ ChainCallbackResult Background::OnDrawHighPrio(Background *background)
     {
         g_Supervisor.EnableFog();
     }
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    if (bgSubOn_state)
+        psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotBgState, bgSub_state);
+#endif
 
     if (background->spellBackgroundState <= SPELL_BACKGROUND_FADING_IN &&
         (TH08_PSP_DIALOGUE_LIVE_BACKGROUND_ENABLED || !g_Gui.IsDialoguePresent()))
     {
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    std::uint64_t bgSub_obj0 = 0U;
+    const bool bgSubOn_obj0 = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotBgObj0, bgSub_obj0);
+#endif
         background->RenderObjects(0);
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    if (bgSubOn_obj0)
+        psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotBgObj0, bgSub_obj0);
+#endif
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    std::uint64_t bgSub_obj1 = 0U;
+    const bool bgSubOn_obj1 = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotBgObj1, bgSub_obj1);
+#endif
         background->RenderObjects(1);
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    if (bgSubOn_obj1)
+        psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotBgObj1, bgSub_obj1);
+#endif
     }
 #if defined(PSP) && TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND_ENABLED
     else if (background->spellBackgroundState <= SPELL_BACKGROUND_FADING_IN)
@@ -1007,8 +1099,24 @@ ChainCallbackResult Background::OnDrawLowPrio(Background *background)
     if (background->spellBackgroundState <= SPELL_BACKGROUND_FADING_IN &&
         (TH08_PSP_DIALOGUE_LIVE_BACKGROUND_ENABLED || !g_Gui.IsDialoguePresent()))
     {
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    std::uint64_t bgSub_obj2 = 0U;
+    const bool bgSubOn_obj2 = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotBgObj2, bgSub_obj2);
+#endif
         background->RenderObjects(2);
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    if (bgSubOn_obj2)
+        psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotBgObj2, bgSub_obj2);
+#endif
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    std::uint64_t bgSub_obj3 = 0U;
+    const bool bgSubOn_obj3 = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotBgObj3, bgSub_obj3);
+#endif
         background->RenderObjects(3);
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+    if (bgSubOn_obj3)
+        psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotBgObj3, bgSub_obj3);
+#endif
         if (!g_Supervisor.IsFogDisabled())
         {
             g_Supervisor.DisableFog();
@@ -1402,8 +1510,343 @@ u32 Background::UpdateStageObjectVms()
     return 0;
 }
 
+#if TH08_PSP_BG_FAST_PROJECT_ENABLED
+// Bit-identical to D3DXVec3Project(out, src, vp, proj, view, world) when world is
+// identity plus translation.  D3DXVec3Project forms (world*view)*proj and then
+// transforms src; rows 0..2 of world*view equal the view rows exactly, so the
+// caller caches rows 0..2 of view*proj (vpRows) and only row 3 is rebuilt here
+// with the same summation order as D3DXMatrixMultiply/D3DXVec3TransformCoord.
+static inline void PspProjectGeneral(Float3 *out, const Float3 &src, const D3DXMATRIX &world,
+                                     const D3DXMATRIX &view, const D3DXMATRIX &proj,
+                                     const FLOAT *vpRows, const D3DVIEWPORT8 &vp)
+{
+    const FLOAT *w = world;
+    const FLOAT *v = view;
+    const FLOAT *p = proj;
+    FLOAT t[4];
+    FLOAT m3[4];
+    for (int c = 0; c < 4; ++c)
+        t[c] = w[12] * v[c] + w[13] * v[4 + c] + w[14] * v[8 + c] + w[15] * v[12 + c];
+    for (int c = 0; c < 4; ++c)
+        m3[c] = t[0] * p[c] + t[1] * p[4 + c] + t[2] * p[8 + c] + t[3] * p[12 + c];
+    FLOAT x = src.x * vpRows[0] + src.y * vpRows[4] + src.z * vpRows[8] + m3[0];
+    FLOAT y = src.x * vpRows[1] + src.y * vpRows[5] + src.z * vpRows[9] + m3[1];
+    FLOAT z = src.x * vpRows[2] + src.y * vpRows[6] + src.z * vpRows[10] + m3[2];
+    const FLOAT ww = src.x * vpRows[3] + src.y * vpRows[7] + src.z * vpRows[11] + m3[3];
+    if (fabsf(ww) > 1.0e-8f)
+    {
+        x /= ww;
+        y /= ww;
+        z /= ww;
+    }
+    out->x = vp.X + (x + 1.0f) * vp.Width * 0.5f;
+    out->y = vp.Y + (1.0f - y) * vp.Height * 0.5f;
+    out->z = vp.MinZ + z * (vp.MaxZ - vp.MinZ);
+}
+#endif
 // FUNCTION: th08 0x40a1b0
 #pragma var_order(objQuadType1, curQuadVm, instancesDrawn, instance, fogState, worldMatrix, obj, objectDistance, cameraVec, quadPos, projectDest, curQuad, didDraw, radius, projectSrc, quadWidth, originalColor, this)
+#if TH08_PSP_ME_BG_ANY_ENABLED
+#if TH08_PSP_ME_BG_ADOPT_AUDIT_ENABLED
+extern "C" unsigned int g_PspSpritesAddedCount;
+extern VertexTex1DiffuseXyzrhw g_QuadVertices[4];
+extern "C" void sceKernelDcacheInvalidateRange(const void *p, unsigned int size);
+#endif
+namespace
+{
+// Draw-time state seen by the last RenderObjects; the capture at the end of
+// the next calc chain assumes it and the draw verifies it (matrices too).
+struct PspMeBgDrawState
+{
+    bool valid;
+    float shakeX, shakeY;
+    float vpX, vpY, vpW, vpH;
+    unsigned int useMixColor, mixColor;
+} g_PspMeBgDrawState;
+bool g_PspMeBgFrameCaptured = false;
+PspMeClientVertex g_PspMeBgOut[TH08_ME_BG_MAX_RECORDS * 4] __attribute__((aligned(64)));
+
+struct PspMeBgRunState
+{
+    bool active;
+    unsigned int count, drawn, index;
+    unsigned int runStart, runCount;
+    AnmVm *runVm;
+    IDirect3DTexture8 *runTexture;
+    u8 runBlend, runZWrite;
+    const u16 *indices;
+    const PspMeClientVertex *verts;
+#if TH08_PSP_ME_BG_ADOPT_AUDIT_ENABLED
+    bool pending;
+    unsigned int pendingStatus;
+    unsigned int pendingAdded;
+#endif
+} g_PspMeBgRun;
+
+void PspMeBgRunFlush()
+{
+    if (g_PspMeBgRun.runCount == 0U)
+        return;
+    g_AnmManager->FlushVertexBuffer();
+    g_AnmManager->PspMeApplySpriteState(g_PspMeBgRun.runVm);
+    g_Supervisor.d3dDevice->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    g_Supervisor.d3dDevice->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    g_Supervisor.d3dDevice->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    th08_psp_bullet_me_submit(g_Supervisor.d3dDevice, g_PspMeBgRun.verts + g_PspMeBgRun.runStart * 4U,
+                              g_PspMeBgRun.runCount, g_PspMeBgRun.indices);
+    th08_me_bg_adopt_note(TH08_ME_BG_STAT_GROUPS);
+    g_PspMeBgRun.runCount = 0U;
+}
+
+inline const void *PspMeBgTag(const RawStageObjectInstance *instance, const RawStageQuadBasic *quad)
+{
+    return reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(instance) ^
+                                          (reinterpret_cast<uintptr_t>(quad) << 1));
+}
+
+#if TH08_PSP_ME_BG_ADOPT_AUDIT_ENABLED
+void PspMeBgAuditCompare(const VertexTex1DiffuseXyzrhw *quad, bool drawn, bool ignoreRgbWhenClear)
+{
+    if (!g_PspMeBgRun.pending)
+        return;
+    g_PspMeBgRun.pending = false;
+    const unsigned int status = g_PspMeBgRun.pendingStatus;
+    const bool expectDrawn = status < TH08_ME_BG_STATUS_SKIP;
+    if (drawn != expectDrawn)
+    {
+        th08_me_bg_adopt_note(TH08_ME_BG_STAT_AUDIT_CULL);
+        return;
+    }
+    if (!drawn || quad == NULL)
+        return;
+    PspMeClientVertex got[4];
+    const PspMeClientVertex *src = g_PspMeBgRun.verts + status * 4U;
+    sceKernelDcacheInvalidateRange(src, sizeof(got));
+    memcpy(got, src, sizeof(got));
+    bool same = true;
+    for (int k = 0; k < 4 && same; ++k)
+    {
+        PspMeClientVertex want;
+        want.u = quad[k].textureUV.x;
+        want.v = quad[k].textureUV.y;
+        const u32 c = quad[k].diffuse;
+        want.r = static_cast<unsigned char>((c >> 16) & 255U);
+        want.g = static_cast<unsigned char>((c >> 8) & 255U);
+        want.b = static_cast<unsigned char>(c & 255U);
+        want.a = static_cast<unsigned char>((c >> 24) & 255U);
+        want.x = quad[k].pos.x + 0.5f;
+        want.y = quad[k].pos.y + 0.5f;
+        want.z = 1.0f - 2.0f * quad[k].pos.z;
+        if (ignoreRgbWhenClear && want.a == 0 && got[k].a == 0)
+        {
+            want.r = got[k].r; want.g = got[k].g; want.b = got[k].b;
+        }
+        same = memcmp(&want, &got[k], sizeof(want)) == 0;
+        if (!same)
+        {
+            // The ME's FPU rounds a few products differently from the SC path;
+            // sub-1e-4 differences are invisible (positions are in pixels).
+            const bool near = fabsf(want.x - got[k].x) <= 2e-4f && fabsf(want.y - got[k].y) <= 2e-4f &&
+                              fabsf(want.z - got[k].z) <= 2e-4f && fabsf(want.u - got[k].u) <= 1e-5f &&
+                              fabsf(want.v - got[k].v) <= 1e-5f && want.r == got[k].r && want.g == got[k].g &&
+                              want.b == got[k].b && want.a == got[k].a;
+            if (near)
+            {
+                th08_me_bg_adopt_note(TH08_ME_BG_STAT_AUDIT_ULP);
+                same = true;
+            }
+        }
+        if (!same)
+        {
+            static unsigned int sampleCount = 0U;
+            if (sampleCount < 12U)
+            {
+                ++sampleCount;
+                th08::psp::BootLog("ME_BG_AUDIT k=%d st=%u want x=%f y=%f z=%f u=%f v=%f c=%02x%02x%02x%02x got x=%f y=%f z=%f u=%f v=%f c=%02x%02x%02x%02x\n",
+                        k, status, want.x, want.y, want.z, want.u, want.v,
+                        want.a, want.r, want.g, want.b, got[k].x, got[k].y, got[k].z, got[k].u, got[k].v, got[k].a,
+                        got[k].r, got[k].g, got[k].b);
+            }
+        }
+    }
+    if (!same)
+        th08_me_bg_adopt_note(TH08_ME_BG_STAT_AUDIT_QUAD);
+}
+void PspMeBgAuditCulled()
+{
+    if (g_PspMeBgRun.pending)
+        PspMeBgAuditCompare(NULL, false, false);
+}
+#endif
+
+// Consumes the next ME entry for `tag`.  1 = handled by the ME path (the
+// caller skips the canonical math and draw), 0 = draw canonically.
+int PspMeBgTake(const void *tag, AnmVm *vm)
+{
+    if (!g_PspMeBgRun.active)
+        return 0;
+    if (g_PspMeBgRun.index >= g_PspMeBgRun.count || th08_me_bg_adopt_tag(g_PspMeBgRun.index) != tag)
+    {
+        PspMeBgRunFlush();
+        g_PspMeBgRun.active = false;
+        th08_me_bg_adopt_note(TH08_ME_BG_STAT_FB_ORDER);
+        return 0;
+    }
+    const unsigned int status = th08_me_bg_adopt_status(g_PspMeBgRun.index);
+    ++g_PspMeBgRun.index;
+#if TH08_PSP_ME_BG_ADOPT_AUDIT_ENABLED
+    g_PspMeBgRun.pending = true;
+    g_PspMeBgRun.pendingStatus = status;
+    g_PspMeBgRun.pendingAdded = g_PspSpritesAddedCount;
+    return 0;
+#else
+    if (status < TH08_ME_BG_STATUS_SKIP)
+    {
+        const bool sameState = g_PspMeBgRun.runCount != 0U && g_PspMeBgRun.runTexture == vm->loadedSprite->texture &&
+                               g_PspMeBgRun.runBlend == vm->blendMode && g_PspMeBgRun.runZWrite == vm->zWriteDisabled &&
+                               g_PspMeBgRun.runStart + g_PspMeBgRun.runCount == status;
+        if (!sameState)
+        {
+            PspMeBgRunFlush();
+            g_PspMeBgRun.runStart = status;
+            g_PspMeBgRun.runVm = vm;
+            g_PspMeBgRun.runTexture = vm->loadedSprite->texture;
+            g_PspMeBgRun.runBlend = vm->blendMode;
+            g_PspMeBgRun.runZWrite = vm->zWriteDisabled;
+        }
+        ++g_PspMeBgRun.runCount;
+    }
+    return 1;
+#endif
+}
+} // namespace
+
+// Called from the main loop right after the calc chain.
+extern "C" void th08_psp_me_bg_adopt_capture(void)
+{
+    g_PspMeBgFrameCaptured = false;
+    const PspMeBgDrawState &st = g_PspMeBgDrawState;
+    Background *bg = &g_Background;
+    if (!st.valid || bg->stageObjects == NULL || bg->stageObjectInstances == NULL || bg->stageObjectVms == NULL ||
+        bg->collectSpecialEffectPoints != 0)
+        return;
+    PspMeBgJob header;
+    memset(&header, 0, sizeof(header));
+    header.shakeX = st.shakeX; header.shakeY = st.shakeY;
+    header.vpX = st.vpX; header.vpY = st.vpY; header.vpW = st.vpW; header.vpH = st.vpH;
+    header.useMixColor = st.useMixColor; header.mixColor = st.mixColor;
+    // SetCamera2 as the draw will run it.
+    Float3 atVec = bg->cameraCurrent.lookAtOffset + bg->cameraCurrent.position;
+    Float3 eyeVec = bg->cameraCurrent.positionOffset + bg->cameraCurrent.position;
+    D3DXMATRIX view, proj;
+    D3DXMatrixLookAtLH(&view, reinterpret_cast<D3DXVECTOR3 *>(&eyeVec), reinterpret_cast<D3DXVECTOR3 *>(&atVec),
+                       reinterpret_cast<D3DXVECTOR3 *>(&bg->cameraCurrent.up));
+    D3DXMatrixPerspectiveFovLH(&proj, bg->cameraCurrent.fieldOfView, st.vpW / st.vpH, 30.0f, 1800.0f);
+    memcpy(header.view, &view, sizeof(header.view));
+    memcpy(header.proj, &proj, sizeof(header.proj));
+    Float3 cameraVec = *reinterpret_cast<Float3 *>(&view);
+    D3DXVec3Normalize(reinterpret_cast<D3DXVECTOR3 *>(&cameraVec), reinterpret_cast<D3DXVECTOR3 *>(&cameraVec));
+    header.camVecX = cameraVec.x; header.camVecY = cameraVec.y; header.camVecZ = cameraVec.z;
+    header.camX = eyeVec.x; header.camY = eyeVec.y; header.camZ = eyeVec.z;
+    header.fogNear = bg->skyFog.nearPlane; header.fogFar = bg->skyFog.farPlane; header.fogColor = bg->skyFog.color.d3dColor;
+    if (!th08_me_bg_adopt_begin(&header))
+        return;
+    for (i32 mode = 0; mode < 4; ++mode)
+    {
+        RawStageObjectInstance *instance = PspBackgroundInstancesForMode(bg, mode);
+        for (; instance->id >= 0; ++instance)
+        {
+            RawStageObject *obj = bg->stageObjects[instance->id];
+            if (obj->zLevel != mode)
+                continue;
+            Float3 quadPos;
+            quadPos.x = obj->position.x + instance->position.x - bg->stagePosition.x + obj->size.x / 2.0f;
+            quadPos.y = obj->position.y + instance->position.y - bg->stagePosition.y + obj->size.y / 2.0f;
+            quadPos.z = obj->position.z + instance->position.z - bg->stagePosition.z + obj->size.z / 2.0f;
+            quadPos = quadPos - (bg->cameraCurrent.position + bg->cameraCurrent.positionOffset);
+            if (bg->cullingDistanceSq < D3DXVec3LengthSq(reinterpret_cast<D3DXVECTOR3 *>(&quadPos)))
+                continue;
+            const f32 objectDistance = D3DXVec3Dot(reinterpret_cast<D3DXVECTOR3 *>(&quadPos),
+                                                   reinterpret_cast<D3DXVECTOR3 *>(&bg->cameraCurrent.forward));
+            f32 radius;
+            if (!PspBackgroundCachedRadius(bg, instance->id, &radius))
+                radius = D3DXVec3Length(reinterpret_cast<D3DXVECTOR3 *>(&obj->size)) / 2.0f + 960.0f;
+            if (objectDistance > radius || objectDistance < 80.0f)
+                continue;
+            RawStageQuadBasic *curQuad = &obj->firstQuad;
+            while (curQuad->type >= 0)
+            {
+                PspMeBgRecord rec;
+                memset(&rec, 0, sizeof(rec));
+                rec.mode = static_cast<unsigned char>(mode);
+                bool emit = false;
+                if (curQuad->type == 0)
+                {
+                    AnmVm *vm = &bg->stageObjectVms[curQuad->vmIdx];
+                    if ((vm->type & 0xF) == 2 && vm->loadedSprite != NULL)
+                    {
+                        rec.kind = 5U;
+                        rec.posX = vm->pos2.x + curQuad->position.x + instance->position.x - bg->stagePosition.x;
+                        rec.posY = vm->pos2.y + curQuad->position.y + instance->position.y - bg->stagePosition.y;
+                        rec.posZ = vm->pos2.z + curQuad->position.z + instance->position.z - bg->stagePosition.z;
+                        rec.scaleX0 = curQuad->size.x != 0.0f ? curQuad->size.x / vm->loadedSprite->widthPx : vm->scale.x;
+                        rec.scaleY0 = curQuad->size.y != 0.0f ? curQuad->size.y / vm->loadedSprite->heightPx : vm->scale.y;
+                        rec.quadWidth = curQuad->size.x != 0.0f ? curQuad->size.x : vm->loadedSprite->widthPx;
+                        rec.sizeX = vm->spriteSize.x; rec.sizeY = vm->spriteSize.y;
+                        rec.uvStartX = vm->loadedSprite->uvStart.x; rec.uvEndX = vm->loadedSprite->uvEnd.x;
+                        rec.uvStartY = vm->loadedSprite->uvStart.y; rec.uvEndY = vm->loadedSprite->uvEnd.y;
+                        rec.scrollX = vm->uvScrollPos.x; rec.scrollY = vm->uvScrollPos.y;
+                        rec.color1 = vm->color1.d3dColor; rec.color2 = vm->color2.d3dColor;
+                        rec.anchor = static_cast<unsigned char>(vm->anchor);
+                        rec.flag17 = vm->flag17 ? 1U : 0U;
+                        if (!vm->visible || !vm->flag1)
+                            rec.kind = 0xFFU;
+                        emit = true;
+                    }
+                }
+                else if (curQuad->type == 1)
+                {
+                    RawStageQuadType1 *q1 = reinterpret_cast<RawStageQuadType1 *>(curQuad);
+                    AnmVm *vm = &bg->stageObjectVms[curQuad->vmIdx];
+                    rec.kind = 7U;
+                    rec.posX = q1->position1.x + instance->position.x - bg->stagePosition.x;
+                    rec.posY = q1->position1.y + instance->position.y - bg->stagePosition.y;
+                    rec.posZ = q1->position1.z + instance->position.z - bg->stagePosition.z;
+                    rec.pos2X = q1->position2.x + instance->position.x - bg->stagePosition.x;
+                    rec.pos2Y = q1->position2.y + instance->position.y - bg->stagePosition.y;
+                    rec.pos2Z = q1->position2.z + instance->position.z - bg->stagePosition.z;
+                    rec.quadWidth = q1->width != 0.0f ? q1->width : (vm->loadedSprite != NULL ? vm->loadedSprite->widthPx : 0.0f);
+                    if (vm->loadedSprite != NULL)
+                    {
+                        rec.uvStartX = vm->loadedSprite->uvStart.x; rec.uvEndX = vm->loadedSprite->uvEnd.x;
+                        rec.uvStartY = vm->loadedSprite->uvStart.y; rec.uvEndY = vm->loadedSprite->uvEnd.y;
+                    }
+                    rec.scrollX = vm->uvScrollPos.x; rec.scrollY = vm->uvScrollPos.y;
+                    rec.color1 = vm->color1.d3dColor; rec.color2 = vm->color2.d3dColor;
+                    if (vm->loadedSprite == NULL || !vm->visible || !vm->flag1 || vm->color1.a == 0)
+                    {
+                        // QueueSpriteQuad returns early, but the projections (and
+                        // the projectSrc carry-over) still happened.
+                        rec.kind = 0xFFU;
+                        rec.pad2 = 7U;
+                    }
+                    emit = true;
+                }
+                if (emit && !th08_me_bg_adopt_add(PspMeBgTag(instance, curQuad), &rec))
+                {
+                    th08_me_bg_adopt_note(TH08_ME_BG_STAT_OVERFLOW);
+                    goto capture_full;
+                }
+                curQuad = reinterpret_cast<RawStageQuadBasic *>(reinterpret_cast<u8 *>(curQuad) + curQuad->byteSize);
+            }
+        }
+    }
+capture_full:
+    th08_me_bg_adopt_submit(g_PspMeBgOut, TH08_ME_BG_MAX_RECORDS);
+    g_PspMeBgFrameCaptured = true;
+}
+#endif
+
 ZunResult Background::RenderObjects(i32 mode)
 {
     RawStageQuadType1 *objQuadType1;
@@ -1438,20 +1881,89 @@ ZunResult Background::RenderObjects(i32 mode)
     this->SetCamera2();
     g_AnmManager->SetCameraMode(1);
     D3DXMatrixIdentity(&worldMatrix);
+#if TH08_PSP_BG_FAST_PROJECT_ENABLED
+    // Rows 0..2 of view*projection: constant for this call (world is identity
+    // plus translation, so rows 0..2 of world*view are exactly the view rows).
+    FLOAT pspVpRows[12];
+    {
+        const FLOAT *pv = g_Supervisor.viewMatrix;
+        const FLOAT *pp = g_Supervisor.projectionMatrix;
+        for (int row = 0; row < 3; ++row)
+            for (int c = 0; c < 4; ++c)
+                pspVpRows[row * 4 + c] = pv[row * 4] * pp[c] + pv[row * 4 + 1] * pp[4 + c] +
+                                        pv[row * 4 + 2] * pp[8 + c] + pv[row * 4 + 3] * pp[12 + c];
+    }
+#endif
     cameraVec = *reinterpret_cast<Float3 *>(&g_Supervisor.viewMatrix);
     D3DXVec3Normalize(reinterpret_cast<D3DXVECTOR3 *>(&cameraVec),
                       reinterpret_cast<D3DXVECTOR3 *>(&cameraVec));
+#if TH08_PSP_ME_BG_ANY_ENABLED
+    if (mode == 0)
+    {
+        PspMeBgDrawState &st = g_PspMeBgDrawState;
+        st.valid = true;
+        st.shakeX = g_AnmManager->screenShakeOffset.x;
+        st.shakeY = g_AnmManager->screenShakeOffset.y;
+        st.vpX = static_cast<float>(g_Supervisor.viewport.X);
+        st.vpY = static_cast<float>(g_Supervisor.viewport.Y);
+        st.vpW = static_cast<float>(g_Supervisor.viewport.Width);
+        st.vpH = static_cast<float>(g_Supervisor.viewport.Height);
+        st.useMixColor = g_AnmManager->useMixColor ? 1U : 0U;
+        st.mixColor = g_AnmManager->color.d3dColor;
+        g_PspMeBgRun.active = false;
+        g_PspMeBgRun.runCount = 0U;
+        g_PspMeBgRun.index = 0U;
+        if (g_PspMeBgFrameCaptured)
+        {
+            g_PspMeBgFrameCaptured = false;
+            const int state = th08_me_bg_adopt_state_matches(
+                st.shakeX, st.shakeY, st.vpX, st.vpY, st.vpW, st.vpH, st.useMixColor, st.mixColor,
+                static_cast<const float *>(g_Supervisor.viewMatrix), static_cast<const float *>(g_Supervisor.projectionMatrix));
+            if (state == 0)
+                th08_me_bg_adopt_note(TH08_ME_BG_STAT_FB_STATE);
+            else if (state == 1 && th08_psp_bullet_me_color_identity(g_Supervisor.d3dDevice) &&
+                     th08_me_bg_adopt_acquire(3000U, &g_PspMeBgRun.count, &g_PspMeBgRun.drawn) != 0)
+            {
+                g_PspMeBgRun.indices = g_AnmManager->PspBulletUnifiedQuadIndices();
+                g_PspMeBgRun.verts = th08_me_bg_adopt_vertices();
+                if (g_PspMeBgRun.indices == NULL)
+                    th08_me_bg_adopt_note(TH08_ME_BG_STAT_FB_STATE);
+                else
+                    g_PspMeBgRun.active = true;
+            }
+        }
+    }
+    struct PspMeBgModeGuard
+    {
+        i32 mode;
+        ~PspMeBgModeGuard()
+        {
+            PspMeBgRunFlush();
+            if (mode == 3)
+            {
+                g_PspMeBgRun.active = false;
+                th08_me_bg_adopt_release();
+            }
+        }
+    } pspMeBgModeGuard = {mode};
+#endif
 
     while (instance->id >= 0)
     {
 #if defined(PSP)
         th08::psp::RenderPerfNoteBackgroundInstanceVisit();
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+        psp::DrawPrioritySubprofileCount(psp::kDrawPriorityCountBgInstances);
+#endif
 #endif
         obj = this->stageObjects[instance->id];
         if (obj->zLevel == mode)
         {
 #if defined(PSP)
             th08::psp::RenderPerfNoteBackgroundCandidate();
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+            psp::DrawPrioritySubprofileCount(psp::kDrawPriorityCountBgCandidates);
+#endif
 #endif
             curQuad = &obj->firstQuad;
 
@@ -1510,15 +2022,24 @@ ZunResult Background::RenderObjects(i32 mode)
 
                             if ((curQuadVm->type & 0xF) == 2)
                             {
+#if TH08_PSP_ME_BG_ANY_ENABLED
+                                if (PspMeBgTake(PspMeBgTag(instance, curQuad), curQuadVm))
+                                    break;
+#endif
                                 worldMatrix._41 = curQuadVm->pos[0];
                                 worldMatrix._42 = curQuadVm->pos[1];
                                 worldMatrix._43 = curQuadVm->pos[2];
 #if defined(PSP)
                                 th08::psp::RenderPerfNoteBackgroundProject();
 #endif
-                                D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&quadPos),
+                                #if TH08_PSP_BG_FAST_PROJECT_ENABLED
+                                                PspProjectGeneral(&quadPos, projectSrc, worldMatrix, g_Supervisor.viewMatrix,
+                                                                  g_Supervisor.projectionMatrix, pspVpRows, g_Supervisor.viewport);
+#else
+                                                D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&quadPos),
                                                 reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                                 &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
+#endif
 
                                 if (curQuad->size.x != 0.0f)
                                 {
@@ -1535,9 +2056,14 @@ ZunResult Background::RenderObjects(i32 mode)
 #if defined(PSP)
                                 th08::psp::RenderPerfNoteBackgroundProject();
 #endif
-                                D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectDest),
+                                #if TH08_PSP_BG_FAST_PROJECT_ENABLED
+                                                PspProjectGeneral(&projectDest, projectSrc, worldMatrix, g_Supervisor.viewMatrix,
+                                                                  g_Supervisor.projectionMatrix, pspVpRows, g_Supervisor.viewport);
+#else
+                                                D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectDest),
                                                 reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                                 &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
+#endif
                                 projectDest = projectDest - quadPos;
                                 curQuadVm->scale.x =
                                     D3DXVec3Length(reinterpret_cast<D3DXVECTOR3 *>(&projectDest)) / quadWidth;
@@ -1583,11 +2109,43 @@ ZunResult Background::RenderObjects(i32 mode)
                                 {
                                     if (!g_Supervisor.IsFogDisabled())
                                     {
+                                        {
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+                                            std::uint64_t bgSub_objfog_a = 0U;
+                                            const bool bgSubOn_objfog_a = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotObjFog, bgSub_objfog_a);
+#endif
                                         g_Supervisor.DisableFog();
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+                                            if (bgSubOn_objfog_a)
+                                                psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotObjFog, bgSub_objfog_a);
+#endif
+                                        }
                                     }
                                     fogState = 0;
                                 }
+                                {
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+                                    psp::DrawPrioritySubprofileCount(psp::kDrawPriorityCountBgQuads);
+                                    std::uint64_t bgSub_objdraw_a = 0U;
+                                    const bool bgSubOn_objdraw_a = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotObjDraw, bgSub_objdraw_a);
+#endif
+#if TH08_PSP_ME_BG_ANY_ENABLED
+                                PspMeBgRunFlush();
+#endif
+#if TH08_PSP_ME_BG_ADOPT_AUDIT_ENABLED
+                                {
+                                    const unsigned int pspBgAddedBefore = g_PspSpritesAddedCount;
+                                    g_AnmManager->DrawNoRotationNoRound(curQuadVm);
+                                    PspMeBgAuditCompare(g_QuadVertices, g_PspSpritesAddedCount != pspBgAddedBefore, false);
+                                }
+#else
                                 g_AnmManager->DrawNoRotationNoRound(curQuadVm);
+#endif
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+                                    if (bgSubOn_objdraw_a)
+                                        psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotObjDraw, bgSub_objdraw_a);
+#endif
+                                }
                                 if ((curQuadVm->type & 0xF0) == 0x10 &&
                                     this->skyFog.nearPlane > quadWidth &&
                                     this->collectSpecialEffectPoints != 0)
@@ -1606,16 +2164,44 @@ ZunResult Background::RenderObjects(i32 mode)
                                 {
                                     if (!g_Supervisor.IsFogDisabled())
                                     {
+                                        {
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+                                            std::uint64_t bgSub_objfog_b = 0U;
+                                            const bool bgSubOn_objfog_b = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotObjFog, bgSub_objfog_b);
+#endif
                                         g_Supervisor.EnableFog();
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+                                            if (bgSubOn_objfog_b)
+                                                psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotObjFog, bgSub_objfog_b);
+#endif
+                                        }
                                     }
                                     fogState = 1;
                                 }
+                                {
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+                                    psp::DrawPrioritySubprofileCount(psp::kDrawPriorityCountBgQuads);
+                                    std::uint64_t bgSub_objdraw_b = 0U;
+                                    const bool bgSubOn_objdraw_b = psp::DrawPrioritySubprofileBeginSlot(psp::kDrawPrioritySlotObjDraw, bgSub_objdraw_b);
+#endif
+#if TH08_PSP_ME_BG_ANY_ENABLED
+                                PspMeBgRunFlush();
+#endif
                                 g_AnmManager->Draw3D(curQuadVm);
+#if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
+                                    if (bgSubOn_objdraw_b)
+                                        psp::DrawPrioritySubprofileEndSlot(psp::kDrawPrioritySlotObjDraw, bgSub_objdraw_b);
+#endif
+                                }
                             }
                             break;
 
                         case 1:
                         {
+#if TH08_PSP_ME_BG_ANY_ENABLED
+                            if (PspMeBgTake(PspMeBgTag(instance, curQuad), &this->stageObjectVms[curQuad->vmIdx]))
+                                break;
+#endif
                             objQuadType1 = reinterpret_cast<RawStageQuadType1 *>(curQuad);
 #pragma var_order(type1World, halfWidthSecond, type1Width, vertices, projectedSecond, halfWidthFirst)
                             Float3 type1World;
@@ -1634,9 +2220,14 @@ ZunResult Background::RenderObjects(i32 mode)
 #if defined(PSP)
                             th08::psp::RenderPerfNoteBackgroundProject();
 #endif
-                            D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&quadPos),
+                            #if TH08_PSP_BG_FAST_PROJECT_ENABLED
+                                            PspProjectGeneral(&quadPos, projectSrc, worldMatrix, g_Supervisor.viewMatrix,
+                                                              g_Supervisor.projectionMatrix, pspVpRows, g_Supervisor.viewport);
+#else
+                                            D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&quadPos),
                                             reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                             &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
+#endif
 
                             if (objQuadType1->width != 0.0f)
                             {
@@ -1652,9 +2243,14 @@ ZunResult Background::RenderObjects(i32 mode)
 #if defined(PSP)
                             th08::psp::RenderPerfNoteBackgroundProject();
 #endif
-                            D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectDest),
+                            #if TH08_PSP_BG_FAST_PROJECT_ENABLED
+                                            PspProjectGeneral(&projectDest, projectSrc, worldMatrix, g_Supervisor.viewMatrix,
+                                                              g_Supervisor.projectionMatrix, pspVpRows, g_Supervisor.viewport);
+#else
+                                            D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectDest),
                                             reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                             &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
+#endif
                             projectDest = projectDest - quadPos;
                             halfWidthFirst =
                                 D3DXVec3Length(reinterpret_cast<D3DXVECTOR3 *>(&projectDest)) / 2.0f;
@@ -1706,9 +2302,14 @@ ZunResult Background::RenderObjects(i32 mode)
 #if defined(PSP)
                             th08::psp::RenderPerfNoteBackgroundProject();
 #endif
-                            D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectedSecond),
+                            #if TH08_PSP_BG_FAST_PROJECT_ENABLED
+                                            PspProjectGeneral(&projectedSecond, projectSrc, worldMatrix, g_Supervisor.viewMatrix,
+                                                              g_Supervisor.projectionMatrix, pspVpRows, g_Supervisor.viewport);
+#else
+                                            D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectedSecond),
                                             reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                             &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
+#endif
 
                             if (objQuadType1->width != 0.0f)
                             {
@@ -1724,9 +2325,14 @@ ZunResult Background::RenderObjects(i32 mode)
 #if defined(PSP)
                             th08::psp::RenderPerfNoteBackgroundProject();
 #endif
-                            D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectDest),
+                            #if TH08_PSP_BG_FAST_PROJECT_ENABLED
+                                            PspProjectGeneral(&projectDest, projectSrc, worldMatrix, g_Supervisor.viewMatrix,
+                                                              g_Supervisor.projectionMatrix, pspVpRows, g_Supervisor.viewport);
+#else
+                                            D3DXVec3Project(reinterpret_cast<D3DXVECTOR3 *>(&projectDest),
                                             reinterpret_cast<D3DXVECTOR3 *>(&projectSrc), &g_Supervisor.viewport,
                                             &g_Supervisor.projectionMatrix, &g_Supervisor.viewMatrix, &worldMatrix);
+#endif
                             projectDest = projectDest - projectedSecond;
                             halfWidthSecond =
                                 D3DXVec3Length(reinterpret_cast<D3DXVECTOR3 *>(&projectDest)) / 2.0f;
@@ -1821,11 +2427,26 @@ ZunResult Background::RenderObjects(i32 mode)
                                 }
                                 fogState = 0;
                             }
+#if TH08_PSP_ME_BG_ANY_ENABLED
+                            PspMeBgRunFlush();
+#endif
+#if TH08_PSP_ME_BG_ADOPT_AUDIT_ENABLED
+                            {
+                                const unsigned int pspBgAddedBefore = g_PspSpritesAddedCount;
+                                g_AnmManager->QueueSpriteQuad(curQuadVm, reinterpret_cast<VertexTex1DiffuseXyzrhw *>(vertices));
+                                PspMeBgAuditCompare(reinterpret_cast<VertexTex1DiffuseXyzrhw *>(vertices),
+                                                    g_PspSpritesAddedCount != pspBgAddedBefore, true);
+                            }
+#else
                             g_AnmManager->QueueSpriteQuad(curQuadVm, reinterpret_cast<VertexTex1DiffuseXyzrhw *>(vertices));
+#endif
                             break;
                         }
                         }
                     advance_quad:
+#if TH08_PSP_ME_BG_ADOPT_AUDIT_ENABLED
+                        PspMeBgAuditCulled();
+#endif
                         curQuad = reinterpret_cast<RawStageQuadBasic *>(reinterpret_cast<u8 *>(curQuad) +
                                                                        curQuad->byteSize);
             }
@@ -1877,6 +2498,33 @@ void Background::SetCamera1()
     g_Supervisor.d3dDevice->SetTransform(D3DTS_VIEW, &g_Supervisor.viewMatrix);
     g_Supervisor.d3dDevice->SetTransform(D3DTS_PROJECTION, &g_Supervisor.projectionMatrix);
 }
+
+#if defined(PSP)
+// SetCamera2's view/projection and camera right vector predicted from the
+// current camera state (called at the end of the calc chain by ME captures
+// whose kernels project world points the way the next draw will).
+extern "C" int th08_psp_bg_predict_camera(float *view16, float *proj16, float *camRight3)
+{
+    Background *bg = &g_Background;
+    Float3 atVec = bg->cameraCurrent.lookAtOffset + bg->cameraCurrent.position;
+    Float3 eyeVec = bg->cameraCurrent.positionOffset + bg->cameraCurrent.position;
+    D3DXMATRIX view, proj;
+    D3DXMatrixLookAtLH(&view, reinterpret_cast<D3DXVECTOR3 *>(&eyeVec), reinterpret_cast<D3DXVECTOR3 *>(&atVec),
+                       reinterpret_cast<D3DXVECTOR3 *>(&bg->cameraCurrent.up));
+    D3DXMatrixPerspectiveFovLH(&proj, bg->cameraCurrent.fieldOfView,
+                               (f32)g_Supervisor.viewport.Width / (f32)g_Supervisor.viewport.Height, 30.0f, 1800.0f);
+    memcpy(view16, &view, 16 * sizeof(float));
+    memcpy(proj16, &proj, 16 * sizeof(float));
+    Float3 right;
+    D3DXVec3Cross(reinterpret_cast<D3DXVECTOR3 *>(&right), reinterpret_cast<D3DXVECTOR3 *>(&bg->cameraCurrent.lookAtOffset),
+                  reinterpret_cast<D3DXVECTOR3 *>(&bg->cameraCurrent.up));
+    D3DXVec3Normalize(reinterpret_cast<D3DXVECTOR3 *>(&right), reinterpret_cast<D3DXVECTOR3 *>(&right));
+    camRight3[0] = right.x;
+    camRight3[1] = right.y;
+    camRight3[2] = right.z;
+    return 1;
+}
+#endif
 
 // FUNCTION: th08 0x40b6d0
 #pragma var_order(eyeVec, atVec, this)

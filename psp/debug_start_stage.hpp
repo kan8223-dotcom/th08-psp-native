@@ -18,5 +18,16 @@ int DebugStartStageOverride();
 // Title auto-advance: when TH08PSP_DEBUG_STAGE.txt contains "auto", returns
 // PSP_CTRL_CROSS on a schedule (tap every ~2 s) until a game has started, so a
 // PPSSPP run needs no host keyboard input.  0 otherwise.
+// Returns a TH_BUTTON_* mask to OR into the frame input (0 = none).
+// "auto": tap SHOOT until a game starts.  "menu=replay": walk the title
+// menu into Replay -> 4th list entry -> stage select -> mode -> start.
 unsigned int DebugAutoStartButtons();
+// Debug replay playback: when TH08PSP_DEBUG_STAGE.txt contains
+// "replay=<file in ./replay>", the title screen starts that replay once, from
+// its first recorded stage, without any input.  NULL otherwise.
+const char *DebugReplayAutoStart();
+// "replay_stage=N" in the same file: start the auto-started replay at stage N (0-based, 7 = 6B); -1 = first stage.
+int DebugReplayAutoStartStage();
+// Test async lease memory pressure even when PPSSPP cannot enable GE4 triple.
+bool DebugRetainStreamLeaseForTest();
 } // namespace th08::psp

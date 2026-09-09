@@ -5,6 +5,7 @@
 #include "GameManager.hpp"
 #include "Gui.hpp"
 #include "ItemManager.hpp"
+#include "psp/me_bullet_adopt.hpp"
 #include "Player.hpp"
 #include "ReplaySyncAudit.hpp"
 #include "ReplayManager.hpp"
@@ -2123,7 +2124,7 @@ void ItemManager::OnUpdate()
         {
             if (item->state == ITEM_STATE_AUTOCOLLECT ||
                 (g_Player.position.y < g_Player.primaryShtFile->pointItemValueLine &&
-                 (g_GameManager.GetPower() >= 0.0 ||
+                 (g_GameManager.GetPower() >= 128.0 ||
                   g_Player.focusMode != PLAYER_FOCUS_MODE_UNFOCUSED ||
                   g_GameManager.shotType == 1 || g_GameManager.shotType == 6)))
             {
@@ -2703,6 +2704,13 @@ void ItemManager::OnDraw()
             }
         }
 
+#if TH08_PSP_ME_BULLET_ANY_ENABLED
+        if (th08_psp_me_item_take(item, &item->sprite))
+        {
+            item = item->next;
+            continue;
+        }
+#endif
 #if TH08_PSP_ITEM_TIME_INLINE_DRAW_ENABLED
         if (item->itemType == ITEM_TIME)
         {
@@ -2767,6 +2775,9 @@ void ItemManager::OnDraw()
         item = item->next;
     }
 
+#if TH08_PSP_ME_BULLET_ANY_ENABLED
+    th08_psp_me_item_pass_end();
+#endif
 #if TH08_PSP_ITEM_TIME_DRAW_PAIR_ENABLED
     g_AnmManager->EndPspItemTimeDrawPairPass();
 #endif

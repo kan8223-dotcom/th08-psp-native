@@ -31,6 +31,9 @@ namespace th08::psp
 // the NOWAIT double-buffer swap.
 bool SwapTripleInitialize();
 bool SwapTripleActive();
+// Exit path: give the upper-tier third buffer back (GE idle) so the GE4
+// shutdown finds no live upper allocation; the surface keeps two lower buffers.
+void SwapTripleShutdown();
 // Main thread, in Present after glFlush: rotate the buffers without waiting
 // for the GE.  Waits only until the previous frame is actually displayed
 // (usually already true).  The waited time is returned for attribution.

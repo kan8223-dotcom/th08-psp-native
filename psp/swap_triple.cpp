@@ -5,6 +5,7 @@
 #include "fileio.hpp"
 #include "perf_attribution.hpp"
 #include "swap_async.hpp"
+extern "C" void th08_psp_auto_cadence_note_wait(unsigned long long us);
 
 #include <cstddef>
 #include <cstdint>
@@ -181,6 +182,17 @@ bool SwapTripleActive()
 {
     return gActive;
 }
+void SwapTripleShutdown()
+{
+    if (!gActive)
+        return;
+    // Log only: freeing the upper buffer through PSPGL here can wait on an
+    // open stream list (HOME hang).  The GE4 shutdown tolerates this one
+    // allocation and restores the aperture regardless.
+    gActive = false;
+    BootLog("SWAP_TRIPLE shutdown: leaving the upper buffer to the GE4 exit presents=%lu\n", gPresents);
+    FlushBootLog();
+}
 
 void SwapTriplePoll()
 {
@@ -190,6 +202,11 @@ void SwapTriplePoll()
     const int state = TH08_SWAP_TRIPLE_PEEK(gPendingQid);
     if (state <= 0)
         RequestFlip(gFlipsHook);
+}
+
+extern "C" int th08_psp_swap_triple_last_qid(void)
+{
+    return gActive ? gLastQid : -1;
 }
 
 void SwapTripleNoteListEnqueued(int qid)
@@ -261,6 +278,7 @@ void SwapTriplePresent(std::uint64_t *waitedUs)
             const std::uint64_t t0 = NowUs();
             sceGeListSync(gPendingQid, 0);
             gForcedGeWaitUs += NowUs() - t0;
+            th08_psp_auto_cadence_note_wait(NowUs() - t0);
             RequestFlip(gFlipsForced);
         }
         // The buffer we are about to hand to the GE is the one currently on
@@ -271,6 +289,7 @@ void SwapTriplePresent(std::uint64_t *waitedUs)
             const std::uint64_t t0 = NowUs();
             WaitDisplayShows(gPendingBuf->base);
             gDisplayWaitUs += NowUs() - t0;
+            th08_psp_auto_cadence_note_wait(NowUs() - t0);
         }
         // Rotation: N-1 is displayed, its predecessor is free, N is pending.
         struct pspgl_buffer *const freed = gDisplayed;

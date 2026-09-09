@@ -1020,7 +1020,9 @@ struct AnmManager
     ~AnmManager()
     {
     }
-    ZunBool ExecuteScript(AnmVm *vm);
+    // pspMeAbort: when non-NULL (Media Engine step), a random-number instruction
+    // sets *pspMeAbort and returns without touching the RNG.
+    ZunBool ExecuteScript(AnmVm *vm, int *pspMeAbort = NULL);
     void ExecuteScriptArray(AnmVm *sprites, int count);
     void SetRenderStateForVm(AnmVm *vm);
     void SetRenderStateForVm3D(AnmVm *vm);
@@ -1045,6 +1047,13 @@ struct AnmManager
     void TranslateRotation(VertexTex1DiffuseXyzrhw *vertex, float x, float y, float sine, float cosine, float xOffset,
                            float yOffset);
     ZunResult Draw2D(AnmVm *vm);
+    // PSP: emit a Draw2D quad whose vertices were computed on the Media Engine.
+    ZunResult DrawPspMeQuad(AnmVm *vm, const float *x4, const float *y4, const float *z4, const float *u4,
+                            const float *v4, unsigned int color);
+    // PSP: apply texture/vertex-shader/blend/z-write state for vm without drawing (ME bullet runs).
+    void PspMeApplySpriteState(AnmVm *vm);
+    // PSP: the unified 6-indices-per-quad table, NULL until the bullet batch prepared it.
+    const u16 *PspBulletUnifiedQuadIndices() const;
     // Draw2D-equivalent presentation path for callers which already own the
     // sine/cosine of vm->rotation.z. It still emits the same four-corner input
     // and six-vertex triangle list through DrawInner.

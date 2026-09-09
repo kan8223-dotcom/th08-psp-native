@@ -1,4 +1,11 @@
 #include "th_pch.h"
+#if defined(PSP)
+#include "fileio.hpp"
+#if defined(PSP) && ((defined(TH08_PSP_ME_POPUP) && TH08_PSP_ME_POPUP) || (defined(TH08_PSP_ME_POPUP_AUDIT) && TH08_PSP_ME_POPUP_AUDIT))
+#include "psp/me_popup.hpp"
+#define TH08_PSP_ME_POPUP_ENABLED 1
+#endif
+#endif
 
 #if defined(PSP)
 #include "render_perf_telemetry.hpp"
@@ -94,6 +101,364 @@ PspAsciiRenderOwnerScope::~PspAsciiRenderOwnerScope()
 {
     g_PspAsciiCurrentRenderOwner = previousOwner_;
 }
+#endif
+#if defined(PSP) && defined(TH08_PSP_DRAW_PRIORITY_SUBPROFILE) && TH08_PSP_DRAW_PRIORITY_SUBPROFILE
+#if defined(TH08_PSP_HUD_TEXT_NATIVE) && TH08_PSP_HUD_TEXT_NATIVE
+#define TH08_PSP_HUD_TEXT_NATIVE_ENABLED 1
+extern "C" void th08_psp_ascii_popup_build_quad(AnmVm *vm, const AnmLoadedSprite *sprite, float widthPx, float scaleX,
+                                                float scaleY, float *xyz12, float *uv8);
+extern "C" void *th08_psp_bullet_me_reserve(void *deviceRaw, unsigned int quadCount);
+extern "C" void th08_psp_bullet_me_reserve_commit(void *deviceRaw);
+extern "C" int th08_psp_bullet_me_submit(void *deviceRaw, const void *vertices, unsigned int quadCount,
+                                         const unsigned short *indices);
+extern "C" int th08_psp_bullet_me_color_identity(void *deviceRaw);
+#if defined(TH08_PSP_HUD_TEXT_NATIVE_AUDIT) && TH08_PSP_HUD_TEXT_NATIVE_AUDIT
+extern "C" void th08_psp_ascii_last_quad(float *xyz12, float *uv8);
+#endif
+#else
+#define TH08_PSP_HUD_TEXT_NATIVE_ENABLED 0
+#endif
+namespace
+{
+struct PspAsciiSubStats
+{
+    unsigned long calls, popupsUs, restUs;
+    unsigned long hudStrings, hudGlyphs, hudFallbacks, hudAuditGlyphs, hudAuditMismatch;
+    unsigned long hudSkipVm, hudSkipIndices, hudSkipAlpha, hudSkipTexture, hudSkipIdentity;
+    unsigned long hudDrawCalls, hudDrawUs, hudSubmits, hudMergedStrings;
+} g_PspAsciiSub;
+extern "C" unsigned int sceKernelGetSystemTimeLow(void);
+struct PspHudTextTimer
+{
+    unsigned int start;
+    ~PspHudTextTimer()
+    {
+        g_PspAsciiSub.hudDrawUs += sceKernelGetSystemTimeLow() - start;
+        if ((++g_PspAsciiSub.hudDrawCalls % 600UL) == 0UL)
+            th08::psp::BootLog("HUD_TEXT stats calls=%lu us=%lu strings=%lu glyphs=%lu submits=%lu merged=%lu fallback=%lu\n",
+                g_PspAsciiSub.hudDrawCalls, g_PspAsciiSub.hudDrawUs, g_PspAsciiSub.hudStrings,
+                g_PspAsciiSub.hudGlyphs, g_PspAsciiSub.hudSubmits, g_PspAsciiSub.hudMergedStrings,
+                g_PspAsciiSub.hudFallbacks);
+    }
+};
+#if TH08_PSP_HUD_TEXT_NATIVE_ENABLED
+struct PspHudGlyphVertex
+{
+    float u, v;
+    unsigned char r, g, b, a;
+    float x, y, z;
+}; // PspClientVertex layout (24 bytes)
+#if defined(TH08_PSP_HUD_TEXT_STREAM_AUDIT) && TH08_PSP_HUD_TEXT_STREAM_AUDIT
+unsigned int g_PspHudStreamHash = 2166136261U;
+unsigned int g_PspHudStreamGlyphs = 0U;
+void PspHudStreamBytes(const void *data, unsigned int bytes)
+{
+    const unsigned char *p = static_cast<const unsigned char *>(data);
+    while (bytes-- != 0U)
+        g_PspHudStreamHash = (g_PspHudStreamHash ^ *p++) * 16777619U;
+}
+#endif
+inline unsigned int PspHudMix(unsigned int c1, unsigned int c2)
+{
+    const unsigned int c = (c1 * c2) / 128U;
+    return c >= 256U ? 255U : c;
+}
+// One AsciiManager string as a single indexed quad batch.  Mirrors the
+// canonical per-glyph loop below (sprite choice, advance, newline) and the
+// quad math of DrawNoRotation (BuildPspAsciiPopupQuad).  Returns false to let
+// the canonical loop draw the string.
+bool PspHudTextDrawNative(AsciiManager *am, const AsciiManagerString *s, AnmVm *vm, float spaceWidth,
+                          PspHudGlyphVertex *batchOut = NULL, unsigned int *batchQuads = NULL)
+{
+    if (am->asciiAnm == NULL || g_Supervisor.d3dDevice == NULL || !vm->IsVisible() || !vm->flag1)
+    {
+        ++g_PspAsciiSub.hudSkipVm;
+        return false;
+    }
+    const u16 *const indices = g_AnmManager->PspBulletUnifiedQuadIndices();
+    if (indices == NULL)
+    {
+        ++g_PspAsciiSub.hudSkipIndices;
+        return false;
+    }
+    const int base = s->isSelected ? (170 - ' ') : (31 - ' ');
+    const u32 color1 = s->isSelected ? 0xffffffffU : s->color;
+    if ((color1 >> 24) == 0U)
+    {
+        ++g_PspAsciiSub.hudSkipAlpha;
+        return false; // DrawNoRotation draws nothing: keep the canonical walk
+    }
+    IDirect3DTexture8 *texture = NULL;
+    const AnmLoadedSprite *firstSprite = NULL;
+    unsigned int glyphs = 0U;
+    for (const u8 *p = reinterpret_cast<const u8 *>(s->text); *p; ++p)
+    {
+        if (*p == '\n' || *p == ' ')
+            continue;
+        const AnmLoadedSprite *const sprite = am->asciiAnm->GetSprite(*p + base);
+        if (sprite == NULL || sprite->texture == NULL || (texture != NULL && sprite->texture != texture))
+        {
+            ++g_PspAsciiSub.hudSkipTexture;
+            return false;
+        }
+        texture = sprite->texture;
+        if (firstSprite == NULL)
+            firstSprite = sprite;
+        ++glyphs;
+    }
+    if (glyphs == 0U || glyphs > 0x600U)
+    {
+        ++g_PspAsciiSub.hudSkipTexture;
+        return false;
+    }
+    vm->loadedSprite = const_cast<AnmLoadedSprite *>(firstSprite);
+    vm->color1.d3dColor = color1;
+    vm->pos = s->position;
+    // The render state DrawNoRotation would set for the first glyph; only then
+    // does the device's colour path tell whether the vertex colour passes through.
+    if (batchQuads == NULL || *batchQuads == 0U)
+    {
+        g_AnmManager->FlushVertexBuffer();
+        g_AnmManager->PspMeApplySpriteState(vm);
+        if (!th08_psp_bullet_me_color_identity(g_Supervisor.d3dDevice))
+        {
+            ++g_PspAsciiSub.hudSkipIdentity;
+            return false;
+        }
+    }
+    u32 color = vm->flag17 ? vm->color2.d3dColor : color1;
+    if (g_AnmManager->useMixColor)
+    {
+        const u32 m = g_AnmManager->color.d3dColor;
+        color = (PspHudMix(color >> 24, m >> 24) << 24) | (PspHudMix((color >> 16) & 255U, (m >> 16) & 255U) << 16) |
+                (PspHudMix((color >> 8) & 255U, (m >> 8) & 255U) << 8) | PspHudMix(color & 255U, m & 255U);
+    }
+    const unsigned char cr = static_cast<unsigned char>((color >> 16) & 255U);
+    const unsigned char cg = static_cast<unsigned char>((color >> 8) & 255U);
+    const unsigned char cb = static_cast<unsigned char>(color & 255U);
+    const unsigned char ca = static_cast<unsigned char>(color >> 24);
+#if defined(TH08_PSP_HUD_TEXT_NATIVE_AUDIT) && TH08_PSP_HUD_TEXT_NATIVE_AUDIT
+    // Audit: draw canonically and compare our quad with the one DrawNoRotation built.
+    (void)cr; (void)cg; (void)cb; (void)ca;
+    for (const u8 *p = reinterpret_cast<const u8 *>(s->text); *p; ++p)
+    {
+        if (*p == '\n')
+        {
+            vm->pos.y += 16.0f * s->scaleY;
+            vm->pos.x = s->position.x;
+            continue;
+        }
+        if (*p == ' ')
+        {
+            vm->pos.x += spaceWidth;
+            continue;
+        }
+        const AnmLoadedSprite *const sprite = am->asciiAnm->GetSprite(*p + base);
+        float xyz[12], uv[8], cxyz[12], cuv[8];
+        th08_psp_ascii_popup_build_quad(vm, sprite, vm->spriteSize.x, vm->scale.x, vm->scale.y, xyz, uv);
+        vm->loadedSprite = const_cast<AnmLoadedSprite *>(sprite);
+        vm->color1.d3dColor = color1;
+        g_AnmManager->DrawNoRotation(vm);
+        th08_psp_ascii_last_quad(cxyz, cuv);
+        ++g_PspAsciiSub.hudAuditGlyphs;
+        bool same = true;
+        for (int i = 0; i < 12 && same; ++i)
+            same = xyz[i] == cxyz[i];
+        for (int i = 0; i < 8 && same; ++i)
+            same = uv[i] == cuv[i];
+        if (!same)
+        {
+            ++g_PspAsciiSub.hudAuditMismatch;
+            static unsigned samples = 0U;
+            if (samples < 6U)
+            {
+                ++samples;
+                th08::psp::BootLog("HUD_TEXT_AUDIT ch=%u want %f,%f,%f uv %f,%f got %f,%f,%f uv %f,%f\n", *p, cxyz[0], cxyz[1],
+                                   cxyz[2], cuv[0], cuv[1], xyz[0], xyz[1], xyz[2], uv[0], uv[1]);
+            }
+        }
+        vm->pos.x += spaceWidth;
+    }
+    ++g_PspAsciiSub.hudStrings;
+    g_PspAsciiSub.hudGlyphs += glyphs;
+    return true;
+#else
+    // Keep whatever was reserved before us in this present (the bullet batch
+    // the ME wrote earlier this frame): a fresh reservation must not rewind
+    // over it (r221/r222: some enemy bullets flickered).
+    if (batchOut == NULL)
+        th08_psp_bullet_me_reserve_commit(g_Supervisor.d3dDevice);
+    PspHudGlyphVertex *const out =
+        batchOut != NULL ? batchOut + *batchQuads * 4U :
+        static_cast<PspHudGlyphVertex *>(th08_psp_bullet_me_reserve(g_Supervisor.d3dDevice, glyphs));
+    if (out == NULL)
+    {
+        ++g_PspAsciiSub.hudFallbacks;
+        return false;
+    }
+    unsigned int q = 0U;
+    for (const u8 *p = reinterpret_cast<const u8 *>(s->text); *p; ++p)
+    {
+        if (*p == '\n')
+        {
+            vm->pos.y += 16.0f * s->scaleY;
+            vm->pos.x = s->position.x;
+            continue;
+        }
+        if (*p == ' ')
+        {
+            vm->pos.x += spaceWidth;
+            continue;
+        }
+        const AnmLoadedSprite *const sprite = am->asciiAnm->GetSprite(*p + base);
+        float xyz[12], uv[8];
+        th08_psp_ascii_popup_build_quad(vm, sprite, vm->spriteSize.x, vm->scale.x, vm->scale.y, xyz, uv);
+        PspHudGlyphVertex *const v = out + q * 4U;
+        for (int i = 0; i < 4; ++i)
+        {
+            v[i].u = uv[i * 2];
+            v[i].v = uv[i * 2 + 1];
+            v[i].r = cr; v[i].g = cg; v[i].b = cb; v[i].a = ca;
+            v[i].x = xyz[i * 3] + 0.5f;
+            v[i].y = xyz[i * 3 + 1] + 0.5f;
+            v[i].z = 1.0f - 2.0f * xyz[i * 3 + 2];
+        }
+        ++q;
+        vm->pos.x += spaceWidth;
+    }
+    if (batchQuads != NULL)
+    {
+        *batchQuads += q;
+    }
+    else if (!th08_psp_bullet_me_submit(g_Supervisor.d3dDevice, out, q, indices))
+    {
+        ++g_PspAsciiSub.hudFallbacks;
+        vm->pos = s->position;
+        return false;
+    }
+#if defined(TH08_PSP_HUD_TEXT_STREAM_AUDIT) && TH08_PSP_HUD_TEXT_STREAM_AUDIT
+    PspHudStreamBytes(&s->isGui, sizeof(s->isGui));
+    PspHudStreamBytes(&s->isSelected, sizeof(s->isSelected));
+    PspHudStreamBytes(s->text, strlen(s->text));
+    PspHudStreamBytes(out, q * 4U * sizeof(*out));
+    PspHudStreamBytes(&vm->pos, sizeof(vm->pos));
+    PspHudStreamBytes(&vm->scale, sizeof(vm->scale));
+    PspHudStreamBytes(&vm->color1, sizeof(vm->color1));
+    g_PspHudStreamGlyphs += q;
+#endif
+    // The GE reads these vertices later: the next reservation (next string,
+    // same present) must not rewind over them (r221: HUD digits flickered
+    // under load).
+    if (batchOut == NULL)
+    {
+        th08_psp_bullet_me_reserve_commit(g_Supervisor.d3dDevice);
+        ++g_PspAsciiSub.hudSubmits;
+    }
+    ++g_PspAsciiSub.hudStrings;
+    g_PspAsciiSub.hudGlyphs += q;
+    return true;
+#endif
+}
+#if defined(TH08_PSP_HUD_TEXT_BATCH) && TH08_PSP_HUD_TEXT_BATCH && \
+    !(defined(TH08_PSP_HUD_TEXT_NATIVE_AUDIT) && TH08_PSP_HUD_TEXT_NATIVE_AUDIT)
+// Only adjacent game-owned strings using this same VM and viewport may join.
+// Position, scale, selected atlas and colour are baked per string by the r229
+// builder; blend/depth/UV-scroll/mix/shake are invariant during this walk.
+int PspHudTextDrawRun(AsciiManager *am, int first)
+{
+    AnmVm *const vm = &am->largeText;
+    if (am->asciiAnm == NULL || g_Supervisor.d3dDevice == NULL || !vm->IsVisible() || !vm->flag1)
+        return 0;
+    const u16 *const indices = g_AnmManager->PspBulletUnifiedQuadIndices();
+    if (indices == NULL)
+        return 0;
+    IDirect3DTexture8 *texture = NULL;
+    unsigned int glyphs = 0U;
+    int end = first;
+    for (; end < am->numStrings; ++end)
+    {
+        const AsciiManagerString &s = am->strings[end];
+        if (s.isGui != am->strings[first].isGui ||
+            PspAsciiStringRenderOwner(am, end) != PspAsciiRenderOwner::Game ||
+            (!s.isSelected && (s.color >> 24) == 0U))
+            break;
+        const int base = s.isSelected ? (170 - ' ') : (31 - ' ');
+        IDirect3DTexture8 *candidateTexture = texture;
+        unsigned int count = 0U;
+        const u8 *p = reinterpret_cast<const u8 *>(s.text);
+        for (; *p; ++p)
+        {
+            if (*p == '\n' || *p == ' ')
+                continue;
+            const AnmLoadedSprite *const sprite = am->asciiAnm->GetSprite(*p + base);
+            if (sprite == NULL || sprite->texture == NULL ||
+                (candidateTexture != NULL && candidateTexture != sprite->texture))
+                break;
+            candidateTexture = sprite->texture;
+            ++count;
+        }
+        // Split BEFORE the string. Both index-table and arena limits still
+        // apply; an allocation failure retries the old per-string path.
+        if (*p != 0 || count == 0U || glyphs + count > 0x600U)
+            break;
+        texture = candidateTexture;
+        glyphs += count;
+    }
+    if (end - first < 2)
+        return 0;
+    // Flush before reserving: queued canonical vertices own earlier storage.
+    g_AnmManager->FlushVertexBuffer();
+    th08_psp_bullet_me_reserve_commit(g_Supervisor.d3dDevice);
+    PspHudGlyphVertex *const out = static_cast<PspHudGlyphVertex *>(
+        th08_psp_bullet_me_reserve(g_Supervisor.d3dDevice, glyphs));
+    if (out == NULL)
+        return 0;
+    unsigned int quads = 0U;
+    const unsigned long stringsBefore = g_PspAsciiSub.hudStrings;
+    const unsigned long glyphsBefore = g_PspAsciiSub.hudGlyphs;
+#if defined(TH08_PSP_HUD_TEXT_STREAM_AUDIT) && TH08_PSP_HUD_TEXT_STREAM_AUDIT
+    const unsigned int hashBefore = g_PspHudStreamHash;
+    const unsigned int auditGlyphsBefore = g_PspHudStreamGlyphs;
+#endif
+    bool built = true;
+    for (int index = first; index < end; ++index)
+    {
+        const AsciiManagerString &s = am->strings[index];
+        vm->scale.x = s.scaleX;
+        vm->scale.y = s.scaleY;
+        if (!PspHudTextDrawNative(am, &s, vm, am->spaceWidth * s.scaleX, out, &quads))
+        {
+            built = false;
+            break;
+        }
+    }
+    if (!built || !th08_psp_bullet_me_submit(g_Supervisor.d3dDevice, out, quads, indices))
+    {
+        // No text primitives were submitted. Restore the first string's
+        // inputs before its normal helper/canonical fallback retries it.
+        g_PspAsciiSub.hudStrings = stringsBefore;
+        g_PspAsciiSub.hudGlyphs = glyphsBefore;
+#if defined(TH08_PSP_HUD_TEXT_STREAM_AUDIT) && TH08_PSP_HUD_TEXT_STREAM_AUDIT
+        g_PspHudStreamHash = hashBefore;
+        g_PspHudStreamGlyphs = auditGlyphsBefore;
+#endif
+        ++g_PspAsciiSub.hudFallbacks;
+        vm->pos = am->strings[first].position;
+        vm->scale.x = am->strings[first].scaleX;
+        vm->scale.y = am->strings[first].scaleY;
+        return 0;
+    }
+    th08_psp_bullet_me_reserve_commit(g_Supervisor.d3dDevice);
+    ++g_PspAsciiSub.hudSubmits;
+    g_PspAsciiSub.hudMergedStrings += end - first - 1;
+    return end - first;
+}
+#define TH08_PSP_HUD_TEXT_BATCH_ENABLED 1
+#endif
+#endif
+} // namespace
+#else
+#define TH08_PSP_HUD_TEXT_NATIVE_ENABLED 0
 #endif
 
 // Menu script indices and interrupts used by the original pause/retry state machines.
@@ -708,6 +1073,14 @@ void AsciiManager::OnDrawLowPrioImpl()
     this->largeText.visible = true;
     this->largeText.anchor = 3;
 
+#if TH08_PSP_HUD_TEXT_NATIVE_ENABLED
+    {
+    PspHudTextTimer hudTimer = {sceKernelGetSystemTimeLow()};
+#if defined(TH08_PSP_HUD_TEXT_STREAM_AUDIT) && TH08_PSP_HUD_TEXT_STREAM_AUDIT
+    g_PspHudStreamHash = 2166136261U;
+    g_PspHudStreamGlyphs = 0U;
+#endif
+#endif
     for (i = 0; i < this->numStrings; i++, curString++)
     {
 #if defined(PSP)
@@ -747,6 +1120,22 @@ void AsciiManager::OnDrawLowPrioImpl()
             }
         }
 
+#if TH08_PSP_HUD_TEXT_NATIVE_ENABLED
+#if defined(TH08_PSP_HUD_TEXT_BATCH_ENABLED) && TH08_PSP_HUD_TEXT_BATCH_ENABLED
+        if (!isFpsOverlay)
+        {
+            const int consumed = PspHudTextDrawRun(this, i);
+            if (consumed != 0)
+            {
+                i += consumed - 1;
+                curString += consumed - 1;
+                continue;
+            }
+        }
+#endif
+        if (!isFpsOverlay && PspHudTextDrawNative(this, curString, &this->largeText, spaceWidth))
+            continue;
+#endif
         while (*text)
         {
             if (*text == '\n')
@@ -784,6 +1173,15 @@ void AsciiManager::OnDrawLowPrioImpl()
         }
     }
 
+#if TH08_PSP_HUD_TEXT_NATIVE_ENABLED
+#if defined(TH08_PSP_HUD_TEXT_STREAM_AUDIT) && TH08_PSP_HUD_TEXT_STREAM_AUDIT
+    // Packed UV/RGBA/XYZ plus string/viewport order, independent of grouping.
+    th08::psp::BootLog("HUD_STREAM st=%d f=%lu call=%lu glyphs=%u hash=%08x\n",
+        g_GameManager.currentStage, static_cast<unsigned long>(g_GameManager.gameplayFrameCounter),
+        g_PspAsciiSub.hudDrawCalls + 1UL, g_PspHudStreamGlyphs, g_PspHudStreamHash);
+#endif
+    }
+#endif
     if (isGui)
     {
         g_AnmManager->FlushVertexBuffer();
@@ -1888,8 +2286,43 @@ void RetryMenu::OnDraw()
 
 #pragma var_order(popup, alpha, dy, dx, i, j, charPtr, unused, rect, alphaColor, divisor)
 // FUNCTION: th08 0x405420
+#if defined(PSP) && defined(TH08_PSP_DRAW_PRIORITY_SUBPROFILE) && TH08_PSP_DRAW_PRIORITY_SUBPROFILE
+extern "C" unsigned int sceKernelGetSystemTimeLow(void);
+namespace
+{
+struct PspAsciiSubTimer
+{
+    unsigned int start;
+    unsigned int mid;
+    ~PspAsciiSubTimer()
+    {
+        const unsigned int end = sceKernelGetSystemTimeLow();
+        g_PspAsciiSub.popupsUs += mid - start;
+        g_PspAsciiSub.restUs += end - mid;
+        if ((++g_PspAsciiSub.calls % 600UL) == 0UL)
+        {
+            th08::psp::BootLog("ASCII_SUB stats calls=%lu popups_us=%lu rest_us=%lu hud_strings=%lu hud_glyphs=%lu "
+                               "hud_fallbacks=%lu hud_audit_glyphs=%lu hud_audit_mismatch=%lu "
+                               "skip_vm=%lu skip_idx=%lu skip_alpha=%lu skip_tex=%lu skip_ident=%lu\n",
+                               g_PspAsciiSub.calls, g_PspAsciiSub.popupsUs, g_PspAsciiSub.restUs, g_PspAsciiSub.hudStrings,
+                               g_PspAsciiSub.hudGlyphs, g_PspAsciiSub.hudFallbacks, g_PspAsciiSub.hudAuditGlyphs,
+                               g_PspAsciiSub.hudAuditMismatch, g_PspAsciiSub.hudSkipVm, g_PspAsciiSub.hudSkipIndices,
+                               g_PspAsciiSub.hudSkipAlpha, g_PspAsciiSub.hudSkipTexture, g_PspAsciiSub.hudSkipIdentity);
+            th08::psp::FlushBootLog();
+        }
+    }
+};
+} // namespace
+#define TH08_PSP_ASCII_SUB_ENABLED 1
+#else
+#define TH08_PSP_ASCII_SUB_ENABLED 0
+#endif
+
 void AsciiManager::OnDrawHighPrioImpl()
 {
+#if TH08_PSP_ASCII_SUB_ENABLED
+    PspAsciiSubTimer pspAsciiSubTimer = {sceKernelGetSystemTimeLow(), 0U};
+#endif
     AsciiManagerPopup *popup;
     u8 *charPtr;
     i32 alpha;
@@ -1911,6 +2344,9 @@ void AsciiManager::OnDrawHighPrioImpl()
 #if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_BATCH) && \
     TH08_PSP_ASCII_POPUP_BATCH
     const bool scorePopupsDrawnByBatch =
+#if defined(TH08_PSP_ME_POPUP_ENABLED)
+        th08_psp_me_popup_draw() != 0 ||
+#endif
         g_AnmManager->DrawPspAsciiPopupBatch(
             &this->smallScoreText, this->asciiAnm, this->scorePopups,
             ASCII_MAX_SCORE_POPUPS + ASCII_MAX_PLAYER_POPUPS,
@@ -2063,6 +2499,9 @@ void AsciiManager::OnDrawHighPrioImpl()
         g_AnmManager->DrawNoRotation(&this->nightBlindnessVm);
     }
 
+#if TH08_PSP_ASCII_SUB_ENABLED
+    pspAsciiSubTimer.mid = sceKernelGetSystemTimeLow();
+#endif
     popup = this->timePopups;
 #if defined(PSP) && defined(TH08_PSP_ASCII_POPUP_OCCUPANCY) && \
     TH08_PSP_ASCII_POPUP_OCCUPANCY

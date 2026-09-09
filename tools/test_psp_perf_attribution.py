@@ -148,6 +148,7 @@ class PspPerfAttributionTests(unittest.TestCase):
                 return ++fakeNow;
             }
             extern "C" int sceKernelGetThreadId() { return 7; }
+            extern "C" void th08_psp_auto_cadence_note_wait(unsigned long long) {}
             extern "C" int __real_sceGeListSync(int, int) {
                 fakeNow += 10; return 0;
             }

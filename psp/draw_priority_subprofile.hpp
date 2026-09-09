@@ -20,6 +20,37 @@ void DrawPrioritySubprofileEndDrawChain(std::uint64_t startUs);
 // Nested measurement inside priority 7.  The false path performs no clock
 // read, and callers keep the canonical EffectManager call unconditional.
 bool DrawPrioritySubprofileBeginEffectBackground(std::uint64_t &startUs);
+// Named sub-brackets inside the Background draw callbacks (BG_SUB line).
+enum DrawPrioritySlot : unsigned
+{
+    kDrawPrioritySlotBgClear = 0U,
+    kDrawPrioritySlotBgSprites,
+    kDrawPrioritySlotBgEffectCb,
+    kDrawPrioritySlotBgZClear,
+    kDrawPrioritySlotBgState,
+    kDrawPrioritySlotBgObj0,
+    kDrawPrioritySlotBgObj1,
+    kDrawPrioritySlotBgObj2,
+    kDrawPrioritySlotBgObj3,
+    kDrawPrioritySlotBgSpell,
+    kDrawPrioritySlotObjDraw,
+    kDrawPrioritySlotObjFog,
+    kDrawPrioritySlotPrep,
+    kDrawPrioritySlotSubmit,
+    kDrawPrioritySlotCount
+};
+enum DrawPriorityCounter : unsigned
+{
+    kDrawPriorityCountBgInstances = 0U,
+    kDrawPriorityCountBgCandidates,
+    kDrawPriorityCountBgQuads,
+    kDrawPriorityCountBgProjects,
+    kDrawPriorityCounterCount
+};
+// Per-sampled-frame event counters (BG_SUB cnt= field).
+void DrawPrioritySubprofileCount(unsigned counter);
+bool DrawPrioritySubprofileBeginSlot(unsigned slot, std::uint64_t &startUs);
+void DrawPrioritySubprofileEndSlot(unsigned slot, std::uint64_t startUs);
 void DrawPrioritySubprofileEndEffectBackground(std::uint64_t startUs);
 
 // These lifecycle hooks are owned by the existing 600-stage-tick attribution

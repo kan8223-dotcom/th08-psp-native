@@ -683,6 +683,15 @@ bool th08_linux_surface_load_image_memory(IDirect3DDevice8 *device, const void *
 #endif
     if (decoded == NULL || decoded->w <= 0 || decoded->h <= 0)
     {
+#if defined(PSP)
+        // Capture the decoder's reason before cleanup can replace SDL's error.
+        unsigned long sourceHash = 2166136261UL;
+        const unsigned char *sourceBytes = static_cast<const unsigned char *>(data);
+        for (UINT i = 0; i < size; ++i)
+            sourceHash = (sourceHash ^ sourceBytes[i]) * 16777619UL;
+        th08::psp::BootLog("SURFACE_DECODE_ERROR input=%lu source_hash=%08lx error=%.192s\n",
+                           static_cast<unsigned long>(size), sourceHash, IMG_GetError());
+#endif
         if (decoded != NULL) SDL_FreeSurface(decoded);
 #if defined(PSP)
         breadcrumb.stage = "image_decode";

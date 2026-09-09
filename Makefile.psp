@@ -3,6 +3,15 @@ export PSPDEV := /usr/local/pspdev
 
 TARGET := TH08PSP
 
+# Keep the existing diagnostic output by default. The no-log comparison only
+# removes log sinks; game data, saves, replay writes and exit rescue stay intact.
+TH08_PSP_LOGGING ?= 1
+ifeq ($(TH08_PSP_LOGGING),0)
+else ifeq ($(TH08_PSP_LOGGING),1)
+else
+$(error TH08_PSP_LOGGING must be 0 or 1)
+endif
+
 # Diagnostic builds retain the full frame/memory/audio observers.  Product
 # candidates set this to 0, which removes their translation units and replaces
 # the tracked allocator with an ownership-only implementation.
@@ -13,6 +22,8 @@ TH08_PSP_RUNTIME_TELEMETRY ?= 1
 # fixed aggregate counters, and writes one buffered line per 600 stage ticks.
 # A zero build does not compile the observer or wrap GE/display wait symbols.
 TH08_PSP_PERF_ATTRIBUTION ?= 0
+# Fixed RAM breadcrumb for unfinished main-thread waits; no per-frame I/O.
+TH08_PSP_WAIT_PROBE ?= 0
 
 # Default-off 1/16 presented-frame sampler which decomposes DrawChain by its
 # canonical priority callbacks.  It is a child of PERF_ATTRIBUTION so both
@@ -104,11 +115,8 @@ TH08_PSP_IO_SERIALIZE ?= 0
 ifneq ($(filter-out 0 1,$(TH08_PSP_IO_SERIALIZE)),)
 $(error TH08_PSP_IO_SERIALIZE must be 0 or 1)
 endif
-ifeq ($(TH08_PSP_IO_SERIALIZE),1)
-ifneq ($(TH08_PSP_GO_IO_LAMP),1)
-$(error TH08_PSP_IO_SERIALIZE=1 requires TH08_PSP_GO_IO_LAMP=1)
-endif
-endif
+# (The on-screen I/O lamp used to be mandatory with IO_SERIALIZE; the PSP Go has
+# a hardware lamp, so it is optional now.)
 # Stage ef0 transfers whose user buffer lies above 0x0A000000 through a low
 # 64 KiB buffer (R-051 candidate).  Requires TH08_PSP_IO_SERIALIZE.  Default OFF.
 TH08_PSP_IO_BOUNCE_HIGH ?= 0
@@ -123,6 +131,7 @@ $(error TH08_PSP_FONT_STREAM_CACHE must be 0 or 1)
 endif
 # Development aid: start a new game at the stage named in TH08PSP_DEBUG_STAGE.txt.
 TH08_PSP_DEBUG_START_STAGE ?= 0
+DEBUG_START_STAGE_CONFIG_STAMP = $(GENERATED_DIR)/debug-start-stage-$(TH08_PSP_DEBUG_START_STAGE).stamp
 ifneq ($(filter-out 0 1,$(TH08_PSP_DEBUG_START_STAGE)),)
 $(error TH08_PSP_DEBUG_START_STAGE must be 0 or 1)
 endif
@@ -141,6 +150,93 @@ TH08_PSP_ANM_TEXTURE_16BIT ?= 0
 ifneq ($(filter-out 0 1,$(TH08_PSP_ANM_TEXTURE_16BIT)),)
 $(error TH08_PSP_ANM_TEXTURE_16BIT must be 0 or 1)
 endif
+TH08_PSP_DRAW_NATIVE_PRIMS ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_DRAW_NATIVE_PRIMS)),)
+$(error TH08_PSP_DRAW_NATIVE_PRIMS must be 0 or 1)
+endif
+TH08_PSP_USAGE_METER ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_USAGE_METER)),)
+$(error TH08_PSP_USAGE_METER must be 0 or 1)
+endif
+TH08_PSP_BG_FAST_PROJECT ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_BG_FAST_PROJECT)),)
+$(error TH08_PSP_BG_FAST_PROJECT must be 0 or 1)
+endif
+TH08_PSP_ME_CORE ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_ME_CORE)),)
+$(error TH08_PSP_ME_CORE must be 0 or 1)
+endif
+TH08_PSP_ME_EFFECT_SHADOW ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_ME_EFFECT_SHADOW)),)
+$(error TH08_PSP_ME_EFFECT_SHADOW must be 0 or 1)
+endif
+# Background-effect quads built on the ME (capture after the calc chain,
+# consumed by DrawBackgroundEffects).  _AUDIT keeps the SC path and compares.
+TH08_PSP_ME_EFFECT_ADOPT ?= 0
+TH08_PSP_ME_EFFECT_ADOPT_AUDIT ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_ME_EFFECT_ADOPT)),)
+$(error TH08_PSP_ME_EFFECT_ADOPT must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_ME_EFFECT_ADOPT_AUDIT)),)
+$(error TH08_PSP_ME_EFFECT_ADOPT_AUDIT must be 0 or 1)
+endif
+# Bullet quads built on the ME straight into the direct-GE arena.  _AUDIT
+# keeps the SC path and compares.  Requires TH08_PSP_BULLET_DIRECT_GE.
+TH08_PSP_ME_BULLET_ADOPT ?= 0
+TH08_PSP_ME_BULLET_ADOPT_AUDIT ?= 0
+# Coalesce consecutive 4-vertex strip DrawPrimitiveUP calls (Background
+# Draw3D quads, GUI/ASCII squares) into one native indexed submit; requires
+# DRAW_NATIVE_PRIMS and PREPARE_STATE_CACHE.
+TH08_PSP_QUAD_BATCH ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_QUAD_BATCH)),)
+$(error TH08_PSP_QUAD_BATCH must be 0 or 1)
+endif
+# Hand PSPGL's partial command list to the GE every N draws (GE starts early).
+TH08_PSP_GE_KICK ?= 0
+TH08_PSP_GE_KICK_DRAWS ?= 6
+# Pre-transformed draws go straight into PSPGL's list as GE through-mode
+# primitives (no matrix reload, no per-draw PSPGL walk).
+TH08_PSP_GE_2D_DIRECT ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_GE_2D_DIRECT)),)
+$(error TH08_PSP_GE_2D_DIRECT must be 0 or 1)
+endif
+# Keep dialogue faces / loading / title textures out of the upper VRAM so the
+# per-frame hot set (bullets, effects, stage, player, HUD) is resident.
+TH08_PSP_GE4_HOT_TEXTURES ?= 0
+# Try only fresh tall boss portraits in unused lower eDRAM; never migrate them.
+TH08_PSP_PORTRAIT_LOWER_VRAM ?= 0
+ifeq ($(TH08_PSP_PORTRAIT_LOWER_VRAM),1)
+ifneq ($(TH08_PSP_GE4_HOT_TEXTURES)$(TH08_PSP_ANM_TEXTURE_16BIT),11)
+$(error TH08_PSP_PORTRAIT_LOWER_VRAM=1 requires GE4_HOT_TEXTURES=1 ANM_TEXTURE_16BIT=1)
+endif
+else ifneq ($(TH08_PSP_PORTRAIT_LOWER_VRAM),0)
+$(error TH08_PSP_PORTRAIT_LOWER_VRAM must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_GE4_HOT_TEXTURES)),)
+$(error TH08_PSP_GE4_HOT_TEXTURES must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_GE_KICK)),)
+$(error TH08_PSP_GE_KICK must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_ME_BULLET_ADOPT)),)
+$(error TH08_PSP_ME_BULLET_ADOPT must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_ME_BULLET_ADOPT_AUDIT)),)
+$(error TH08_PSP_ME_BULLET_ADOPT_AUDIT must be 0 or 1)
+endif
+# Background billboards / type-1 strips projected and fog-coloured on the ME.
+TH08_PSP_ME_BG_ADOPT ?= 0
+TH08_PSP_ME_BG_ADOPT_AUDIT ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_ME_BG_ADOPT)),)
+$(error TH08_PSP_ME_BG_ADOPT must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_ME_BG_ADOPT_AUDIT)),)
+$(error TH08_PSP_ME_BG_ADOPT_AUDIT must be 0 or 1)
+endif
+MECC_DIR := psp/third_party/me-custom-core
+MECC_BUILD_DIR := build/psp-generated/mecc
+MECC_LIB := $(MECC_BUILD_DIR)/libme-core.a
+MECC_INPUTS := $(wildcard $(MECC_DIR)/*.c $(MECC_DIR)/*.h $(MECC_DIR)/*.S $(MECC_DIR)/kernel/*.c $(MECC_DIR)/kernel/*.h $(MECC_DIR)/kernel/*.exp) $(MECC_DIR)/CMakeLists.txt $(MECC_DIR)/kernel/CMakeLists.txt
 # Redraw the dialogue background snapshot from Background::OnDraw instead of
 # BeginScene (R-045).  Default OFF.
 TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND ?= 0
@@ -172,6 +268,9 @@ TH08_PSP_SWAP_TRIPLE ?= 0
 # replays the record when the sprite/manager key is unchanged.  Exclusive.
 TH08_PSP_GUI_BORDER_REPLAY_AUDIT ?= 0
 TH08_PSP_GUI_BORDER_REPLAY ?= 0
+# Border replay through a persistent native (GE-ready) vertex buffer: one
+# indexed submit per texture instead of 123 sprite appends per frame.
+TH08_PSP_GUI_BORDER_NATIVE ?= 0
 
 # Product bullet collision negative gate proven by TH08_PSP_BULLET_COLLISION_GATE_AUDIT
 # (Codex handoff section 10): a bullet strictly separated from the canonical
@@ -219,6 +318,23 @@ else ifeq ($(TH08_PSP_PERF_ATTRIBUTION),0)
 PSP_PERF_ATTRIBUTION_SRCS :=
 else
 $(error TH08_PSP_PERF_ATTRIBUTION must be 0 or 1)
+endif
+
+ifeq ($(TH08_PSP_LOGGING),0)
+PSP_NOLOG_SRCS := psp/nolog_20260909_142801.cpp
+else
+PSP_NOLOG_SRCS :=
+endif
+
+ifeq ($(TH08_PSP_WAIT_PROBE),1)
+ifneq ($(TH08_PSP_PERF_ATTRIBUTION),1)
+$(error TH08_PSP_WAIT_PROBE=1 requires TH08_PSP_PERF_ATTRIBUTION=1)
+endif
+PSP_WAIT_PROBE_SRCS := psp/wait_probe.cpp
+else ifeq ($(TH08_PSP_WAIT_PROBE),0)
+PSP_WAIT_PROBE_SRCS :=
+else
+$(error TH08_PSP_WAIT_PROBE must be 0 or 1)
 endif
 
 ifeq ($(TH08_PSP_DRAW_PRIORITY_SUBPROFILE),1)
@@ -498,6 +614,8 @@ TH08_PORTABLE_SRCS := \
 PSP_HOST_SRCS := \
 	$(PSP_RUNTIME_TELEMETRY_SRCS) \
 	$(PSP_PERF_ATTRIBUTION_SRCS) \
+	$(PSP_WAIT_PROBE_SRCS) \
+	$(PSP_NOLOG_SRCS) \
 	$(PSP_DRAW_PRIORITY_SUBPROFILE_SRCS) \
 	$(PSP_ITEM_UPDATE_SUBPROFILE_SRCS) \
 	$(PSP_ITEM_ATAN2_SRCS) \
@@ -519,6 +637,7 @@ PSP_HOST_SRCS := \
 	psp/ge4_bridge.cpp \
 	psp/newlib_heap_geometry.cpp \
 	psp/render_cadence.cpp \
+	psp/auto_cadence.cpp \
 	psp/render_resource_arena.cpp \
 	psp/stage_pool_arena.cpp \
 	psp/x87_trig_cache.cpp \
@@ -527,6 +646,15 @@ PSP_HOST_SRCS := \
 	psp/fileio.cpp \
 	psp/debug_start_stage.cpp \
 	psp/backbuffer_shadow.cpp \
+	psp/usage_meter.cpp \
+	psp/me_worker.cpp \
+	psp/me_effect_shadow.cpp \
+	psp/me_effect_adopt.cpp \
+	psp/me_bullet_adopt.cpp \
+	psp/me_bg_adopt.cpp \
+	psp/me_bullet_move.cpp \
+	psp/me_popup.cpp \
+	psp/ge2d_direct.cpp \
 	psp/sdl_renderer_disabled.cpp \
 	psp/video.cpp \
 	psp/runtime_support.cpp
@@ -561,6 +689,14 @@ PSPGL_GE4_INDEXED_COPY_ARCHIVE_SHA256 := 3d63366aa076ee44627bcd5121cdb305c681601
 PSPGL_GE4_STREAM_ARENA_ARCHIVE := deps/pspgl-ge4/libGL_th08_ge4_streamarena_v1.a
 PSPGL_GE4_STREAM_ARENA_ARCHIVE_SIZE := 1680912
 PSPGL_GE4_STREAM_ARENA_ARCHIVE_SHA256 := a66904358c6449317ca2ca06a511c432a7b697db9021af3b0a4acf6b4319eb96
+# Stream-list variant (built from the stream-arena source plus
+# pspgl-th08-stream-list-v1.patch): two large lists streamed to the GE by
+# stall address instead of the 16 x 512-word enqueue ring.
+PSPGL_GE4_STREAM_LIST_ARCHIVE := deps/pspgl-ge4/libGL_th08_ge4_streamlist_v1.a
+PSPGL_GE4_STREAM_LIST_ARCHIVE_SIZE := 1684244
+PSPGL_GE4_STREAM_LIST_ARCHIVE_SHA256 := c2225961304d6d74c63398b2e9b23b9b818b084458354e5b9928310c9f03bdec
+PSPGL_STREAM_LIST_PATCH := deps/pspgl-ge4/pspgl-th08-stream-list-v1.patch
+PSPGL_STREAM_LIST_PATCH_SHA256 := 5cd243f5b2a9589e9798cf0f7f48e90b9eeebdd044531f425b76aa6525128574
 PSPGL_GE4_PATCH := deps/pspgl-ge4/pspgl-th08-ge4-v1.patch
 PSPGL_GE4_PATCH_SHA256 := b3f146b3c10c13424a386441726b11311a8b483627466aec0961de803184adb1
 PSPGL_NATIVE_SUBMIT_PATCH := deps/pspgl-ge4/pspgl-th08-native-submit-v3.patch
@@ -581,6 +717,7 @@ PSPGL_GE4_ARCHIVE_STAMP := build/psp-generated/pspgl_ge4_archive.ok
 PSPGL_GE4_MIXED_ARCHIVE_STAMP := build/psp-generated/pspgl_ge4_mixed_archive.ok
 PSPGL_GE4_INDEXED_COPY_ARCHIVE_STAMP := build/psp-generated/pspgl_ge4_indexed_copy_archive.ok
 PSPGL_GE4_STREAM_ARENA_ARCHIVE_STAMP := build/psp-generated/pspgl_ge4_stream_arena_archive.ok
+PSPGL_GE4_STREAM_LIST_ARCHIVE_STAMP := build/psp-generated/pspgl_ge4_stream_list_archive.ok
 PSPGL_GE4_LINK_STAMP := build/psp-generated/pspgl_ge4_link.ok
 NEWLIB_HEAP_ABI_STAMP := build/psp-generated/newlib_heap_abi.ok
 EXTRA_TARGETS := EBOOT.PBP $(NEWLIB_HEAP_ABI_STAMP) $(GE4_PROVEN_PRX)
@@ -589,6 +726,7 @@ EXTRA_CLEAN := TH08PSP.map build/psp-generated/i18n.hpp \
 	$(PSPGL_GE4_MIXED_ARCHIVE_STAMP) \
 	$(PSPGL_GE4_INDEXED_COPY_ARCHIVE_STAMP) \
 	$(PSPGL_GE4_STREAM_ARENA_ARCHIVE_STAMP) \
+	$(PSPGL_GE4_STREAM_LIST_ARCHIVE_STAMP) \
 	$(PSPGL_GE4_LINK_STAMP) $(GE4_PROVEN_PRX)
 
 TH08_UPSTREAM_COMMIT := a940881f97024c99ff387d2cb4c6650fb2bad97f
@@ -599,9 +737,47 @@ TH08_PSP_BUILD_ID ?= r022-ge4-pspgl-v1-20260901
 # Correctness builds keep the full schema-8 replay audit.  Set to 0 only for
 # production-load FPS runs; the config stamp prevents stale mixed objects.
 TH08_REPLAY_SYNC_AUDIT ?= 1
+# These optional observers create independent files; the no-log product must
+# not silently leave them running. Ordinary replay recording is unaffected.
+ifeq ($(TH08_PSP_LOGGING),0)
+ifneq ($(TH08_PSP_RUNTIME_TELEMETRY)$(TH08_REPLAY_SYNC_AUDIT)$(TH08_PSP_DEBUG_START_STAGE),000)
+$(error TH08_PSP_LOGGING=0 requires RUNTIME_TELEMETRY=0 REPLAY_SYNC_AUDIT=0 DEBUG_START_STAGE=0)
+endif
+endif
 # Presentation-only Allegrex VFPU path. Set to 0 for the pixel/FPS A/B; game
 # simulation, collision, RNG, and replay calculations never use this switch.
 TH08_PSP_RENDER_VFPU ?= 1
+TH08_PSP_QUAD_VFPU ?= 0
+TH08_PSP_QUAD_VFPU_AUDIT ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_QUAD_VFPU) $(TH08_PSP_QUAD_VFPU_AUDIT)),)
+$(error QUAD_VFPU and QUAD_VFPU_AUDIT must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_QUAD_VFPU_AUDIT),1)
+ifneq ($(TH08_PSP_QUAD_VFPU),1)
+$(error QUAD_VFPU_AUDIT requires QUAD_VFPU=1)
+endif
+endif
+QUAD_VFPU_CONFIG_STAMP = $(GENERATED_DIR)/quad-vfpu-$(TH08_PSP_QUAD_VFPU)-$(TH08_PSP_QUAD_VFPU_AUDIT)-$(TH08_PSP_BULLET_UPDATE_SUBPROFILE).stamp
+TH08_PSP_BULLET_UPDATE_SUBPROFILE ?= 0
+TH08_PSP_LASER_TRIG_CACHE ?= 0
+TH08_PSP_LASER_TRIG_AUDIT ?= 0
+TH08_PSP_REPLAY_SURFACE_RECOVERY ?= 0
+TH08_PSP_REPLAY_SURFACE_FAILS ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_LASER_TRIG_CACHE) $(TH08_PSP_LASER_TRIG_AUDIT) $(TH08_PSP_REPLAY_SURFACE_RECOVERY)),)
+$(error LASER_TRIG and REPLAY_SURFACE_RECOVERY flags must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1 3,$(TH08_PSP_REPLAY_SURFACE_FAILS)),)
+$(error REPLAY_SURFACE_FAILS must be 0, 1 or 3)
+endif
+ifeq ($(TH08_PSP_LASER_TRIG_AUDIT),1)
+ifneq ($(TH08_PSP_LASER_TRIG_CACHE),1)
+$(error LASER_TRIG_AUDIT requires LASER_TRIG_CACHE=1)
+endif
+endif
+R232_CONFIG_STAMP = $(GENERATED_DIR)/r232-$(TH08_PSP_LASER_TRIG_CACHE)-$(TH08_PSP_LASER_TRIG_AUDIT)-$(TH08_PSP_REPLAY_SURFACE_RECOVERY)-$(TH08_PSP_REPLAY_SURFACE_FAILS).stamp
+ifneq ($(filter-out 0 1,$(TH08_PSP_BULLET_UPDATE_SUBPROFILE)),)
+$(error BULLET_UPDATE_SUBPROFILE must be 0 or 1)
+endif
 # PSP-only memoization of the exact binary64 libm values used by the x87
 # compatibility gameplay wrappers.  It never substitutes approximate VFPU
 # math and remains default-off until replay, surface, hit-rate and FPS gates.
@@ -615,6 +791,23 @@ TH08_PSP_ANTITAMPER_SWAR ?= 0
 # the outer and inner vertices of zero-secondary-radius radial trails.  It has
 # no runtime storage and remains default-off until replay/surface/FPS gates.
 TH08_PSP_RADIAL_TRAIL_TRIG_REUSE ?= 0
+# Presentation-only: DrawRadialTrail uses single-precision table trig.
+TH08_PSP_RADIAL_TRAIL_FAST_TRIG ?= 0
+# BGM stream: refill every free chunk per notification, jump after an overrun,
+# and raise the refill thread priority above the main thread.
+TH08_PSP_BGM_CATCHUP ?= 0
+# Fired bullets with an idle transform program are advanced on the ME.
+TH08_PSP_ME_BULLET_MOVE ?= 0
+# Reserve the stage pool at boot below 32 MiB (the ME cannot address the extra memory).
+TH08_PSP_STAGE_POOL_LOW ?= 0
+# Score/time popups built on the ME (AUDIT: SC batch still draws, ME output compared).
+TH08_PSP_ME_POPUP ?= 0
+TH08_PSP_ME_POPUP_AUDIT ?= 0
+# Automatic 60/30/20 render cadence from measured frame cost (AUTO_CADENCE_PROMPT.md).
+TH08_PSP_AUTO_CADENCE ?= 0
+# Cache the per-region rotation trig inside Player::CheckBulletCancelCollision.
+TH08_PSP_CANCEL_TRIG_CACHE ?= 0
+TH08_PSP_ME_BULLET_MOVE_SHARE ?= 100
 # PSP-only callback2 scan bound for Reimu/Yukari's Fantasy Seal deathbomb.
 # BeginBombSpell still resets all 128 slots; only the update/draw scans use the
 # statically proven 0..17 live range. Keep default-off until replay/FPS gates.
@@ -623,6 +816,13 @@ TH08_PSP_FANTASY_SEAL_WORK_BOUNDS ?= 0
 # ascending update order remain authoritative; a bit only avoids touching a
 # known-empty 864-byte slot.  Keep default-off until replay/pixel/FPS gates.
 TH08_PSP_EFFECT_OCCUPANCY_FASTPATH ?= 0
+# PSP-only early reject of ordinary 2D background effects (drawGroup 4) whose
+# axis-aligned Draw2D quad cannot touch the viewport (bound = full sprite
+# extent + screen shake + rounding margin).  The original computes the quad
+# and culls it in DrawInner; skipping Draw2D draws the same nothing.  AUDIT
+# keeps drawing and counts early-cull decisions that produced a sprite.
+TH08_PSP_EFFECT_EARLY_CULL ?= 0
+TH08_PSP_EFFECT_EARLY_CULL_AUDIT ?= 0
 # PSP-only M0 observer for a future ordinary-Effect GE_SPRITES frontend.  It
 # always executes the canonical six-vertex Draw2D path and only compares a
 # shadow two-endpoint representation.  Keep default-off outside audit runs.
@@ -722,6 +922,11 @@ TH08_PSP_ITEM_NATURAL_NATIVE_COPY ?= 0
 # zero resident bytes.  Async/triple Present paths need a separate retirement
 # queue and are deliberately excluded.  Default OFF.
 TH08_PSP_PSPGL_STREAM_ARENA ?= 0
+# Select the stream-list PSPGL archive (see PSPGL_GE4_STREAM_LIST_ARCHIVE).
+TH08_PSP_PSPGL_STREAM_LIST ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_PSPGL_STREAM_LIST)),)
+$(error TH08_PSP_PSPGL_STREAM_LIST must be 0 or 1)
+endif
 ifneq ($(filter-out 0 1,$(TH08_PSP_PSPGL_STREAM_ARENA)),)
 $(error TH08_PSP_PSPGL_STREAM_ARENA must be 0 or 1)
 endif
@@ -750,9 +955,9 @@ ifeq ($(TH08_PSP_PSPGL_STREAM_ARENA),1)
 ifeq ($(TH08_PSP_SWAP_ASYNC),1)
 $(error TH08_PSP_PSPGL_STREAM_ARENA and TH08_PSP_SWAP_ASYNC are mutually exclusive)
 endif
-ifeq ($(TH08_PSP_SWAP_TRIPLE),1)
-$(error TH08_PSP_PSPGL_STREAM_ARENA and TH08_PSP_SWAP_TRIPLE are mutually exclusive)
-endif
+# SWAP_TRIPLE + STREAM_ARENA: the stream lease is recycled at the first draw of
+# the next frame, after the SwapTripleWaitPendingDone fence at the bullet
+# arena rollover (calc end); BeginPspglStreamArenaFrame fences again itself.
 endif
 # PSP-only Player shot/damage-region occupancy sidecar.  Keep the correctness
 # baseline off; set to 1 only for an isolated replay/pixel/FPS A/B run.  The
@@ -851,6 +1056,9 @@ TH08_PSP_LOCAL_FONT_SUBSET ?= 1
 # descriptor releases only on runtime model > 0 (Slim+/Go).  Model 0 and a
 # failed model query retain the established per-row flush.
 TH08_PSP_FONT_GLYPH_CACHE_RETAIN ?= 0
+# Reuse one converted coverage surface within a single GDI font descriptor.
+# No cross-row retention, changed blend math, or changed glyph-cache policy.
+TH08_PSP_TEXT_MASK_REUSE ?= 0
 
 GENERATED_DIR := build/psp-generated
 GENERATED_I18N := $(GENERATED_DIR)/i18n.hpp
@@ -882,6 +1090,19 @@ RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/radial-trail-trig-reuse-0.stamp \
 	$(GENERATED_DIR)/radial-trail-trig-reuse-1.stamp
 RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMP := $(GENERATED_DIR)/radial-trail-trig-reuse-$(TH08_PSP_RADIAL_TRAIL_TRIG_REUSE).stamp
+RADIAL_TRAIL_FAST_TRIG_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/radial-trail-fast-trig-0.stamp \
+	$(GENERATED_DIR)/radial-trail-fast-trig-1.stamp
+RADIAL_TRAIL_FAST_TRIG_CONFIG_STAMP := $(GENERATED_DIR)/radial-trail-fast-trig-$(TH08_PSP_RADIAL_TRAIL_FAST_TRIG).stamp
+BGM_CATCHUP_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/bgm-catchup-0.stamp \
+	$(GENERATED_DIR)/bgm-catchup-1.stamp
+BGM_CATCHUP_CONFIG_STAMP := $(GENERATED_DIR)/bgm-catchup-$(TH08_PSP_BGM_CATCHUP).stamp
+ME_BULLET_MOVE_CONFIG_STAMP := $(GENERATED_DIR)/me-bullet-move-$(TH08_PSP_ME_BULLET_MOVE)-$(TH08_PSP_ME_BULLET_MOVE_SHARE).stamp
+STAGE_POOL_LOW_CONFIG_STAMP := $(GENERATED_DIR)/stage-pool-low-$(TH08_PSP_STAGE_POOL_LOW).stamp
+ME_POPUP_CONFIG_STAMP := $(GENERATED_DIR)/me-popup-$(TH08_PSP_ME_POPUP)-$(TH08_PSP_ME_POPUP_AUDIT).stamp
+AUTO_CADENCE_CONFIG_STAMP := $(GENERATED_DIR)/auto-cadence-$(TH08_PSP_AUTO_CADENCE).stamp
+CANCEL_TRIG_CACHE_CONFIG_STAMP := $(GENERATED_DIR)/cancel-trig-cache-$(TH08_PSP_CANCEL_TRIG_CACHE).stamp
 FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/fantasy-seal-work-bounds-0.stamp \
 	$(GENERATED_DIR)/fantasy-seal-work-bounds-1.stamp
@@ -890,6 +1111,53 @@ EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/effect-occupancy-fastpath-0.stamp \
 	$(GENERATED_DIR)/effect-occupancy-fastpath-1.stamp
 EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/effect-occupancy-fastpath-$(TH08_PSP_EFFECT_OCCUPANCY_FASTPATH).stamp
+EFFECT_EARLY_CULL_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/effect-early-cull-0.stamp \
+	$(GENERATED_DIR)/effect-early-cull-1.stamp
+EFFECT_EARLY_CULL_CONFIG_STAMP := $(GENERATED_DIR)/effect-early-cull-$(TH08_PSP_EFFECT_EARLY_CULL).stamp
+EFFECT_EARLY_CULL_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/effect-early-cull-audit-0.stamp \
+	$(GENERATED_DIR)/effect-early-cull-audit-1.stamp
+EFFECT_EARLY_CULL_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/effect-early-cull-audit-$(TH08_PSP_EFFECT_EARLY_CULL_AUDIT).stamp
+ME_EFFECT_ADOPT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/me-effect-adopt-0.stamp \
+	$(GENERATED_DIR)/me-effect-adopt-1.stamp
+ME_EFFECT_ADOPT_CONFIG_STAMP := $(GENERATED_DIR)/me-effect-adopt-$(TH08_PSP_ME_EFFECT_ADOPT).stamp
+ME_EFFECT_ADOPT_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/me-effect-adopt-audit-0.stamp \
+	$(GENERATED_DIR)/me-effect-adopt-audit-1.stamp
+ME_EFFECT_ADOPT_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/me-effect-adopt-audit-$(TH08_PSP_ME_EFFECT_ADOPT_AUDIT).stamp
+ME_BULLET_ADOPT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/me-bullet-adopt-0.stamp \
+	$(GENERATED_DIR)/me-bullet-adopt-1.stamp
+ME_BULLET_ADOPT_CONFIG_STAMP := $(GENERATED_DIR)/me-bullet-adopt-$(TH08_PSP_ME_BULLET_ADOPT).stamp
+ME_BULLET_ADOPT_AUDIT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/me-bullet-adopt-audit-0.stamp \
+	$(GENERATED_DIR)/me-bullet-adopt-audit-1.stamp
+ME_BULLET_ADOPT_AUDIT_CONFIG_STAMP := $(GENERATED_DIR)/me-bullet-adopt-audit-$(TH08_PSP_ME_BULLET_ADOPT_AUDIT).stamp
+ME_BG_ADOPT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/me-bg-adopt-0-0.stamp \
+	$(GENERATED_DIR)/me-bg-adopt-1-0.stamp \
+	$(GENERATED_DIR)/me-bg-adopt-0-1.stamp
+ME_BG_ADOPT_CONFIG_STAMP := $(GENERATED_DIR)/me-bg-adopt-$(TH08_PSP_ME_BG_ADOPT)-$(TH08_PSP_ME_BG_ADOPT_AUDIT).stamp
+QUAD_BATCH_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/quad-batch-0.stamp \
+	$(GENERATED_DIR)/quad-batch-1.stamp
+QUAD_BATCH_CONFIG_STAMP := $(GENERATED_DIR)/quad-batch-$(TH08_PSP_QUAD_BATCH).stamp
+GE_KICK_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/ge-kick-0-0.stamp \
+	$(GENERATED_DIR)/ge-kick-1-$(TH08_PSP_GE_KICK_DRAWS).stamp
+GE_KICK_CONFIG_STAMP := $(GENERATED_DIR)/ge-kick-$(TH08_PSP_GE_KICK)-$(if $(filter 1,$(TH08_PSP_GE_KICK)),$(TH08_PSP_GE_KICK_DRAWS),0).stamp
+GE_2D_DIRECT_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/ge-2d-direct-0.stamp \
+	$(GENERATED_DIR)/ge-2d-direct-1.stamp
+GE_2D_DIRECT_CONFIG_STAMP := $(GENERATED_DIR)/ge-2d-direct-$(TH08_PSP_GE_2D_DIRECT).stamp
+GE4_HOT_TEXTURES_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/ge4-hot-textures-0.stamp \
+	$(GENERATED_DIR)/ge4-hot-textures-1.stamp
+GE4_HOT_TEXTURES_CONFIG_STAMP := $(GENERATED_DIR)/ge4-hot-textures-$(TH08_PSP_GE4_HOT_TEXTURES).stamp
+PORTRAIT_LOWER_CONFIG_STAMPS := $(GENERATED_DIR)/portrait-lower-0.stamp $(GENERATED_DIR)/portrait-lower-1.stamp
+PORTRAIT_LOWER_CONFIG_STAMP := $(GENERATED_DIR)/portrait-lower-$(TH08_PSP_PORTRAIT_LOWER_VRAM).stamp
 EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/effect-occupancy-audit-0.stamp \
 	$(GENERATED_DIR)/effect-occupancy-audit-1.stamp
@@ -1086,6 +1354,10 @@ PERF_ATTRIBUTION_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/perf-attribution-0.stamp \
 	$(GENERATED_DIR)/perf-attribution-1.stamp
 PERF_ATTRIBUTION_CONFIG_STAMP := $(GENERATED_DIR)/perf-attribution-$(TH08_PSP_PERF_ATTRIBUTION).stamp
+WAIT_PROBE_CONFIG_STAMPS := $(GENERATED_DIR)/wait-probe-0.stamp $(GENERATED_DIR)/wait-probe-1.stamp
+WAIT_PROBE_CONFIG_STAMP := $(GENERATED_DIR)/wait-probe-$(TH08_PSP_WAIT_PROBE).stamp
+LOGGING_CONFIG_STAMPS := $(GENERATED_DIR)/logging-0.stamp $(GENERATED_DIR)/logging-1.stamp
+LOGGING_CONFIG_STAMP := $(GENERATED_DIR)/logging-$(TH08_PSP_LOGGING).stamp
 DRAW_PRIORITY_SUBPROFILE_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/draw-priority-subprofile-0.stamp \
 	$(GENERATED_DIR)/draw-priority-subprofile-1.stamp
@@ -1162,6 +1434,10 @@ GUI_BORDER_REPLAY_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/gui-border-replay-0.stamp \
 	$(GENERATED_DIR)/gui-border-replay-1.stamp
 GUI_BORDER_REPLAY_CONFIG_STAMP := $(GENERATED_DIR)/gui-border-replay-$(TH08_PSP_GUI_BORDER_REPLAY).stamp
+GUI_BORDER_NATIVE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/gui-border-native-0.stamp \
+	$(GENERATED_DIR)/gui-border-native-1.stamp
+GUI_BORDER_NATIVE_CONFIG_STAMP := $(GENERATED_DIR)/gui-border-native-$(TH08_PSP_GUI_BORDER_NATIVE).stamp
 RENDER_CADENCE_INITIAL_MODE_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/render-cadence-initial-mode-0.stamp \
 	$(GENERATED_DIR)/render-cadence-initial-mode-1.stamp \
@@ -1179,6 +1455,8 @@ FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/font-glyph-cache-retain-0.stamp \
 	$(GENERATED_DIR)/font-glyph-cache-retain-1.stamp
 FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMP := $(GENERATED_DIR)/font-glyph-cache-retain-$(TH08_PSP_FONT_GLYPH_CACHE_RETAIN).stamp
+TEXT_MASK_REUSE_CONFIG_STAMPS := $(GENERATED_DIR)/text-mask-reuse-0.stamp $(GENERATED_DIR)/text-mask-reuse-1.stamp
+TEXT_MASK_REUSE_CONFIG_STAMP := $(GENERATED_DIR)/text-mask-reuse-$(TH08_PSP_TEXT_MASK_REUSE).stamp
 GO_IO_LAMP_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/go-io-lamp-0.stamp \
 	$(GENERATED_DIR)/go-io-lamp-1.stamp
@@ -1209,8 +1487,22 @@ EXTRA_CLEAN += $(GE4_MODEL_GATE_CONFIG_STAMPS) \
 	$(X87_TRIG_CACHE_CONFIG_STAMPS) \
 	$(ANTITAMPER_SWAR_CONFIG_STAMPS) \
 	$(RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMPS) \
+	$(RADIAL_TRAIL_FAST_TRIG_CONFIG_STAMPS) \
+	$(BGM_CATCHUP_CONFIG_STAMPS) \
 	$(FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMPS) \
 	$(EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMPS) \
+	$(EFFECT_EARLY_CULL_CONFIG_STAMPS) \
+	$(EFFECT_EARLY_CULL_AUDIT_CONFIG_STAMPS) \
+	$(ME_EFFECT_ADOPT_CONFIG_STAMPS) \
+	$(ME_EFFECT_ADOPT_AUDIT_CONFIG_STAMPS) \
+	$(ME_BULLET_ADOPT_CONFIG_STAMPS) \
+	$(ME_BULLET_ADOPT_AUDIT_CONFIG_STAMPS) \
+	$(ME_BG_ADOPT_CONFIG_STAMPS) \
+	$(QUAD_BATCH_CONFIG_STAMPS) \
+	$(GE_KICK_CONFIG_STAMPS) \
+	$(GE_2D_DIRECT_CONFIG_STAMPS) \
+	$(GE4_HOT_TEXTURES_CONFIG_STAMPS) \
+	$(PORTRAIT_LOWER_CONFIG_STAMPS) \
 	$(EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMPS) \
 	$(EFFECT_SPRITE_PAIR_AUDIT_CONFIG_STAMPS) \
 	$(EFFECT_SPRITE_PAIR_FASTPATH_CONFIG_STAMPS) \
@@ -1258,6 +1550,7 @@ EXTRA_CLEAN += $(GE4_MODEL_GATE_CONFIG_STAMPS) \
 	$(STAGE_RELATIVE_PERF_SAMPLING_CONFIG_STAMPS) \
 	$(RUNTIME_TELEMETRY_CONFIG_STAMPS) \
 	$(PERF_ATTRIBUTION_CONFIG_STAMPS) \
+	$(LOGGING_CONFIG_STAMPS) \
 	$(DRAW_PRIORITY_SUBPROFILE_CONFIG_STAMPS) \
 	$(ITEM_UPDATE_SUBPROFILE_CONFIG_STAMPS) \
 	$(ITEM_ATAN2_FASTPATH_AUDIT_CONFIG_STAMPS) \
@@ -1277,10 +1570,12 @@ EXTRA_CLEAN += $(GE4_MODEL_GATE_CONFIG_STAMPS) \
 	$(SWAP_TRIPLE_CONFIG_STAMPS) \
 	$(GUI_BORDER_REPLAY_AUDIT_CONFIG_STAMPS) \
 	$(GUI_BORDER_REPLAY_CONFIG_STAMPS) \
+	$(GUI_BORDER_NATIVE_CONFIG_STAMPS) \
 	$(RENDER_CADENCE_INITIAL_MODE_CONFIG_STAMPS) \
 	$(BOOT_PARITY_CONFIG_STAMPS) \
 	$(FONT_SUBSET_CONFIG_STAMPS) \
 	$(FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMPS) \
+	$(TEXT_MASK_REUSE_CONFIG_STAMPS) \
 	$(GO_IO_LAMP_CONFIG_STAMPS) psp/io_activity_lamp.o \
 	$(IO_SERIALIZE_CONFIG_STAMPS) $(DIALOGUE_SNAPSHOT_AT_BACKGROUND_CONFIG_STAMPS) \
 	$(DIALOGUE_LIVE_BACKGROUND_CONFIG_STAMPS) $(IO_BOUNCE_HIGH_CONFIG_STAMPS) \
@@ -1297,6 +1592,8 @@ CXXFLAGS := -std=gnu++17 -O2 -G0 -march=allegrex -mtune=allegrex \
 	-DPSP -DTH08_PSP_PORT=1 -DTH08_PSP_SC_ONLY=1 -DTH08_PSP_STAGE_POOL_ARENA=1 \
 	-DTH08_PSP_RUNTIME_TELEMETRY=$(TH08_PSP_RUNTIME_TELEMETRY) \
 	-DTH08_PSP_PERF_ATTRIBUTION=$(TH08_PSP_PERF_ATTRIBUTION) \
+	-DTH08_PSP_WAIT_PROBE=$(TH08_PSP_WAIT_PROBE) \
+	-DTH08_PSP_LOGGING=$(TH08_PSP_LOGGING) \
 	-DTH08_PSP_RENDER_CADENCE_INITIAL_MODE=$(TH08_PSP_RENDER_CADENCE_INITIAL_MODE) \
 	-DTH08_PSP_NEWLIB_4_5_0_DLMALLOC=1 -DTH08_PSP_NEWLIB_MALLOC_ALIGNMENT=16 \
 	-DTH08_MODERN_PORT -DTH08_MODERN_LINUX -DWIN32_LEAN_AND_MEAN \
@@ -1398,6 +1695,57 @@ endif
 ifeq ($(TH08_PSP_ANM_TEXTURE_16BIT),1)
 CXXFLAGS += -DTH08_PSP_ANM_TEXTURE_16BIT=1
 endif
+ifeq ($(TH08_PSP_DRAW_NATIVE_PRIMS),1)
+CXXFLAGS += -DTH08_PSP_DRAW_NATIVE_PRIMS=1
+endif
+ifeq ($(TH08_PSP_USAGE_METER),1)
+CXXFLAGS += -DTH08_PSP_USAGE_METER=1
+endif
+ifeq ($(TH08_PSP_BG_FAST_PROJECT),1)
+CXXFLAGS += -DTH08_PSP_BG_FAST_PROJECT=1
+endif
+ifeq ($(TH08_PSP_ME_CORE),1)
+CXXFLAGS += -DTH08_PSP_ME_CORE=1 -I$(MECC_DIR)
+endif
+ifeq ($(TH08_PSP_ME_EFFECT_SHADOW),1)
+CXXFLAGS += -DTH08_PSP_ME_EFFECT_SHADOW=1
+endif
+ifeq ($(TH08_PSP_ME_EFFECT_ADOPT),1)
+CXXFLAGS += -DTH08_PSP_ME_EFFECT_ADOPT=1
+endif
+ifeq ($(TH08_PSP_ME_EFFECT_ADOPT_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_ME_EFFECT_ADOPT_AUDIT=1
+endif
+ifeq ($(TH08_PSP_ME_BULLET_ADOPT),1)
+CXXFLAGS += -DTH08_PSP_ME_BULLET_ADOPT=1
+endif
+ifeq ($(TH08_PSP_ME_BULLET_ADOPT_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_ME_BULLET_ADOPT_AUDIT=1
+endif
+ifeq ($(TH08_PSP_ME_BG_ADOPT),1)
+CXXFLAGS += -DTH08_PSP_ME_BG_ADOPT=1
+endif
+ifeq ($(TH08_PSP_ME_BG_ADOPT_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_ME_BG_ADOPT_AUDIT=1
+endif
+ifeq ($(TH08_PSP_QUAD_BATCH),1)
+CXXFLAGS += -DTH08_PSP_QUAD_BATCH=1
+endif
+ifeq ($(TH08_PSP_GE_KICK),1)
+CXXFLAGS += -DTH08_PSP_GE_KICK=1 -DTH08_PSP_GE_KICK_DRAWS=$(TH08_PSP_GE_KICK_DRAWS)
+endif
+ifeq ($(TH08_PSP_GE_2D_DIRECT),1)
+CXXFLAGS += -DTH08_PSP_GE_2D_DIRECT=1
+endif
+ifeq ($(TH08_PSP_GE4_HOT_TEXTURES),1)
+CXXFLAGS += -DTH08_PSP_GE4_HOT_TEXTURES=1
+endif
+CXXFLAGS += -DTH08_PSP_PORTRAIT_LOWER_VRAM=$(TH08_PSP_PORTRAIT_LOWER_VRAM)
+ifeq ($(TH08_PSP_PORTRAIT_LOWER_VRAM),1)
+ifneq ($(TH08_PSP_DIALOGUE_SNAPSHOT_NO_PROMOTE),1)
+$(error TH08_PSP_PORTRAIT_LOWER_VRAM=1 requires DIALOGUE_SNAPSHOT_NO_PROMOTE=1)
+endif
+endif
 ifeq ($(TH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND),1)
 CXXFLAGS += -DTH08_PSP_DIALOGUE_SNAPSHOT_AT_BACKGROUND=1
 endif
@@ -1410,9 +1758,15 @@ endif
 ifeq ($(TH08_PSP_GUI_BORDER_REPLAY),1)
 CXXFLAGS += -DTH08_PSP_GUI_BORDER_REPLAY=1
 endif
+ifeq ($(TH08_PSP_GUI_BORDER_NATIVE),1)
+CXXFLAGS += -DTH08_PSP_GUI_BORDER_NATIVE=1
+else ifneq ($(TH08_PSP_GUI_BORDER_NATIVE),0)
+$(error TH08_PSP_GUI_BORDER_NATIVE must be 0 or 1)
+endif
 # The flip thread reads PSPGL's surface through the vendored internal headers.
 psp/swap_async.o: CXXFLAGS += -Ideps/pspgl-ge4/include
 psp/swap_triple.o: CXXFLAGS += -Ideps/pspgl-ge4/include
+psp/ge2d_direct.o: CXXFLAGS += -Ideps/pspgl-ge4/include
 # The double-float atan2 and sin/cos rely on exact IEEE binary32 add/mul
 # rounding.  Allegrex has no fused multiply-add, but pin the contract on the
 # objects that instantiate the headers so a toolchain change cannot silently fuse.
@@ -1428,6 +1782,12 @@ CXXFLAGS += -DTH08_REPLAY_SYNC_AUDIT=1
 else ifneq ($(TH08_REPLAY_SYNC_AUDIT),0)
 $(error TH08_REPLAY_SYNC_AUDIT must be 0 or 1)
 endif
+
+CXXFLAGS += -DTH08_PSP_QUAD_VFPU=$(TH08_PSP_QUAD_VFPU) -DTH08_PSP_QUAD_VFPU_AUDIT=$(TH08_PSP_QUAD_VFPU_AUDIT)
+CXXFLAGS += -DTH08_PSP_BULLET_UPDATE_SUBPROFILE=$(TH08_PSP_BULLET_UPDATE_SUBPROFILE)
+CXXFLAGS += -DTH08_PSP_LASER_TRIG_CACHE=$(TH08_PSP_LASER_TRIG_CACHE) -DTH08_PSP_LASER_TRIG_AUDIT=$(TH08_PSP_LASER_TRIG_AUDIT)
+CXXFLAGS += -DTH08_PSP_REPLAY_SURFACE_RECOVERY=$(TH08_PSP_REPLAY_SURFACE_RECOVERY) -DTH08_PSP_REPLAY_SURFACE_FAILS=$(TH08_PSP_REPLAY_SURFACE_FAILS)
+src/Player.o src/BulletManager.o: CXXFLAGS += -ffp-contract=off
 
 ifeq ($(TH08_PSP_RENDER_VFPU),1)
 CXXFLAGS += -DTH08_PSP_RENDER_VFPU=1
@@ -1452,6 +1812,80 @@ CXXFLAGS += -DTH08_PSP_RADIAL_TRAIL_TRIG_REUSE=1
 else ifneq ($(TH08_PSP_RADIAL_TRAIL_TRIG_REUSE),0)
 $(error TH08_PSP_RADIAL_TRAIL_TRIG_REUSE must be 0 or 1)
 endif
+ifeq ($(TH08_PSP_RADIAL_TRAIL_FAST_TRIG),1)
+CXXFLAGS += -DTH08_PSP_RADIAL_TRAIL_FAST_TRIG=1
+else ifneq ($(TH08_PSP_RADIAL_TRAIL_FAST_TRIG),0)
+$(error TH08_PSP_RADIAL_TRAIL_FAST_TRIG must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_BGM_CATCHUP),1)
+CXXFLAGS += -DTH08_PSP_BGM_CATCHUP=1
+else ifneq ($(TH08_PSP_BGM_CATCHUP),0)
+$(error TH08_PSP_BGM_CATCHUP must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_ME_BULLET_MOVE),1)
+CXXFLAGS += -DTH08_PSP_ME_BULLET_MOVE=1 -DTH08_PSP_ME_BULLET_MOVE_SHARE=$(TH08_PSP_ME_BULLET_MOVE_SHARE)
+else ifneq ($(TH08_PSP_ME_BULLET_MOVE),0)
+$(error TH08_PSP_ME_BULLET_MOVE must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_STAGE_POOL_LOW),1)
+CXXFLAGS += -DTH08_PSP_STAGE_POOL_LOW=1
+else ifneq ($(TH08_PSP_STAGE_POOL_LOW),0)
+$(error TH08_PSP_STAGE_POOL_LOW must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_ME_POPUP),1)
+CXXFLAGS += -DTH08_PSP_ME_POPUP=1
+endif
+ifeq ($(TH08_PSP_ME_POPUP_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_ME_POPUP_AUDIT=1
+endif
+# HUD text (score/graze/point/time strings) as one indexed quad batch per
+# string instead of one sprite draw per glyph; AUDIT draws canonically and
+# compares the quads.
+TH08_PSP_HUD_TEXT_NATIVE ?= 0
+TH08_PSP_HUD_TEXT_NATIVE_AUDIT ?= 0
+TH08_PSP_HUD_TEXT_BATCH ?= 0
+TH08_PSP_HUD_TEXT_STREAM_AUDIT ?= 0
+TH08_PSP_SUBMIT_SUBPROFILE ?= 0
+ifeq ($(TH08_PSP_HUD_TEXT_BATCH),1)
+ifneq ($(TH08_PSP_HUD_TEXT_NATIVE),1)
+$(error TH08_PSP_HUD_TEXT_BATCH requires TH08_PSP_HUD_TEXT_NATIVE=1)
+endif
+CXXFLAGS += -DTH08_PSP_HUD_TEXT_BATCH=1
+else ifneq ($(TH08_PSP_HUD_TEXT_BATCH),0)
+$(error TH08_PSP_HUD_TEXT_BATCH must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_HUD_TEXT_STREAM_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_HUD_TEXT_STREAM_AUDIT=1
+endif
+ifeq ($(TH08_PSP_SUBMIT_SUBPROFILE),1)
+ifneq ($(TH08_PSP_BULLET_DIRECT_GE)$(TH08_PSP_PREPARE_STATE_CACHE),11)
+$(error TH08_PSP_SUBMIT_SUBPROFILE requires BULLET_DIRECT_GE=1 and PREPARE_STATE_CACHE=1)
+endif
+CXXFLAGS += -DTH08_PSP_SUBMIT_SUBPROFILE=1
+endif
+HUD_SUBMIT_CONFIG_STAMP := $(GENERATED_DIR)/hud-submit-$(TH08_PSP_HUD_TEXT_NATIVE)-$(TH08_PSP_HUD_TEXT_NATIVE_AUDIT)-$(TH08_PSP_HUD_TEXT_BATCH)-$(TH08_PSP_HUD_TEXT_STREAM_AUDIT)-$(TH08_PSP_SUBMIT_SUBPROFILE).stamp
+ifeq ($(TH08_PSP_HUD_TEXT_NATIVE),1)
+CXXFLAGS += -DTH08_PSP_HUD_TEXT_NATIVE=1
+endif
+# HUD front sprites (frame pieces, difficulty, stars, bottom strip) recorded
+# once and replayed as one indexed GE batch while their inputs are unchanged.
+TH08_PSP_GUI_FRONT_NATIVE ?= 0
+ifeq ($(TH08_PSP_GUI_FRONT_NATIVE),1)
+CXXFLAGS += -DTH08_PSP_GUI_FRONT_NATIVE=1
+endif
+ifeq ($(TH08_PSP_HUD_TEXT_NATIVE_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_HUD_TEXT_NATIVE_AUDIT=1
+endif
+ifeq ($(TH08_PSP_AUTO_CADENCE),1)
+CXXFLAGS += -DTH08_PSP_AUTO_CADENCE=1
+else ifneq ($(TH08_PSP_AUTO_CADENCE),0)
+$(error TH08_PSP_AUTO_CADENCE must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_CANCEL_TRIG_CACHE),1)
+CXXFLAGS += -DTH08_PSP_CANCEL_TRIG_CACHE=1
+else ifneq ($(TH08_PSP_CANCEL_TRIG_CACHE),0)
+$(error TH08_PSP_CANCEL_TRIG_CACHE must be 0 or 1)
+endif
 
 ifeq ($(TH08_PSP_FANTASY_SEAL_WORK_BOUNDS),1)
 CXXFLAGS += -DTH08_PSP_FANTASY_SEAL_WORK_BOUNDS=1
@@ -1466,6 +1900,16 @@ ifeq ($(TH08_PSP_EFFECT_OCCUPANCY_FASTPATH),1)
 CXXFLAGS += -DTH08_PSP_EFFECT_OCCUPANCY_FASTPATH=1
 else ifneq ($(TH08_PSP_EFFECT_OCCUPANCY_FASTPATH),0)
 $(error TH08_PSP_EFFECT_OCCUPANCY_FASTPATH must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_EFFECT_EARLY_CULL),1)
+CXXFLAGS += -DTH08_PSP_EFFECT_EARLY_CULL=1
+else ifneq ($(TH08_PSP_EFFECT_EARLY_CULL),0)
+$(error TH08_PSP_EFFECT_EARLY_CULL must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_EFFECT_EARLY_CULL_AUDIT),1)
+CXXFLAGS += -DTH08_PSP_EFFECT_EARLY_CULL_AUDIT=1
+else ifneq ($(TH08_PSP_EFFECT_EARLY_CULL_AUDIT),0)
+$(error TH08_PSP_EFFECT_EARLY_CULL_AUDIT must be 0 or 1)
 endif
 
 ifeq ($(TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT),1)
@@ -1925,6 +2369,14 @@ else
 $(error TH08_PSP_FONT_GLYPH_CACHE_RETAIN must be 0 or 1)
 endif
 
+ifeq ($(TH08_PSP_TEXT_MASK_REUSE),1)
+CXXFLAGS += -DTH08_PSP_TEXT_MASK_REUSE=1
+else ifeq ($(TH08_PSP_TEXT_MASK_REUSE),0)
+CXXFLAGS += -DTH08_PSP_TEXT_MASK_REUSE=0
+else
+$(error TH08_PSP_TEXT_MASK_REUSE must be 0 or 1)
+endif
+
 LDFLAGS := -Wl,-Map,TH08PSP.map -Wl,--wrap=memalign -Wl,--wrap=malloc \
 	-Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free \
 	-Wl,--require-defined=__malloc_av_ \
@@ -1932,8 +2384,15 @@ LDFLAGS := -Wl,-Map,TH08PSP.map -Wl,--wrap=memalign -Wl,--wrap=malloc \
 	-Wl,--require-defined=__malloc_current_mallinfo \
 	-Wl,--require-defined=__malloc_lock -Wl,--require-defined=__malloc_unlock
 
+ifeq ($(TH08_PSP_LOGGING),0)
+LDFLAGS += -Wl,--wrap=__pspgl_log -Wl,--wrap=sceIoOpen
+endif
+
 ifeq ($(TH08_PSP_PERF_ATTRIBUTION),1)
 LDFLAGS += -Wl,--wrap=sceGeListSync -Wl,--wrap=sceDisplayWaitVblankStart
+endif
+ifeq ($(TH08_PSP_WAIT_PROBE),1)
+LDFLAGS += -Wl,--wrap=sceGeDrawSync
 endif
 ifneq ($(TH08_PSP_PERF_ENV)$(TH08_PSP_SWAP_TRIPLE),00)
 # GE queue observer / triple-buffer flip poll: every PSPGL list submission.
@@ -1969,10 +2428,19 @@ endif
 PSPGL_GE4_SELECTED_ARCHIVE := $(PSPGL_GE4_STREAM_ARENA_ARCHIVE)
 PSPGL_GE4_SELECTED_ARCHIVE_STAMP := $(PSPGL_GE4_STREAM_ARENA_ARCHIVE_STAMP)
 endif
+ifeq ($(TH08_PSP_PSPGL_STREAM_LIST),1)
+ifneq ($(TH08_PSP_PSPGL_STREAM_ARENA),1)
+$(error TH08_PSP_PSPGL_STREAM_LIST=1 requires TH08_PSP_PSPGL_STREAM_ARENA=1)
+endif
+PSPGL_GE4_SELECTED_ARCHIVE := $(PSPGL_GE4_STREAM_LIST_ARCHIVE)
+PSPGL_GE4_SELECTED_ARCHIVE_STAMP := $(PSPGL_GE4_STREAM_LIST_ARCHIVE_STAMP)
+CXXFLAGS += -DTH08_PSP_PSPGL_STREAM_LIST=1
+endif
 
 # SC-only is an intentional link contract for the first playable target.  Do
 # not add me-core, MIST, ME task/audio, or any Media Engine support here.
 LIBS := -lSDL2_image -lSDL2_ttf -lSDL2main -lSDL2 $(PSPGL_GE4_SELECTED_ARCHIVE) \
+	$(if $(filter 1,$(TH08_PSP_ME_CORE)),-L$(MECC_BUILD_DIR) -lme-core,) \
 	-lharfbuzz -lfreetype -lbz2 -lpng16 -ljpeg -lz \
 	-lpspvram -lpspaudio -lpspvfpu -lpspgum_vfpu -lpspmath \
 	-lpspdisplay -lpspgu -lpspge -lpsphprm -lpspctrl -lpsppower \
@@ -2041,6 +2509,40 @@ $(PSPGL_GE4_STREAM_ARENA_ARCHIVE_STAMP): \
 	@strings $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | grep -Fxq '$(PSPGL_GE4_MARKER)'
 	@strings $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | grep -Fxq '$(PSPGL_NATIVE_SUBMIT_MARKER)'
 	@strings $(PSPGL_GE4_STREAM_ARENA_ARCHIVE) | grep -Fxq '$(PSPGL_STREAM_ARENA_MARKER)'
+	@touch $@
+
+$(PSPGL_GE4_STREAM_LIST_ARCHIVE_STAMP): \
+		$(PSPGL_GE4_STREAM_LIST_ARCHIVE) \
+		$(PSPGL_STREAM_LIST_PATCH) $(PSPGL_GE4_ARCHIVE_STAMP) \
+		$(PSPGL_GE4_LICENSE) deps/pspgl-ge4/README.md
+	@mkdir -p $(dir $@)
+	@test "$$(wc -c < "$(PSPGL_GE4_STREAM_LIST_ARCHIVE)")" -eq "$(PSPGL_GE4_STREAM_LIST_ARCHIVE_SIZE)"
+	@test "$$(sha256sum "$(PSPGL_GE4_STREAM_LIST_ARCHIVE)" | awk '{print $$1}')" = "$(PSPGL_GE4_STREAM_LIST_ARCHIVE_SHA256)"
+	@test "$$(sha256sum "$(PSPGL_STREAM_LIST_PATCH)" | awk '{print $$1}')" = "$(PSPGL_STREAM_LIST_PATCH_SHA256)"
+	@test "$$(sha256sum "$(PSPGL_GE4_LICENSE)" | awk '{print $$1}')" = "$(PSPGL_GE4_LICENSE_SHA256)"
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_texobj_promote_upper$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_ge4_fork_marker$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_indexed_triangles$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_dlist_kick$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_stream_list_marker$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_draw_native_sprite_pairs_copy$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_native_submit_marker$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_stream_arena_install$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | \
+		grep -Eq '[[:space:]]T[[:space:]]+__pspgl_th08_stream_arena_begin_frame$$'
+	@$(PSPDEV)/bin/psp-nm -g --defined-only $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | \
+		grep -Eq '[[:space:]]R[[:space:]]+__pspgl_th08_stream_arena_marker$$'
+	@strings $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | grep -Fxq '$(PSPGL_GE4_MARKER)'
+	@strings $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | grep -Fxq '$(PSPGL_NATIVE_SUBMIT_MARKER)'
+	@strings $(PSPGL_GE4_STREAM_LIST_ARCHIVE) | grep -Fxq '$(PSPGL_STREAM_ARENA_MARKER)'
 	@touch $@
 
 $(PSPGL_GE4_MIXED_ARCHIVE_STAMP): $(PSPGL_GE4_MIXED_ARCHIVE) \
@@ -2192,6 +2694,27 @@ $(RENDER_VFPU_CONFIG_STAMP):
 	@rm -f $(filter-out $@,$(RENDER_VFPU_CONFIG_STAMPS))
 	@touch $@
 
+$(QUAD_VFPU_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(GENERATED_DIR)/quad-vfpu-*.stamp
+	@touch $@
+src/AnmManager.o src/BulletManager.o src/modern/linux/d3d8_compat.o psp/main.o: $(QUAD_VFPU_CONFIG_STAMP)
+
+$(R232_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(GENERATED_DIR)/r232-*.stamp
+	@touch $@
+src/Player.o src/BulletManager.o src/TitleScreen.o src/AnmManager.o src/modern/linux/d3dx8_compat.o psp/main.o: $(R232_CONFIG_STAMP)
+
+$(DEBUG_START_STAGE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(GENERATED_DIR)/debug-start-stage-*.stamp
+	@touch $@
+psp/debug_start_stage.o psp/fileio.o psp/main.o psp/memory_telemetry.o \
+src/AnmManager.o src/TitleScreen.o src/GameManager.o src/Global.o src/main.o \
+src/EffectManager.o src/EclRun.o src/EnemyManager.o src/EnemyManagerUpdate.o \
+src/modern/linux/linux_compat.o src/modern/linux/d3d8_compat.o: $(DEBUG_START_STAGE_CONFIG_STAMP)
+
 $(X87_TRIG_CACHE_CONFIG_STAMP):
 	@mkdir -p $(dir $@)
 	@rm -f $(filter-out $@,$(X87_TRIG_CACHE_CONFIG_STAMPS))
@@ -2207,6 +2730,41 @@ $(RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMP):
 	@rm -f $(filter-out $@,$(RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMPS))
 	@touch $@
 
+$(RADIAL_TRAIL_FAST_TRIG_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(RADIAL_TRAIL_FAST_TRIG_CONFIG_STAMPS))
+	@touch $@
+
+$(BGM_CATCHUP_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(BGM_CATCHUP_CONFIG_STAMPS))
+	@touch $@
+
+$(ME_BULLET_MOVE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(GENERATED_DIR)/me-bullet-move-*.stamp
+	@touch $@
+
+$(STAGE_POOL_LOW_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(GENERATED_DIR)/stage-pool-low-*.stamp
+	@touch $@
+
+$(ME_POPUP_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(GENERATED_DIR)/me-popup-*.stamp
+	@touch $@
+
+$(AUTO_CADENCE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(GENERATED_DIR)/auto-cadence-*.stamp
+	@touch $@
+
+$(CANCEL_TRIG_CACHE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(GENERATED_DIR)/cancel-trig-cache-*.stamp
+	@touch $@
+
 $(FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMP):
 	@mkdir -p $(dir $@)
 	@rm -f $(filter-out $@,$(FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMPS))
@@ -2215,6 +2773,66 @@ $(FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMP):
 $(EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMP):
 	@mkdir -p $(dir $@)
 	@rm -f $(filter-out $@,$(EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMPS))
+	@touch $@
+
+$(EFFECT_EARLY_CULL_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(EFFECT_EARLY_CULL_CONFIG_STAMPS))
+	@touch $@
+
+$(EFFECT_EARLY_CULL_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(EFFECT_EARLY_CULL_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ME_EFFECT_ADOPT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ME_EFFECT_ADOPT_CONFIG_STAMPS))
+	@touch $@
+
+$(ME_EFFECT_ADOPT_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ME_EFFECT_ADOPT_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ME_BULLET_ADOPT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ME_BULLET_ADOPT_CONFIG_STAMPS))
+	@touch $@
+
+$(ME_BULLET_ADOPT_AUDIT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(ME_BULLET_ADOPT_AUDIT_CONFIG_STAMPS))
+	@touch $@
+
+$(ME_BG_ADOPT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(GENERATED_DIR)/me-bg-adopt-*.stamp
+	@touch $@
+
+$(QUAD_BATCH_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(QUAD_BATCH_CONFIG_STAMPS))
+	@touch $@
+
+$(GE_KICK_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(GENERATED_DIR)/ge-kick-*.stamp
+	@touch $@
+
+$(GE_2D_DIRECT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(GE_2D_DIRECT_CONFIG_STAMPS))
+	@touch $@
+
+$(GE4_HOT_TEXTURES_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(GE4_HOT_TEXTURES_CONFIG_STAMPS))
+	@touch $@
+
+$(PORTRAIT_LOWER_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(PORTRAIT_LOWER_CONFIG_STAMPS))
 	@touch $@
 
 $(EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMP):
@@ -2462,6 +3080,16 @@ $(PERF_ATTRIBUTION_CONFIG_STAMP):
 	@rm -f $(filter-out $@,$(PERF_ATTRIBUTION_CONFIG_STAMPS))
 	@touch $@
 
+$(WAIT_PROBE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(WAIT_PROBE_CONFIG_STAMPS))
+	@touch $@
+
+$(LOGGING_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(LOGGING_CONFIG_STAMPS))
+	@touch $@
+
 $(DRAW_PRIORITY_SUBPROFILE_CONFIG_STAMP):
 	@mkdir -p $(dir $@)
 	@rm -f $(filter-out $@,$(DRAW_PRIORITY_SUBPROFILE_CONFIG_STAMPS))
@@ -2557,6 +3185,11 @@ $(GUI_BORDER_REPLAY_CONFIG_STAMP):
 	@rm -f $(filter-out $@,$(GUI_BORDER_REPLAY_CONFIG_STAMPS))
 	@touch $@
 
+$(GUI_BORDER_NATIVE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(GUI_BORDER_NATIVE_CONFIG_STAMPS))
+	@touch $@
+
 $(RENDER_CADENCE_INITIAL_MODE_CONFIG_STAMP):
 	@mkdir -p $(dir $@)
 	@rm -f $(filter-out $@,$(RENDER_CADENCE_INITIAL_MODE_CONFIG_STAMPS))
@@ -2575,6 +3208,11 @@ $(FONT_SUBSET_CONFIG_STAMP):
 $(FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMP):
 	@mkdir -p $(dir $@)
 	@rm -f $(filter-out $@,$(FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMPS))
+	@touch $@
+
+$(TEXT_MASK_REUSE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(TEXT_MASK_REUSE_CONFIG_STAMPS))
 	@touch $@
 
 $(GO_IO_LAMP_CONFIG_STAMP):
@@ -2621,6 +3259,7 @@ EBOOT.PBP: $(NEWLIB_HEAP_ABI_STAMP) $(PSPGL_GE4_LINK_STAMP) \
 	$(GE4_PROVEN_PRX)
 
 $(OBJS): $(GENERATED_I18N) $(GE4_MODEL_GATE_CONFIG_STAMP) \
+	$(LOGGING_CONFIG_STAMP) \
 	$(BULLET_VM_CONFIG_STAMP) \
 	$(REPLAY_AUDIT_CONFIG_STAMP) $(RENDER_VFPU_CONFIG_STAMP) \
 	$(RUNTIME_TELEMETRY_CONFIG_STAMP) \
@@ -2631,6 +3270,7 @@ $(OBJS): $(GENERATED_I18N) $(GE4_MODEL_GATE_CONFIG_STAMP) \
 # The diagnostic exists in exactly these call-site owners.  Its source and
 # linker wrappers are absent in OFF builds; the stamp prevents stale ON/OFF
 # objects from surviving an incremental switch.
+psp/platform.o psp/perf_attribution.o psp/wait_probe.o: $(WAIT_PROBE_CONFIG_STAMP)
 src/main.o src/BulletManager.o src/ItemManager.o src/EffectManager.o \
 	src/EnemyManager.o src/EnemyManagerUpdate.o src/Player.o \
 	src/modern/linux/d3d8_compat.o psp/main.o psp/perf_attribution.o: \
@@ -2749,14 +3389,16 @@ src/main.o psp/main.o: \
 # The triple buffer spans the compat device (Present), the game loop (poll),
 # its module, the list hook, the display query module and the boot identity.
 src/modern/linux/d3d8_compat.o src/main.o psp/main.o psp/swap_triple.o \
-psp/swap_async.o psp/ge_list_hook.o psp/perf_env.o psp/stage_pool_arena.o: \
+psp/swap_async.o psp/ge_list_hook.o psp/perf_env.o psp/stage_pool_arena.o psp/me_popup.o: \
 	$(SWAP_TRIPLE_CONFIG_STAMP)
 psp/ge_list_hook.o: $(PERF_ENV_CONFIG_STAMP)
+src/modern/linux/d3d8_compat.o: $(DEBUG_START_STAGE_CONFIG_STAMP)
 
 # The border replay spans Gui::DrawGameScene, its observer, the parent window
 # owner, and the boot identity.
 src/Gui.o psp/gui_border_replay.o psp/perf_attribution.o psp/main.o: \
 	$(GUI_BORDER_REPLAY_AUDIT_CONFIG_STAMP) $(GUI_BORDER_REPLAY_CONFIG_STAMP)
+psp/gui_border_replay.o psp/main.o: $(GUI_BORDER_NATIVE_CONFIG_STAMP)
 
 # Only the presentation scheduler consumes the diagnostic boot mode.  Its
 # public API and every game/replay object remain identical across mode 0/2.
@@ -2775,8 +3417,26 @@ src/modern/linux/d3d8_compat.o psp/main.o: $(PREPARE_STATE_CACHE_CONFIG_STAMP)
 # The radial candidate changes only EffectManager's draw-only zero-secondary
 # branch.  Rebuild it and the boot identity together for every OFF/ON switch.
 src/EffectManager.o psp/main.o: $(RADIAL_TRAIL_TRIG_REUSE_CONFIG_STAMP)
+src/EffectManager.o psp/main.o: $(RADIAL_TRAIL_FAST_TRIG_CONFIG_STAMP)
+src/zwave.o src/SoundPlayer.o src/modern/linux/linux_compat.o psp/main.o: $(BGM_CATCHUP_CONFIG_STAMP)
+src/BulletManager.o src/EffectManager.o src/AnmManager.o psp/me_bullet_move.o psp/me_worker.o psp/main.o: $(ME_BULLET_MOVE_CONFIG_STAMP)
+psp/stage_pool_arena.o psp/main.o src/modern/linux/d3d8_compat.o: $(STAGE_POOL_LOW_CONFIG_STAMP)
+src/AsciiManager.o src/AnmManager.o src/main.o psp/me_popup.o psp/me_worker.o psp/main.o: $(ME_POPUP_CONFIG_STAMP)
+src/main.o psp/auto_cadence.o psp/render_cadence.o psp/main.o: $(AUTO_CADENCE_CONFIG_STAMP)
+src/Player.o psp/main.o: $(CANCEL_TRIG_CACHE_CONFIG_STAMP)
 src/PlayerBomb.o psp/main.o: $(FANTASY_SEAL_WORK_BOUNDS_CONFIG_STAMP)
 src/EffectManager.o psp/main.o: $(EFFECT_OCCUPANCY_FASTPATH_CONFIG_STAMP)
+src/EffectManager.o src/AnmManager.o psp/main.o: $(EFFECT_EARLY_CULL_CONFIG_STAMP) \
+	$(EFFECT_EARLY_CULL_AUDIT_CONFIG_STAMP)
+src/EffectManager.o src/AnmManager.o src/main.o psp/me_effect_adopt.o psp/me_effect_shadow.o psp/me_worker.o psp/main.o: \
+	$(ME_EFFECT_ADOPT_CONFIG_STAMP) $(ME_EFFECT_ADOPT_AUDIT_CONFIG_STAMP)
+src/BulletManager.o src/AnmManager.o src/main.o src/modern/linux/d3d8_compat.o psp/me_bullet_adopt.o psp/me_worker.o psp/main.o: \
+	$(ME_BULLET_ADOPT_CONFIG_STAMP) $(ME_BULLET_ADOPT_AUDIT_CONFIG_STAMP)
+src/Background.o src/AnmManager.o src/main.o psp/me_bg_adopt.o psp/me_worker.o psp/main.o: $(ME_BG_ADOPT_CONFIG_STAMP)
+src/modern/linux/d3d8_compat.o psp/main.o: $(QUAD_BATCH_CONFIG_STAMP) $(GE_KICK_CONFIG_STAMP)
+src/modern/linux/d3d8_compat.o psp/ge2d_direct.o psp/main.o: $(GE_2D_DIRECT_CONFIG_STAMP)
+src/modern/linux/d3d8_compat.o psp/main.o: $(GE4_HOT_TEXTURES_CONFIG_STAMP)
+src/modern/linux/d3d8_compat.o: $(PORTRAIT_LOWER_CONFIG_STAMP)
 src/EffectManager.o psp/effect_occupancy_audit.o psp/perf_attribution.o psp/main.o: \
 	$(EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMP)
 src/EffectManager.o psp/main.o: $(EFFECT_SPRITE_PAIR_AUDIT_CONFIG_STAMP)
@@ -2902,6 +3562,7 @@ psp/memory_telemetry.o psp/main.o: \
 src/modern/linux/linux_compat.o psp/main.o: $(FONT_SUBSET_CONFIG_STAMP)
 src/modern/linux/linux_compat.o psp/main.o: \
 	$(FONT_GLYPH_CACHE_RETAIN_CONFIG_STAMP)
+src/modern/linux/linux_compat.o: $(TEXT_MASK_REUSE_CONFIG_STAMP)
 
 # Only this translation unit owns module/newlib declarations. The dedicated
 # stamp makes the parity toggle rebuild it without invalidating the game ABI.
@@ -2910,6 +3571,12 @@ psp/main.o: $(BOOT_PARITY_CONFIG_STAMP)
 # The accepted AnmVmBase::Initialize body is intentionally inline in the
 # original-owner TU.  GCC otherwise discards its out-of-line COMDAT even though
 # other reconstructed TUs reference it.
+$(HUD_SUBMIT_CONFIG_STAMP):
+	@mkdir -p $(GENERATED_DIR)
+	@rm -f $(GENERATED_DIR)/hud-submit-*.stamp
+	@touch $@
+src/AsciiManager.o src/AnmManager.o src/modern/linux/d3d8_compat.o psp/main.o: $(HUD_SUBMIT_CONFIG_STAMP)
+
 src/AsciiManager.o: CXXFLAGS += -fkeep-inline-functions
 
 .PHONY: test-psp-ascii-popup-batch
@@ -3034,3 +3701,10 @@ test-psp-font-glyph-cache-retain: \
 	python3 tools/test_psp_font_glyph_cache_retain.py
 
 -include $(OBJS:.o=.d)
+
+ifeq ($(TH08_PSP_ME_CORE),1)
+$(MECC_LIB): $(MECC_INPUTS)
+	cmake -S $(MECC_DIR) -B $(MECC_BUILD_DIR) -DCMAKE_BUILD_TYPE=Release
+	cmake --build $(MECC_BUILD_DIR) --target me-core
+$(TARGET).elf: $(MECC_LIB)
+endif

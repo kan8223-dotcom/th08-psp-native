@@ -22,9 +22,17 @@ constexpr std::uint64_t kThBgmDatBytes = 449961024ULL;
 // fixed and amortize Memory Stick traffic into page-sized chunks. Normal
 // messages stop before the tail reserve so a truncation record and the orderly
 // FINAL record still have somewhere to go.
-constexpr std::size_t kBootLogBufferBytes = 4096;
+// RAM log: 128 KiB stays in memory; the file is written only at safe points
+// (stage boundaries, exit, fatal paths) or when the buffer is 3/4 full.  A
+// per-flush open/write/close plus device sync cost a visible frame hitch.
+constexpr std::size_t kBootLogBufferBytes = 128U * 1024U;
 constexpr std::size_t kBootLogRecordBytes = 4096;
+#if defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+// Debug builds run on PPSSPP only: allow per-frame traces.
+constexpr std::uint64_t kBootLogFileLimitBytes = 256ULL * 1024ULL * 1024ULL;
+#else
 constexpr std::uint64_t kBootLogFileLimitBytes = 1024ULL * 1024ULL;
+#endif
 constexpr std::uint64_t kBootLogTailReserveBytes = 4096ULL;
 constexpr std::uint64_t kBootLogNormalLimitBytes =
     kBootLogFileLimitBytes - kBootLogTailReserveBytes;
@@ -63,6 +71,7 @@ std::uint32_t gLogSyncFailures = 0;
 SceLwMutexWorkarea gBootLogMutex{};
 bool gBootLogMutexReady = false;
 bool gInitialized = false;
+int gBootLogRotateResult = 1;
 bool gDiscoveryComplete = false;
 DataDiscovery gDiscovery{};
 
@@ -526,6 +535,7 @@ void FileIoInitialize(const char *launchArgument)
     JoinPath(gBootLogPath, sizeof(gBootLogPath), gGameDirectory, "TH08PSP_BOOT.LOG");
     sceIoChdir(gGameDirectory);
 
+#if TH08_PSP_LOGGING
     // The workarea is static and never touches newlib. All later BOOT.LOG
     // state and file operations are serialized across the main and gameplay
     // setup threads by this kernel lightweight mutex. Fail closed if the
@@ -537,6 +547,7 @@ void FileIoInitialize(const char *launchArgument)
                                PSP_LW_MUTEX_ATTR_THFIFO,
                                0,
                                nullptr) >= 0;
+#endif
 
     char stateDirectory[640];
     if (JoinPath(stateDirectory, sizeof(stateDirectory), gGameDirectory, "replay"))
@@ -548,6 +559,34 @@ void FileIoInitialize(const char *launchArgument)
         sceIoMkdir(stateDirectory, 0777);
     }
 
+#if TH08_PSP_LOGGING
+    // Keep the previous launch's log as TH08PSP_BOOT.PREV.LOG: an accidental
+    // relaunch after a freeze used to destroy the only evidence.
+    {
+        // Keep four previous launches (PREV.LOG is the most recent).
+        static const char *const kPrevNames[] = {"TH08PSP_BOOT.PREV.LOG", "TH08PSP_BOOT.PREV2.LOG",
+                                                 "TH08PSP_BOOT.PREV3.LOG", "TH08PSP_BOOT.PREV4.LOG"};
+        char prevPath[640];
+        char olderPath[640];
+        JoinPath(olderPath, sizeof(olderPath), gGameDirectory, kPrevNames[3]);
+        sceIoRemove(olderPath);
+        for (int gen = 3; gen >= 1; --gen)
+        {
+            JoinPath(prevPath, sizeof(prevPath), gGameDirectory, kPrevNames[gen - 1]);
+            JoinPath(olderPath, sizeof(olderPath), gGameDirectory, kPrevNames[gen]);
+            if (sceIoRename(prevPath, olderPath) < 0)
+            {
+                sceIoRename(prevPath, kPrevNames[gen]);
+            }
+        }
+        JoinPath(prevPath, sizeof(prevPath), gGameDirectory, kPrevNames[0]);
+        int rc = sceIoRename(gBootLogPath, prevPath);
+        if (rc < 0)
+        {
+            rc = sceIoRename(gBootLogPath, kPrevNames[0]);
+        }
+        gBootLogRotateResult = rc;
+    }
     // Establish an empty per-launch file immediately. This prevents a crash
     // before the first full chunk from leaving a previous run looking current.
     const SceUID bootLog = sceIoOpen(gBootLogPath,
@@ -565,7 +604,9 @@ void FileIoInitialize(const char *launchArgument)
     {
         NoteBootLogWriteFailure();
     }
+#endif
     gInitialized = true;
+    BootLog("BOOT_LOG_ROTATE rc=%d\n", gBootLogRotateResult);
 }
 
 const char *GameDirectory()
@@ -705,6 +746,10 @@ bool QueueBootLogFinalMarkerLocked()
 
 void BootLog(const char *format, ...)
 {
+#if !TH08_PSP_LOGGING
+    (void)format;
+    return;
+#endif
     if (format == nullptr)
     {
         return;
@@ -776,8 +821,11 @@ void BootLog(const char *format, ...)
     gLogLength += required;
 }
 
-bool FlushBootLog()
+bool FlushBootLogHard()
 {
+#if !TH08_PSP_LOGGING
+    return true;
+#endif
     BootLogStateGuard guard;
     if (!guard.Acquired())
     {
@@ -808,8 +856,42 @@ bool FlushBootLog()
     return true;
 }
 
+std::uint32_t gLogSoftFlushes = 0;
+// Release builds: keep the log in RAM unless the buffer is nearly full; debug
+// builds (stage/replay tracking) keep flushing immediately so a hard fault
+// leaves the last lines on the card.
+// PPSSPP runs are stopped from outside (no orderly exit) and its I/O is free:
+// keep flushing immediately there so the log stays complete.
+bool BootLogHostIsPpsspp()
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        SceIoStat stat;
+        cached = sceIoGetstat("ms0:/PSP/SYSTEM/ppsspp.ini", &stat) >= 0 ? 1 : 0;
+    }
+    return cached == 1;
+}
+bool FlushBootLog()
+{
+#if !TH08_PSP_LOGGING
+    return true;
+#endif
+#if defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+    return FlushBootLogHard();
+#else
+    if (BootLogHostIsPpsspp() || gLogLength >= (kBootLogBufferBytes / 4U) * 3U)
+        return FlushBootLogHard();
+    ++gLogSoftFlushes;
+    return true;
+#endif
+}
+
 bool FinalizeBootLog()
 {
+#if !TH08_PSP_LOGGING
+    return true;
+#endif
     BootLogStateGuard guard;
     if (!guard.Acquired())
     {

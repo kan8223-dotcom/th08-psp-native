@@ -6,6 +6,10 @@
 #include "ReplayManager.hpp"
 #include "ReplaySyncAudit.hpp"
 #include "replay_reserve_recycle.hpp"
+#if defined(PSP)
+#include "stage_pool_arena.hpp"
+#include "fileio.hpp"
+#endif
 #include "ResultScreen.hpp"
 #include "i18n.hpp"
 
@@ -90,6 +94,146 @@ void ReleaseRecordedStageBuffers(ReplayData *replayData, i32 stage)
 } // namespace
 
 #pragma var_order(decodedReplay, i, replayData, obfuscateOffset, obfuscateCursor, checksum, checksumCursor)
+#if defined(PSP) && !defined(TH08_PORTABLE_NATIVE_LAYOUT)
+namespace
+{
+// The wire layout packs stage records back to back, so records after the
+// first usually sit on 2-byte boundaries.  x86 does not care; the Allegrex
+// takes an address-error exception on every word access to them (hard freeze
+// with no exception handler).  Rebuild the decoded image with every stage and
+// FPS block on a 4-byte boundary and patch the header offsets accordingly.
+u32 g_PspReplayRegionEnd = 0; // end of the decoded stage/FPS region of the most recent load
+ReplayData *PspRealignReplay(ReplayData *decoded, u32 decodedRegionEnd, u32 trailingBytes)
+{
+    g_PspReplayRegionEnd = decodedRegionEnd;
+    u32 *stageOffsets = reinterpret_cast<u32 *>(decoded->header.stageReplayData);
+    u32 *fpsOffsets = reinterpret_cast<u32 *>(decoded->header.stageFpsData);
+    struct Block { u32 offset; u32 *slot; } blocks[MAX_STAGES * 2];
+    int count = 0;
+    for (int i = 0; i < MAX_STAGES; i++)
+    {
+        if (stageOffsets[i] != 0) { blocks[count].offset = stageOffsets[i]; blocks[count].slot = &stageOffsets[i]; count++; }
+        if (fpsOffsets[i] != 0) { blocks[count].offset = fpsOffsets[i]; blocks[count].slot = &fpsOffsets[i]; count++; }
+    }
+    for (int i = 1; i < count; i++)
+    {
+        Block key = blocks[i]; int j = i - 1;
+        while (j >= 0 && blocks[j].offset > key.offset) { blocks[j + 1] = blocks[j]; j--; }
+        blocks[j + 1] = key;
+    }
+    bool needs = false;
+    for (int i = 0; i < count; i++)
+        if ((blocks[i].offset & 3U) != 0 || blocks[i].offset < TH08_REPLAY_DATA_SIZE || blocks[i].offset > decodedRegionEnd)
+            needs = true;
+    if (!needs)
+        return decoded;
+    const u32 total = decodedRegionEnd + trailingBytes + 4U * count + 4U;
+    u8 *dst = reinterpret_cast<u8 *>(g_ZunMemory.Alloc(total));
+    if (dst == NULL)
+        return decoded;
+    const u8 *src = reinterpret_cast<const u8 *>(decoded);
+    memcpy(dst, src, TH08_REPLAY_DATA_SIZE);
+    u32 cursor = TH08_REPLAY_DATA_SIZE;
+    int moved = 0;
+    for (int i = 0; i < count; i++)
+    {
+        const u32 begin = blocks[i].offset;
+        const u32 end = (i + 1 < count) ? blocks[i + 1].offset : decodedRegionEnd;
+        if (begin < TH08_REPLAY_DATA_SIZE || end < begin || end > decodedRegionEnd)
+        {
+            g_ZunMemory.Free(dst);
+            return decoded;
+        }
+        cursor = (cursor + 3U) & ~3U;
+        memcpy(dst + cursor, src + begin, end - begin);
+        if (cursor != begin) moved++;
+        *blocks[i].slot = cursor;
+        cursor += end - begin;
+    }
+    memcpy(dst + cursor, src + decodedRegionEnd, trailingBytes);
+    memcpy(dst, decoded, TH08_REPLAY_DATA_SIZE); // header with the patched offsets
+    g_PspReplayRegionEnd = cursor;
+    th08::psp::BootLog("REPLAY_ALIGN blocks=%d moved=%d bytes=%lu\n", count, moved, (unsigned long)total);
+    th08::psp::FlushBootLog();
+    g_ZunMemory.Free(decoded);
+    return reinterpret_cast<ReplayData *>(dst);
+}
+// During playback the whole decoded replay (~225 KiB for a full run) stays
+// on the heap, which is exactly what the PSP lacks in the late stages.  At
+// each stage start drop the input/FPS streams of finished stages, keeping
+// only their 0x40-byte records, and shrink the buffer.
+void PspCompactPlaybackReplay(ReplayData *&replay, int currentStage)
+{
+    if (replay == NULL || currentStage <= 0)
+        return;
+    u8 *base = reinterpret_cast<u8 *>(replay);
+    struct Block { u8 *ptr; int stage; bool fps; };
+    Block blocks[MAX_STAGES * 2];
+    int count = 0;
+    for (int i = 0; i < MAX_STAGES; i++)
+    {
+        if (replay->header.stageReplayData[i] != NULL)
+        {
+            blocks[count].ptr = reinterpret_cast<u8 *>(replay->header.stageReplayData[i]);
+            blocks[count].stage = i; blocks[count].fps = false; count++;
+        }
+        if (replay->header.stageFpsData[i] != NULL)
+        {
+            blocks[count].ptr = replay->header.stageFpsData[i];
+            blocks[count].stage = i; blocks[count].fps = true; count++;
+        }
+    }
+    for (int i = 1; i < count; i++)
+    {
+        Block key = blocks[i]; int j = i - 1;
+        while (j >= 0 && blocks[j].ptr > key.ptr) { blocks[j + 1] = blocks[j]; j--; }
+        blocks[j + 1] = key;
+    }
+    u8 *regionEnd = base + g_PspReplayRegionEnd;
+    u32 keep = TH08_REPLAY_DATA_SIZE + 4U;
+    bool dropped = false;
+    for (int i = 0; i < count; i++)
+    {
+        u8 *end = (i + 1 < count) ? blocks[i + 1].ptr : regionEnd;
+        if (end < blocks[i].ptr || end > regionEnd) return; // unexpected layout: leave it alone
+        const u32 len = static_cast<u32>(end - blocks[i].ptr);
+        if (blocks[i].stage >= currentStage) keep += len + 4U;
+        else if (!blocks[i].fps) keep += sizeof(StageReplayData) + 4U;
+        else dropped = true;
+        if (blocks[i].stage < currentStage && !blocks[i].fps && len > sizeof(StageReplayData)) dropped = true;
+    }
+    if (!dropped)
+        return;
+    u8 *dst = reinterpret_cast<u8 *>(g_ZunMemory.Alloc(keep));
+    if (dst == NULL)
+        return;
+    memcpy(dst, base, TH08_REPLAY_DATA_SIZE);
+    ReplayData *out = reinterpret_cast<ReplayData *>(dst);
+    u32 cursor = TH08_REPLAY_DATA_SIZE;
+    for (int i = 0; i < count; i++)
+    {
+        u8 *end = (i + 1 < count) ? blocks[i + 1].ptr : regionEnd;
+        u32 len = static_cast<u32>(end - blocks[i].ptr);
+        if (blocks[i].stage < currentStage)
+        {
+            if (blocks[i].fps) { out->header.stageFpsData[blocks[i].stage] = NULL; continue; }
+            len = sizeof(StageReplayData);
+        }
+        cursor = (cursor + 3U) & ~3U;
+        memcpy(dst + cursor, blocks[i].ptr, len);
+        if (blocks[i].fps) out->header.stageFpsData[blocks[i].stage] = dst + cursor;
+        else out->header.stageReplayData[blocks[i].stage] = reinterpret_cast<StageReplayData *>(dst + cursor);
+        cursor += len;
+    }
+    th08::psp::BootLog("REPLAY_COMPACT stage=%d bytes=%lu->%lu\n", currentStage, (unsigned long)g_PspReplayRegionEnd,
+                       (unsigned long)cursor);
+    th08::psp::FlushBootLog();
+    g_PspReplayRegionEnd = cursor;
+    g_ZunMemory.Free(replay);
+    replay = out;
+}
+} // namespace
+#endif
 ReplayData *ReplayManager::LoadReplayData(ReplayData *data, int fileSize)
 {
     u8 *obfuscateCursor;
@@ -218,8 +362,35 @@ ReplayData *ReplayManager::LoadReplayData(ReplayData *data, int fileSize)
         }
     }
 #else
-    decodedReplay = (ReplayData *)g_ZunMemory.Alloc(replayData->header.decompressedSize + sizeof(ReplayDataHeader) +
-                                                    (fileSize - replayData->header.fileSize));
+    {
+        const size_t decodedBytes = replayData->header.decompressedSize + sizeof(ReplayDataHeader) +
+                                    (fileSize - replayData->header.fileSize);
+#if defined(PSP)
+        // The title-screen heap has almost no headroom; borrow the idle stage
+        // pool for the decode buffer when no stage is bound (tracked_free
+        // returns pool loans).  Fall back to the heap, and never write through
+        // a failed allocation (retail had no check here).
+        // Heap first (this is what r209 did successfully); the idle pool is
+        // only a fallback so a full heap no longer writes through NULL.
+        decodedReplay = (ReplayData *)g_ZunMemory.Alloc(decodedBytes);
+        int decodeSource = 1;
+        if (decodedReplay == NULL)
+        {
+            decodedReplay = (ReplayData *)th08::psp::StagePoolArenaAcquireIdleTransient(decodedBytes, "replay-decode");
+            decodeSource = 2;
+        }
+        th08::psp::BootLog("REPLAY_DECODE bytes=%lu ok=%d src=%d comp=%ld file=%ld\n", (unsigned long)decodedBytes,
+                           decodedReplay != NULL ? 1 : 0, decodeSource, (long)replayData->header.compressedSize,
+                           (long)fileSize);
+        th08::psp::FlushBootLog();
+        if (decodedReplay == NULL)
+            goto err1;
+#else
+        decodedReplay = (ReplayData *)g_ZunMemory.Alloc(decodedBytes);
+        if (decodedReplay == NULL)
+            goto err1;
+#endif
+    }
 
     memcpy(&decodedReplay->header, data, sizeof(ReplayDataHeader));
 
@@ -228,6 +399,13 @@ ReplayData *ReplayManager::LoadReplayData(ReplayData *data, int fileSize)
 
     memcpy((u8 *)decodedReplay + sizeof(ReplayDataHeader) + replayData->header.decompressedSize,
            (u8 *)data + replayData->header.fileSize, fileSize - replayData->header.fileSize);
+#if defined(PSP)
+    th08::psp::BootLog("REPLAY_DECODE done\n");
+    th08::psp::FlushBootLog();
+    decodedReplay = PspRealignReplay(decodedReplay,
+                                     sizeof(ReplayDataHeader) + replayData->header.decompressedSize,
+                                     fileSize - replayData->header.fileSize);
+#endif
 #endif
 
     replayData = decodedReplay;
@@ -812,6 +990,9 @@ ZunResult ReplayManager::BeginPlaybackStage(ReplayManager *replayManager)
 #endif
     }
 
+#if defined(PSP) && !defined(TH08_PORTABLE_NATIVE_LAYOUT)
+    PspCompactPlaybackReplay(replayManager->replayData, g_GameManager.currentStage);
+#endif
     stage = g_GameManager.currentStage;
     if (TH08_REPLAY_STAGE_DATA(replayManager->replayData, stage) == NULL)
     {
@@ -1405,10 +1586,40 @@ void ReplayManager::SaveReplay(const char *replayPath, const char *replayName)
     }
 
     {
+#if defined(PSP)
+        // One write instead of four: every write call on the Go's internal
+        // storage is a chance to stall for 30 s.
+        {
+            const DWORD infoBytes = infoHeader.size - sizeof(infoHeader);
+            const DWORD total = TH08_REPLAY_HEADER_SIZE + compressedSize + sizeof(infoHeader) + infoBytes;
+            u8 *joined = static_cast<u8 *>(malloc(total));
+            if (joined != NULL)
+            {
+                u8 *cursor = joined;
+                memcpy(cursor, &replayCopy.header, TH08_REPLAY_HEADER_SIZE);
+                cursor += TH08_REPLAY_HEADER_SIZE;
+                memcpy(cursor, compressedData, compressedSize);
+                cursor += compressedSize;
+                memcpy(cursor, &infoHeader, sizeof(infoHeader));
+                cursor += sizeof(infoHeader);
+                memcpy(cursor, infoBuffer, infoBytes);
+                WriteFile(file, joined, total, &bytesWritten, NULL);
+                free(joined);
+            }
+            else
+            {
+                WriteFile(file, &replayCopy.header, TH08_REPLAY_HEADER_SIZE, &bytesWritten, NULL);
+                WriteFile(file, compressedData, compressedSize, &bytesWritten, NULL);
+                WriteFile(file, &infoHeader, sizeof(infoHeader), &bytesWritten, NULL);
+                WriteFile(file, infoBuffer, infoHeader.size - sizeof(infoHeader), &bytesWritten, NULL);
+            }
+        }
+#else
         WriteFile(file, &replayCopy.header, TH08_REPLAY_HEADER_SIZE, &bytesWritten, NULL);
         WriteFile(file, compressedData, compressedSize, &bytesWritten, NULL);
         WriteFile(file, &infoHeader, sizeof(infoHeader), &bytesWritten, NULL);
         WriteFile(file, infoBuffer, infoHeader.size - sizeof(infoHeader), &bytesWritten, NULL);
+#endif
         CloseHandle(file);
 
         utils::DebugPrint("info : Size %d -> %d\r\n", currentOffset, compressedSize + TH08_REPLAY_HEADER_SIZE);

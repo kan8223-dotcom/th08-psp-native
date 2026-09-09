@@ -16,6 +16,9 @@ struct MemorySnapshot
 };
 
 void PlatformInitialize();
+void PlatformLogSafety();
+// Idempotent and allocation/I/O-free. Safe before a potentially blocked exit.
+void PlatformArmExitWatchdog();
 bool PlatformRunning();
 bool PlatformSuspended();
 bool PlatformSelectButtonDown();

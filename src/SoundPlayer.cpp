@@ -3,6 +3,9 @@
 #include "SoundPlayer.hpp"
 
 #include "Global.hpp"
+#if defined(PSP)
+#include "fileio.hpp"
+#endif
 #include "Supervisor.hpp"
 #include "dxutil.hpp"
 #include "i18n.hpp"
@@ -854,6 +857,12 @@ loop:
 }
 
 #pragma var_order(msg, looped, lpThreadParameterCopy, waitObj, res, stopped)
+#if defined(PSP) && defined(TH08_PSP_BGM_CATCHUP) && TH08_PSP_BGM_CATCHUP
+extern "C" int sceKernelGetThreadId(void);
+extern "C" int sceKernelGetThreadCurrentPriority(void);
+extern "C" int sceKernelChangeThreadPriority(int thid, int priority);
+extern "C" int th08_psp_main_thread_priority(void);
+#endif
 DWORD WINAPI SoundPlayer::BGMPlayerThread(LPVOID lpThreadParameter)
 {
     DWORD waitObj;
@@ -862,6 +871,19 @@ DWORD WINAPI SoundPlayer::BGMPlayerThread(LPVOID lpThreadParameter)
     u32 looped;
     LPVOID lpThreadParameterCopy;
     HRESULT res;
+#if defined(PSP) && defined(TH08_PSP_BGM_CATCHUP) && TH08_PSP_BGM_CATCHUP
+    {
+        // The refill thread must preempt a CPU-bound main thread (equal PSP
+        // priorities only switch when the running thread blocks).
+        const int current = sceKernelGetThreadCurrentPriority();
+        const int mainPriority = th08_psp_main_thread_priority();
+        int wanted = mainPriority - 2;
+        if (wanted < 16)
+            wanted = 16;
+        const int rc = sceKernelChangeThreadPriority(sceKernelGetThreadId(), wanted);
+        th08::psp::BootLog("BGM_THREAD priority %d -> %d rc=0x%08x\n", current, wanted, static_cast<unsigned>(rc));
+    }
+#endif
 
     lpThreadParameterCopy = lpThreadParameter;
     stopped = false;

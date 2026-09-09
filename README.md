@@ -9,12 +9,15 @@ PSP-2000 / PSP-3000 / PSP Go (64 MB models). Not an emulator: it is a port of th
 
 > **Note:** This port is based on an AI-generated decompilation of TH08 that is not affiliated with or endorsed by Gensokyo Club. Gensokyo Club does not provide any support for this project. For the community-maintained decompilation, please refer to the official Gensokyo Club repositories.
 
-> 2026-09-05 時点の状態 / Status as of 2026-09-05
-> - PSP Go（423 MHz）実機で **1面から6面まで通しプレイし、Normal エンディングまで到達**（処理落ち率 15.4%）。PSP-3000（定格 333 MHz）でも同じビルドで通しクリアを確認済みです。
-> - 60 Hz simulation × 30描画（SELECTで60/30/20描画を切替）。密集スペルでは弾更新のCPU負荷で処理落ちします。
-> - **既知の問題**: PSP Go 内蔵ストレージ（ef0）では 30 秒の読み込み停止が1周に数回残ります（[docs/psp-go-internal-storage-stall.md](docs/psp-go-internal-storage-stall.md)。メモリースティックからの起動で回避できる見込み）／32bitの顔・背景テクスチャは16bitに減色／ラストワード練習は非対応／PSP-1000（32 MB）は非対応。
-> - Full playthrough to the Normal ending on a PSP Go at 423 MHz (15.4% slowdown counter). The same build also completed a full playthrough on a PSP-3000 at stock 333 MHz.
-> - Known issues: a few 30-second read stalls per playthrough on the PSP Go's internal storage (ef0; see the doc above, expected to be avoided by running from a Memory Stick); 32-bit face/background textures are stored as 16-bit; Last Word practice is unsupported; PSP-1000 (32 MB) is not supported.
+> 2026-09-09: [v0.3.0-beta / r238 ログなし版](https://github.com/kan8223-dotcom/th08-psp-native/releases/tag/v0.3.0-beta)
+> - 実機へ投入した r238 をそのまま公開。プレイヤーから全体的なパフォーマンス向上の報告があります。新しい性能ログは記録しないため、FPS改善率の数値比較はありません。
+> - MEによる弾・効果・背景などの処理、GE送信の集約、HUD頂点の記録再生、文字ラスタライズの再利用を含みます。音声処理はSC側です。
+> - シミュレーションは60 Hzを目標に維持し、描画は負荷に応じて60/30/20へ自動調整。SELECTで手動選択できます。ボム中は自動設定時に20描画へ切り替わります。
+> - **会話早送りはまだ重い**など、最適化は継続中です。対象のボス立ち絵は空き容量がある場合のみ下位eDRAMを優先し、足りなければMain RAMへ戻します。
+> - 今回の実機報告はPSP Go・M2環境。前段のログなしr236は423 MHzでリプレイ完走報告があり、443 MHzでは停止報告があります。これをr238や他機種の完走保証にはしていません。オーバークロックの安定動作は保証しません。
+> - 内蔵ストレージの読み込み停止問題は未解決です（[詳細](docs/psp-go-internal-storage-stall.md)）。32bitの顔・背景テクスチャは16bit化／ラストワード練習・PSP-1000は非対応。
+>
+> r238 is the exact no-log build installed on the test PSP Go. The player reports substantially better overall performance, but dialogue fast-forward remains slow. No new performance logs are recorded and no measured FPS gain is claimed. Earlier-build playthrough results are not a guarantee for this build or other models; overclocking is not guaranteed stable. See the release notes for validation limits.
 
 ## 必要なもの / Requirements
 
@@ -35,27 +38,32 @@ thbgm.dat               (your own copy)
 ```
 
 起動後はタイトルで放置するとデモが走ります。SELECTで描画レート（60/30/20）を切り替えられます。
-`TH08PSP_BOOT.LOG` が同じフォルダに書かれます（不具合報告の際に添付してください）。
+更新時は設定・スコア・`replay/`を残し、配布ファイルだけを置き換えてください。
+**r238はログなし版です。新しい `TH08PSP_BOOT.LOG` や性能ログは書きません。**
+以前のログが残っていても今回の実行記録ではありません。不具合報告にはビルド名・機種・ストレージ・クロック・発生場面を添えてください。
+セーブ・リプレイ保存は無効化していません。ME用の `kcall.prx` は起動時に本体から展開されるので、別途ダウンロードは不要です。
 
 ## ビルド / Build
 
-PSPSDK（psp-gcc 15.2 で検証）と SDL2 / SDL2_image / SDL2_ttf の PSP ビルドが必要です。
+PSPSDK（psp-gcc 15.2で検証）と SDL2 / SDL2_image / SDL2_ttf のPSPビルド、CMake、Python 3、xxdが必要です。
+`PSPDEV`を設定し、PSPSDKのコマンドをPATHに入れたクリーンなチェックアウトで実行します。
 
 ```
-make -f Makefile.psp clean
-make -f Makefile.psp -j4 TH08_PSP_BUILD_ID=<id> <feature vector>
+bash tools/build_r238_nolog_20260909_183252.sh
 ```
 
-リリース版の feature vector は各リリースノートに記載しています（`TH08_REPLAY_SYNC_AUDIT=0` を必ず指定）。
-すべての最適化・観測機能は `Makefile.psp` の `TH08_PSP_*` スイッチ（既定OFF）で個別に有効化され、
-`tools/test_psp_*.py` のソース契約テストで検証されます。PSPGLは `deps/pspgl-ge4/` に凍結したフォーク（BSD-3）を使います。
+このスクリプトにr238のfeature vectorを固定しています。ローカルな`build/`内の履歴スクリプトは不要です。
+最適化・観測機能は `Makefile.psp` の `TH08_PSP_*` スイッチで個別に選択できます。
+PSPGLは `deps/pspgl-ge4/` の凍結stream-listアーカイブ（BSD-3）、MEライブラリは `psp/third_party/me-custom-core/`（MIT）を使います。
+公開バイナリの識別値とビルド検証範囲は [r238公開記録](docs/releases/r238_20260909_183252.md) を参照してください。
 
 ## 技術メモ / Technical notes
 
-- SC-only 構成です。Media Engine（ME）は使用していません（`FEATURE ME=DISABLED` をブートログで確認できます）。
+- ゲーム全体の進行・音声はSC側、対象の弾更新や描画用データ生成などをME workerに分担させています。
 - GE 側 4 MiB eDRAM（PSP-2000 以降）を `ge4wrap_texv1.prx` で解錠し、上位 2 MiB をテクスチャ昇格に使います。
-- 弾・アイテムの頂点生成は GE へ直接（no-copy）投入、Item/三角関数は bit-exact な double-float 高速経路、
-  描画は SWAP_NOWAIT（VBlank 待ち除去＋表示同一性ガード）など。決定論（リプレイ同期）を壊す最適化は採用していません。
+- GE stream-list、トリプルバッファ、HUD前面スプライトの記録再生と文字送信の集約を使います。
+- r237の文字マスク再利用は縁取り4回＋本体1回の同じ文字ラスタライズを再利用します。行をまたぐ会話全文キャッシュではありません。
+- ログ出力は無効ですが、RAM上の一部計測カウンタは残ります。「すべてのI/O・計測コストがゼロ」という構成ではありません。
 - 計測・判定の記録は `TH08_PSP_ISSUE_LEDGER.md` / `TH08_PSP_PORT_PLAN.md`（作業リポジトリ側）にあります。
 
 ## クレジット / Credits
@@ -63,6 +71,7 @@ make -f Makefile.psp -j4 TH08_PSP_BUILD_ID=<id> <feature vector>
 - Original game: 東方永夜抄 © 上海アリス幻樂団 (Team Shanghai Alice). This is an unofficial fan port. No original assets are distributed.
 - PC decompilation (two upstream projects): the original reconstruction [GensokyoClub/th08](https://github.com/GensokyoClub/th08) (KSS, MIT), and its fork [N0zoM1z0/th08](https://github.com/N0zoM1z0/th08) (Linux/portable64 port, MIT), which is the direct base of this PSP port.
 - PSPGL fork base: [pspdev/pspgl](https://github.com/pspdev/pspgl) (BSD-3-Clause), SDL2 for PSP, PSPSDK, ARK CFW.
+- Media Engine custom core: m-c/d (MIT); source, upstream notes and license are preserved in `psp/third_party/me-custom-core/`.
 - PSP eDRAM (4 MiB) knowledge and hardware discussion: **m-c/d** and **Acid_Snake** of the PSP Homebrew Community. Thank you.
 - Port engineering: kan82 with coding agents (OpenAI Codex, Anthropic Claude). See `th07-psp-native` for the sibling Touhou 7 port.
 

@@ -25,7 +25,7 @@ void LogHeapAtStage(const char *phase, unsigned long generation)
                        static_cast<unsigned long>(heap.largestFreeChunkBytes), static_cast<unsigned long>(heap.topChunkBytes),
                        static_cast<unsigned long>(heap.freeChunkCount), static_cast<unsigned long>(heap.largestNoGrowRequestBytes),
                        static_cast<unsigned long>(heap.scanValid));
-    th08::psp::FlushBootLog();
+    th08::psp::FlushBootLogHard();
 }
 } // namespace
 
@@ -400,6 +400,10 @@ void UnbindManagers()
 
 void FreeBacking()
 {
+#if defined(TH08_PSP_STAGE_POOL_LOW) && TH08_PSP_STAGE_POOL_LOW
+    // Reserved at boot below 32 MiB for the Media Engine: never returned.
+    return;
+#endif
     if (gRawAllocation != nullptr)
         th08_psp_tracked_free(gRawAllocation);
     gRawAllocation = nullptr;
@@ -429,6 +433,16 @@ bool AllocateBackingUnlocked()
     return true;
 }
 } // namespace
+
+bool StagePoolArenaReserveEarly()
+{
+    LockTransient();
+    const bool ok = AllocateBackingUnlocked();
+    UnlockTransient();
+    BootLog("STAGE_POOL early=%s base=%p bytes=%lu (below 32 MiB for the ME)\n", ok ? "READY" : "FAILED",
+            static_cast<void *>(gArenaBase), static_cast<unsigned long>(kReserveBytes));
+    return ok;
+}
 
 bool StagePoolArenaPrepareIdle()
 {

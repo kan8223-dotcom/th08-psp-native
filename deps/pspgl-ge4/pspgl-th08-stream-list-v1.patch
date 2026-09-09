@@ -1,0 +1,312 @@
+--- pspgl_dlist.c.streamarena	2026-09-05 21:48:21.878813996 +0900
++++ pspgl_dlist.c	2026-09-05 21:48:21.882813924 +0900
+@@ -9,29 +9,33 @@
+ #include "pspgl_buffers.h"
+ #include "pspgl_dlist.h"
+ 
+-#define NUM_CMDLISTS	16u
++/* TH08 stream-list variant.  Two large command lists; a list is handed to
++   the GE as soon as it receives its first command, with the stall address at
++   the write pointer, and is streamed by advancing the stall (the sceGu
++   GU_DIRECT model).  glFlush / swap finish the list (FINISH/END, stall
++   released to the end) and switch to the other list.  This replaces the
++   upstream 16 x 512-word ring whose per-list sceGeListEnQueue cost about
++   0.15 ms and whose full-list-only submission kept the GE idle for most of
++   a frame. */
++const char __pspgl_th08_stream_list_marker[] =
++	"pspGL TH08 stream-list v1 base streamarena-v1 "
++	"de4260adf56d06516ec46018d404ca77e0b61748";
+ 
+-#define DLIST_SIZE	512	/* command words (32bit) */
++#define NUM_CMDLISTS	2u
++#define DLIST_SIZE	32768	/* command words (32bit) */
+ #define DLIST_EXTRA	4	/* 4 commands of overhead at the end */
+-
+-#define DLIST_CACHED	0	/* put command list in cached memory */
++#define DLIST_STALL_STEP 32	/* auto stall advance every N words */
+ 
+ struct pspgl_dlist {
+ 	unsigned long len;	/* amount used */
++	unsigned long stall_len; /* words already released to the GE */
+ 	int qid;		/* queue ID; -1 if not queued */
+-
++	int finished;		/* FINISH/END written, stall released */
+ 	struct pspgl_buffer *pins; /* list of buffers pinned by this dlist */
+-
+-#if DLIST_CACHED
+- 	unsigned long __attribute__((aligned(16))) cmd_buf[DLIST_SIZE];
+-#else
+ 	unsigned long *cmd_buf;
+-	/* need to align to cache lines (64bytes) to avoid cached/uncached conflicts */
+ 	unsigned long __attribute__((aligned(CACHELINE_SIZE))) _cmdbuf[DLIST_SIZE];
+-#endif
+ };
+ 
+-
+ static int dlist_needinit = 1;
+ static struct pspgl_dlist dlists[NUM_CMDLISTS]
+ 	__attribute__((aligned(CACHELINE_SIZE)));
+@@ -41,6 +45,8 @@
+ {
+ 	d->qid = -1;
+ 	d->len = 0;
++	d->stall_len = 0;
++	d->finished = 0;
+ 	d->pins = NULL;
+ }
+ 
+@@ -49,18 +55,45 @@
+ 	if (likely(!dlist_needinit))
+ 		return;
+ 	dlist_needinit = 0;
+-
+ 	dlist_current = 0;
+ 	for(int i = 0; i < NUM_CMDLISTS; i++) {
+ 		struct pspgl_dlist *d = &dlists[i];
+-
+-		if (!DLIST_CACHED)
+-			d->cmd_buf = __pspgl_uncached(d->_cmdbuf, 
+-						      sizeof(d->_cmdbuf));
++		d->cmd_buf = __pspgl_uncached(d->_cmdbuf, sizeof(d->_cmdbuf));
+ 		dlist_reset(d);
+ 	}
+ }
+ 
++/* Hand the list to the GE with the stall at the write pointer. */
++static void dlist_stream_start (struct pspgl_dlist *d)
++{
++	if (d->qid != -1 || d->len == 0)
++		return;
++	if (pspgl_curctx->stats.enabled)
++		pspgl_curctx->stats.buffer_issues++;
++	d->qid = sceGeListEnQueue(d->cmd_buf, &d->cmd_buf[d->len], 0, NULL);
++	d->stall_len = d->len;
++}
++
++/* Release everything written so far. */
++static void dlist_stall_advance (struct pspgl_dlist *d)
++{
++	if (d->qid == -1 || d->finished || d->len <= d->stall_len)
++		return;
++	sceGeListUpdateStallAddr(d->qid, &d->cmd_buf[d->len]);
++	d->stall_len = d->len;
++}
++
++/* Called by the game after each draw: make the GE start / continue now. */
++void __pspgl_th08_dlist_kick (void)
++{
++	struct pspgl_dlist *d = &dlists[dlist_current];
++
++	if (d->qid == -1)
++		dlist_stream_start(d);
++	else
++		dlist_stall_advance(d);
++}
++
+ void __pspgl_dlist_enqueue_cmd (unsigned long cmd)
+ {
+ 	struct pspgl_dlist *d = &dlists[dlist_current];
+@@ -69,19 +102,58 @@
+ 		__pspgl_dlist_submit();
+ 		d = &dlists[dlist_current];
+ 	}
++
+ 	d->cmd_buf[d->len++] = cmd;
++
++	if (d->qid == -1)
++		dlist_stream_start(d);
++	else if (d->len - d->stall_len >= DLIST_STALL_STEP)
++		dlist_stall_advance(d);
++}
++
++static void dlist_finish (struct pspgl_dlist *d)
++{
++	if (unlikely((d->len + DLIST_EXTRA) > DLIST_SIZE))
++		__pspgl_log("d->len=%d DLIST_SIZE=%d\n", d->len, DLIST_SIZE);
++	assert((d->len + DLIST_EXTRA) <= DLIST_SIZE);
++
++	d->cmd_buf[d->len++] = 0x0f000000;	/* FINISH */
++	d->cmd_buf[d->len++] = 0x0c000000;	/* END */
++	d->cmd_buf[d->len++] = 0x00000000;	/* NOP */
++	d->cmd_buf[d->len++] = 0x00000000;	/* NOP */
+ }
+ 
++/* Terminate a list and let the GE run it to the END. */
++static void dlist_close (struct pspgl_dlist *d)
++{
++	if (d->finished)
++		return;
++	dlist_finish(d);
++	if (d->qid == -1) {
++		if (pspgl_curctx->stats.enabled)
++			pspgl_curctx->stats.buffer_issues++;
++		d->qid = sceGeListEnQueue(d->cmd_buf, &d->cmd_buf[d->len], 0, NULL);
++	} else
++		sceGeListUpdateStallAddr(d->qid, &d->cmd_buf[d->len]);
++	d->stall_len = d->len;
++	d->finished = 1;
++}
+ 
+-/* Wait for a dlist to stop being used by the hardware, and do the
+-   appropriate updates on any buffers it pins. */
++/* Wait for a list to be finished, and free/unpin its buffers.  A list that
++   is still streaming is closed first (a stalled list never completes). */
+ static void sync_list(struct pspgl_dlist *list)
+ {
+ 	unsigned long long start=0;
+ 	struct pspgl_buffer *data, *next;
+ 
+-	if (list->qid == -1)
+-		return;
++	if (list->qid == -1) {
++		if (list->len != 0) {
++			/* commands written but never handed over */
++			dlist_close(list);
++		} else
++			return;
++	} else if (!list->finished)
++		dlist_close(list);
+ 
+ 	if (pspgl_curctx->stats.enabled)
+ 		start = now();
+@@ -107,47 +179,27 @@
+ 	dlist_reset(list);
+ }
+ 
+-static
+-void dlist_finish (struct pspgl_dlist *d)
+-{
+-	if (unlikely((d->len + DLIST_EXTRA) > DLIST_SIZE))
+-		__pspgl_log("d->len=%d DLIST_SIZE=%d\n", d->len, DLIST_SIZE);
+-	assert((d->len + DLIST_EXTRA) <= DLIST_SIZE);
+-
+-	d->cmd_buf[d->len++] = 0x0f000000;	/* FINISH */
+-	d->cmd_buf[d->len++] = 0x0c000000;	/* END */
+-	d->cmd_buf[d->len++] = 0x00000000;	/* NOP */
+-	d->cmd_buf[d->len++] = 0x00000000;	/* NOP */
+-}
+-
+-/* Submit all pending command lists to hardware, and move to the next
+-   free command list.  If all lists are busy, wait until the next one
+-   is available (ie, hardware has finished). */
++/* Close the current list, hand it to the GE (or release its stall) and move
++   to the other list, waiting for that one if the GE still owns it. */
+ void __pspgl_dlist_submit(void)
+ {
+ 	struct pspgl_dlist *d = &dlists[dlist_current];
+ 
+-	dlist_finish(d);
+-	pspgl_dlist_dump(d->cmd_buf, d->len);
+-
+-	assert(d->qid == -1);
+-	if (DLIST_CACHED)
+-		sceKernelDcacheWritebackInvalidateRange(d->cmd_buf, sizeof(d->cmd_buf));
+-
+-	if (pspgl_curctx->stats.enabled)
+-		pspgl_curctx->stats.buffer_issues++;
++	if (d->len == 0 && d->qid == -1)
++		return;
+ 
+-	psp_log("queueing %d commands", d->len);
+-	d->qid = sceGeListEnQueue(d->cmd_buf, &d->cmd_buf[d->len-1], 0, NULL);
++	pspgl_dlist_dump(d->cmd_buf, d->len);
++	psp_log("closing %d commands", d->len);
++	dlist_close(d);
+ 
+-	/* move to next command queue */
++	/* move to the other command list */
+ 	dlist_current = (dlist_current + 1) % NUM_CMDLISTS;
+ 	d = &dlists[dlist_current];
+-	if (d->qid != -1)
++
++	if (d->qid != -1 || d->len != 0)
+ 		sync_list(d);
+ }
+ 
+-
+ /* Pin a buffer to a particular dlist.  If it is already attached
+    to a dlist, move it to this dlist, so it remains pinned a little
+    longer. */
+@@ -158,33 +210,29 @@
+ 	if (data->pin_prevp != NULL) {
+ 		/* pinned by someone; snip from whatever list its
+ 		   currently on */
++		*data->pin_prevp = data->pin_next;
+ 		if (data->pin_next)
+ 			data->pin_next->pin_prevp = data->pin_prevp;
+-		*(data->pin_prevp) = data->pin_next;
+ 	} else {
+-		/* newly pinned */
+ 		data->refcount++;
+ 	}
++
+ 	data->flags |= flags;
+ 
+-	/* insert into current dlist pin list */
+ 	data->pin_prevp = &d->pins;
+ 	data->pin_next = d->pins;
+ 	if (data->pin_next)
+ 		data->pin_next->pin_prevp = &data->pin_next;
+ 	d->pins = data;
+ 
+-	/* tell buffer management this buffer wants to be in vidmem */
+ 	__pspgl_buffer_want_vidmem(data);
+ }
+ 
+-/* Block until the hardware has finished with all outstanding lists */
+ void __pspgl_dlist_await_completion (int (*pred)(void *), void *p)
+ {
+ 	unsigned i;
+ 
+ 	i = dlist_current;
+-
+ 	do {
+ 		sync_list(&dlists[i]);
+ 		i = (i + 1) % NUM_CMDLISTS;
+@@ -193,7 +241,6 @@
+ 	} while(i != dlist_current);
+ }
+ 
+-/* Cancel all pending lists */
+ void __pspgl_dlist_cancel (void)
+ {
+ 	for(int i = 0; i < NUM_CMDLISTS; i++) {
+@@ -201,8 +248,10 @@
+ 
+ 		if (d->qid != -1) {
+ 			sceGeListDeQueue(d->qid);
++			d->finished = 1;
+ 			sync_list(d);
+-		}
++		} else
++			dlist_reset(d);
+ 	}
+ }
+ 
+@@ -217,17 +266,17 @@
+ 	if ((d->len + 2 + size) >= (DLIST_SIZE - 4)) {
+ 		__pspgl_dlist_submit();
+ 		d = &dlists[dlist_current];
+-
+ 		assert(d->len == 0);
+ 		assert(size <= (DLIST_SIZE - DLIST_EXTRA));
+ 	}
+ 
+ 	len = d->len;
+ 	d->len += size + 2;
++
+ 	adr = (unsigned long) &d->cmd_buf[d->len];
++
+ 	d->cmd_buf[len  ] = (CMD_BASE << 24) | ((adr >> 8) & 0xf0000);
+ 	d->cmd_buf[len+1] = (CMD_JUMP << 24) | (adr & 0xffffff);
+ 
+ 	return (void *)&d->cmd_buf[len+2];
+ }
+-
+--- /dev/fd/63	2026-09-05 21:49:19.565829092 +0900
++++ pspgl_dlist.h	2026-09-05 21:48:21.890813785 +0900
+@@ -42,3 +42,4 @@
+ 
+ #endif
+ 
++extern void __pspgl_th08_dlist_kick (void);

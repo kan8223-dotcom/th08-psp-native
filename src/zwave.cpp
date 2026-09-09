@@ -19,6 +19,9 @@
 #include <dxerr8.h>
 #include <mmsystem.h>
 #include <windows.h>
+#if defined(PSP)
+#include "fileio.hpp"
+#endif
 
 namespace th08
 {
@@ -680,6 +683,9 @@ CStreamingSound::CStreamingSound(LPDIRECTSOUNDBUFFER pDSBuffer, DWORD dwDSBuffer
                                  DWORD dwNotifySize)
     : CSound(&pDSBuffer, dwDSBufferSize, 1, pWaveFile)
 {
+#if defined(PSP) && defined(TH08_PSP_BGM_CATCHUP) && TH08_PSP_BGM_CATCHUP
+    m_pspWrittenTotal = dwDSBufferSize;
+#endif
     m_dwLastPlayPos = 0;
     m_dwPlayProgress = 0;
     m_dwNotifySize = dwNotifySize;
@@ -788,7 +794,77 @@ HRESULT CStreamingSound::UpdatePartialFadeOut()
 #pragma var_order(dwDSLockedBufferSize2, pDSLockedBuffer, dwBytesWrittenToBuffer, currentPlayCursor,                 \
                   pDSLockedBuffer2, bRestored, dwPlayDelta, hr, dwDSLockedBufferSize, dwCurrentPlayPos,             \
                   currentWriteCursor, dwReadSoFar)
+#if defined(PSP) && defined(TH08_PSP_BGM_CATCHUP) && TH08_PSP_BGM_CATCHUP
+// PSP: one notification refills every free chunk (a late thread catches up
+// instead of losing a chunk per missed notification), and when the play
+// cursor has overrun the write offset the stream jumps to the chunk after the
+// cursor instead of replaying the stale ring.
+namespace
+{
+unsigned long g_PspBgmCalls = 0UL, g_PspBgmChunks = 0UL, g_PspBgmMulti = 0UL, g_PspBgmJumps = 0UL,
+              g_PspBgmMaxChunks = 0UL, g_PspBgmSkips = 0UL;
+}
 HRESULT CStreamingSound::HandleWaveStreamNotification(BOOL bLoopedPlay)
+{
+    if (m_apDSBuffer == NULL || m_apDSBuffer[0] == NULL || m_pWaveFile == NULL)
+        return CO_E_NOTINITIALIZED;
+    const DWORD ringSize = m_dwDSBufferSize;
+    const DWORD chunk = m_dwNotifySize;
+    unsigned long long played = 0ULL;
+    if (chunk == 0 || ringSize < chunk * 2 || FAILED(m_apDSBuffer[0]->GetPspPlayedTotal(&played)))
+        return HandleWaveStreamNotificationOnce(bLoopedPlay);
+    ++g_PspBgmCalls;
+    if (g_PspBgmCalls == 1UL)
+        th08::psp::BootLog("BGM_CATCHUP first ring=%lu chunk=%lu written=%llu played=%llu\n",
+                           static_cast<unsigned long>(ringSize), static_cast<unsigned long>(chunk), m_pspWrittenTotal, played);
+    long long fresh = static_cast<long long>(m_pspWrittenTotal) - static_cast<long long>(played);
+    if (fresh < 0)
+    {
+        // Overrun: everything between the play cursor and the write offset is
+        // stale.  Resume at the next chunk boundary after the cursor.
+        DWORD playPos = 0;
+        m_apDSBuffer[0]->GetCurrentPosition(&playPos, NULL);
+        const DWORD next = (((playPos / chunk) + 1U) * chunk) % ringSize;
+        m_dwNextWriteOffset = next;
+        m_pspWrittenTotal = played + ((next + ringSize - playPos) % ringSize);
+        th08::psp::BootLog("BGM_CATCHUP jump lag_bytes=%lld play=%lu next=%lu\n", -fresh,
+                           static_cast<unsigned long>(playPos), static_cast<unsigned long>(next));
+        fresh = static_cast<long long>(m_pspWrittenTotal) - static_cast<long long>(played);
+        ++g_PspBgmJumps;
+    }
+    unsigned long chunks = 0UL;
+    HRESULT last = CO_E_FIRST;
+    while (fresh >= 0 && static_cast<unsigned long long>(fresh) + chunk <= ringSize && chunks < ringSize / chunk)
+    {
+        const HRESULT hr = HandleWaveStreamNotificationOnce(bLoopedPlay);
+        if (hr != S_OK)
+        {
+            if (hr == CO_E_FIRST)
+                ++g_PspBgmSkips;
+            return chunks != 0UL ? S_OK : hr;
+        }
+        last = S_OK;
+        ++chunks;
+        m_pspWrittenTotal += chunk;
+        if (FAILED(m_apDSBuffer[0]->GetPspPlayedTotal(&played)))
+            break;
+        fresh = static_cast<long long>(m_pspWrittenTotal) - static_cast<long long>(played);
+    }
+    g_PspBgmChunks += chunks;
+    if (chunks > 1UL)
+        ++g_PspBgmMulti;
+    if (chunks > g_PspBgmMaxChunks)
+        g_PspBgmMaxChunks = chunks;
+    if ((g_PspBgmCalls % 200UL) == 0UL)
+        th08::psp::BootLog("BGM_CATCHUP stats calls=%lu chunks=%lu multi=%lu jumps=%lu max_chunks=%lu skips=%lu\n",
+                           g_PspBgmCalls, g_PspBgmChunks, g_PspBgmMulti, g_PspBgmJumps, g_PspBgmMaxChunks,
+                           g_PspBgmSkips);
+    return last;
+}
+HRESULT CStreamingSound::HandleWaveStreamNotificationOnce(BOOL bLoopedPlay)
+#else
+HRESULT CStreamingSound::HandleWaveStreamNotification(BOOL bLoopedPlay)
+#endif
 {
     HRESULT hr;
     DWORD dwCurrentPlayPos;
@@ -959,6 +1035,9 @@ HRESULT CStreamingSound::Reset()
     m_dwPlayProgress = 0;
     m_dwNextWriteOffset = 0;
     m_bFillNextNotificationWithSilence = FALSE;
+#if defined(PSP) && defined(TH08_PSP_BGM_CATCHUP) && TH08_PSP_BGM_CATCHUP
+    m_pspWrittenTotal = m_dwDSBufferSize;
+#endif
 
     // Restore the buffer if it was lost
     BOOL bRestored;

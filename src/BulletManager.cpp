@@ -1,4 +1,11 @@
 #include "th_pch.h"
+#if defined(PSP)
+#include "laser_trig_cache.hpp"
+#endif
+#if defined(PSP) && defined(TH08_PSP_BULLET_UPDATE_SUBPROFILE) && TH08_PSP_BULLET_UPDATE_SUBPROFILE
+extern "C" unsigned int sceKernelGetSystemTimeLow(void);
+#define TH08_PSP_BULLET_UPDATE_SUBPROFILE_ENABLED 1
+#endif
 
 #include "BulletManager.hpp"
 #include "GameManager.hpp"
@@ -8,6 +15,16 @@
 #include "ReplayManager.hpp"
 #include "SoundPlayer.hpp"
 #include "Supervisor.hpp"
+#include "psp/me_bullet_adopt.hpp"
+#if defined(PSP) && defined(TH08_PSP_ME_BULLET_MOVE) && TH08_PSP_ME_BULLET_MOVE
+#include "psp/me_bullet_move.hpp"
+#define TH08_PSP_ME_BULLET_MOVE_ENABLED 1
+#else
+#define TH08_PSP_ME_BULLET_MOVE_ENABLED 0
+#endif
+#if defined(PSP)
+#include "fileio.hpp"
+#endif
 
 #if defined(PSP)
 #include "perf_attribution.hpp"
@@ -872,7 +889,9 @@ void __fastcall SelectBulletSprite(AnmVm *dst, AnmVm *base, AnmVm *sizeSource, i
 
 void __fastcall fsincos(f32 *sine, f32 *cosine, f32 angle)
 {
-#ifdef TH08_MODERN_PORT
+#if TH08_PSP_LASER_TRIG_ENABLED
+    psp::LaserSinCos(angle, sine, cosine);
+#elif defined(TH08_MODERN_PORT)
     *sine = X87CompatibleSin(angle);
     *cosine = X87CompatibleCos(angle);
 #endif
@@ -1874,6 +1893,17 @@ ChainCallbackResult BulletManager::OnUpdate(BulletManager *bulletManager)
         return CHAIN_CALLBACK_RESULT_CONTINUE;
 
     g_ItemManager.OnUpdate();
+#if defined(TH08_PSP_BULLET_UPDATE_SUBPROFILE_ENABLED)
+    const unsigned int pspBulletStart = sceKernelGetSystemTimeLow();
+    unsigned long pspActiveLasers = 0UL;
+#endif
+#if TH08_PSP_ME_BULLET_MOVE_ENABLED
+    th08_psp_me_bullet_move_wait();
+    const unsigned char *const pspMeMoveFlags = th08_psp_me_bullet_move_flags();
+#endif
+#if defined(TH08_PSP_BULLET_UPDATE_SUBPROFILE_ENABLED)
+    const unsigned int pspBulletWaited = sceKernelGetSystemTimeLow();
+#endif
 #if defined(TH08_PSP_BULLET_RUNTIME_FASTPATH) && \
     defined(TH08_REPLAY_SYNC_AUDIT)
     // Item update can synchronously request a transition clear, so validate
@@ -1972,6 +2002,23 @@ updateBullet:
 #if defined(TH08_PSP_BULLET_TRANSFORM_AUDIT_ENABLED)
             PspBulletTransformAuditNoteFiredUpdateCall();
 #endif
+#if TH08_PSP_ME_BULLET_MOVE_ENABLED
+            if (pspMeMoveFlags != NULL)
+            {
+                const unsigned char pspMoveFlag = pspMeMoveFlags[bullet - bulletManager->bullets];
+                if ((pspMoveFlag & 1U) != 0U)
+                {
+                    // Moved on the ME: transform program terminal, position and
+                    // off-screen bookkeeping done.
+                    if ((pspMoveFlag & 2U) != 0U)
+                    {
+                        bullet->Deactivate();
+                        goto nextBullet;
+                    }
+                    goto pspMeMovedCollision;
+                }
+            }
+#endif
 #if defined(TH08_PSP_BULLET_TRANSFORM_TERMINAL_FASTPATH_ENABLED)
             if (!PspBulletTransformTerminalSkip(
                     static_cast<u32>(bucketIndex)))
@@ -2049,6 +2096,9 @@ updateBullet:
                     bullet->offscreenFrames = 0;
             }
 
+#if TH08_PSP_ME_BULLET_MOVE_ENABLED
+pspMeMovedCollision:
+#endif
             if (bullet->collisionDisabled == 0)
             {
 #if defined(TH08_PSP_BULLET_COLLISION_GATE_PRODUCT_ENABLED)
@@ -2189,7 +2239,11 @@ lethalCollision:
                 }
             }
 executeBulletScript:
-            if (bullet->sprites.bulletVm.currentInstruction != NULL)
+            if (bullet->sprites.bulletVm.currentInstruction != NULL
+#if TH08_PSP_ME_BULLET_MOVE_ENABLED
+                && (pspMeMoveFlags == NULL || (pspMeMoveFlags[bullet - bulletManager->bullets] & 4U) == 0U)
+#endif
+            )
                 g_AnmManager->ExecuteScript(&bullet->sprites.bulletVm);
                 break;
             case BULLET_STATE_SPAWNING_FAST:
@@ -2313,6 +2367,9 @@ nextBullet:
                                  liveEnumVisited, !useLiveEnumerator);
 #endif
 
+#if defined(TH08_PSP_BULLET_UPDATE_SUBPROFILE_ENABLED)
+    const unsigned int pspBulletOrdinaryDone = sceKernelGetSystemTimeLow();
+#endif
     laser = &bulletManager->lasers[0];
     reinterpret_cast<Float3 *>(laserCenter)->operator float *();
     reinterpret_cast<Float3 *>(laserSize)->operator float *();
@@ -2321,6 +2378,9 @@ nextBullet:
             if (laser->inUse == 0)
                 continue;
 
+#if defined(TH08_PSP_BULLET_UPDATE_SUBPROFILE_ENABLED)
+            ++pspActiveLasers;
+#endif
             laser->endOffset += g_Supervisor.framerateMultiplier * laser->speed;
             if (laser->endOffset - laser->startOffset > laser->startLength)
                 laser->startOffset = laser->endOffset - laser->startLength;
@@ -2415,10 +2475,45 @@ nextBullet:
             g_AnmManager->ExecuteScript(&laser->bodyVm);
         }
 
+#if defined(TH08_PSP_BULLET_UPDATE_SUBPROFILE_ENABLED)
+    {
+        const unsigned int pspBulletEnd = sceKernelGetSystemTimeLow();
+        static int lastStage = -1;
+        static unsigned long calls = 0, waitUs = 0, ordinaryUs = 0, laserUs = 0, active = 0, lasers = 0;
+        if (lastStage != g_GameManager.currentStage)
+        {
+            lastStage = g_GameManager.currentStage;
+            calls = waitUs = ordinaryUs = laserUs = active = lasers = 0UL;
+        }
+        waitUs += pspBulletWaited - pspBulletStart;
+        ordinaryUs += pspBulletOrdinaryDone - pspBulletWaited;
+        laserUs += pspBulletEnd - pspBulletOrdinaryDone;
+        active += static_cast<unsigned long>(bulletManager->activeBulletCount);
+        lasers += pspActiveLasers;
+        if ((++calls % 600UL) == 0UL)
+            psp::BootLog("BULLET_UPDATE_SUB st=%d sf=%lu calls=%lu waitcache_us=%lu ordinary_us=%lu laser_us=%lu "
+                         "active=%lu lasers=%lu cumulative=1\n", lastStage,
+                         static_cast<unsigned long>(g_GameManager.stageActiveFrames), calls,
+                         waitUs, ordinaryUs, laserUs, active, lasers);
+    }
+#endif
     if (bulletManager->spawnSuppressionFrames != 0)
         --bulletManager->spawnSuppressionFrames;
     bulletManager->timer++;
     ++bulletManager->frameCounter;
+#if TH08_PSP_LASER_TRIG_ENABLED
+    psp::LaserTrigFrame();
+#endif
+#if defined(PSP)
+    {
+        // Simulation checksum (ME bullet movement A/B): cumulative active bullets, RNG seed, score.
+        static unsigned long pspSimCalls = 0UL, pspSimBullets = 0UL;
+        pspSimBullets += static_cast<unsigned long>(bulletManager->activeBulletCount);
+        if ((++pspSimCalls % 600UL) == 0UL)
+            th08::psp::BootLog("SIM_CHECK calls=%lu bullets=%lu rng=%04x score=%lu\n", pspSimCalls, pspSimBullets,
+                               static_cast<unsigned>(g_Rng.GetSeed()), static_cast<unsigned long>(g_GameManager.globals->score));
+    }
+#endif
     return CHAIN_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -2734,6 +2829,377 @@ void Bullet::UpdateVerticalWrap()
 
 // FUNCTION: th08 0x432b50
 #pragma var_order(i, sine, laser, halfLength, cosine, node, bulletManager)
+#if TH08_PSP_ME_BULLET_ANY_ENABLED
+#if TH08_PSP_ME_BULLET_ADOPT_AUDIT_ENABLED
+extern VertexTex1DiffuseXyzrhw g_QuadVertices[4];
+extern "C" void sceKernelDcacheInvalidateRange(const void *p, unsigned int size); // pspkernel.h clashes with game typedefs
+extern "C" unsigned int g_PspSpritesAddedCount; // AddSpriteToDrawBuffer counter (items use the canonical append)
+#endif
+namespace
+{
+// Draw-time state seen by the last bullet draw; the capture at the end of
+// the next calc chain assumes it and the draw verifies it.
+struct PspMeBulletDrawState
+{
+    bool valid;
+    float shakeX, shakeY;
+    float vpX, vpY, vpW, vpH;
+    unsigned int useMixColor, mixColor;
+} g_PspMeBulletDrawState;
+bool g_PspMeBulletFrameCaptured = false;
+
+// Bullet::DrawSingleBullet's VM selection.
+AnmVm *PspMeBulletSelectVm(Bullet *bullet)
+{
+    switch (bullet->state)
+    {
+#if defined(TH08_PSP_COMPACT_BULLET_VM)
+    case BULLET_STATE_SPAWNING_FAST:
+    case BULLET_STATE_SPAWNING_NORMAL:
+    case BULLET_STATE_SPAWNING_SLOW:
+        return &bullet->sprites.selectedSpawnVm;
+#else
+    case BULLET_STATE_SPAWNING_FAST:
+        return &bullet->sprites.spawnFastVm;
+    case BULLET_STATE_SPAWNING_NORMAL:
+        return &bullet->sprites.spawnNormalVm;
+    case BULLET_STATE_SPAWNING_SLOW:
+        return &bullet->sprites.spawnSlowVm;
+#endif
+    case BULLET_STATE_DESPAWNING:
+        return &bullet->sprites.despawnVm;
+    default:
+        return &bullet->sprites.bulletVm;
+    }
+}
+
+// Presentation trig exactly as DrawSingleBullet computes it (memoized per
+// bullet slot; the cache is presentation-only state).
+void PspMeBulletRenderRotation(Bullet *bullet, f32 *renderAngle, f32 *sine, f32 *cosine)
+{
+#if defined(TH08_PSP_BULLET_RUNTIME_FASTPATH)
+    PspBulletRenderRotationCache *cache = PspBulletRenderCacheFor(bullet);
+    if (cache != NULL && cache->valid != 0U && cache->sourceAngle == bullet->angle)
+    {
+        *renderAngle = cache->renderAngle;
+        *sine = cache->sine;
+        *cosine = cache->cosine;
+        return;
+    }
+    *renderAngle = AddNormalizeAngle(ZUN_PI / 2.0f + bullet->angle, 0.0f);
+    th08::psp::RenderSinCos(*renderAngle, sine, cosine);
+    if (cache != NULL)
+    {
+        cache->sourceAngle = bullet->angle;
+        cache->renderAngle = *renderAngle;
+        cache->sine = *sine;
+        cache->cosine = *cosine;
+        cache->valid = 1U;
+    }
+#else
+    *renderAngle = AddNormalizeAngle(ZUN_PI / 2.0f + bullet->angle, 0.0f);
+    th08::psp::RenderSinCos(*renderAngle, sine, cosine);
+#endif
+}
+
+// Fills the ME record with the inputs DrawSingleBullet -> Draw2D would use,
+// without mutating the VM (the draw still performs the original mutations).
+void PspMeBulletFillRecord(Bullet *bullet, PspMeBulletRecord *rec)
+{
+    AnmVm *vm = PspMeBulletSelectVm(bullet);
+    const unsigned int color1 = (vm->color1.d3dColor & 0xff000000U) | 0xffffffU;
+    rec->posX = g_GameManager.arcadeRegionTopLeftPos.x + bullet->position.x;
+    rec->posY = g_GameManager.arcadeRegionTopLeftPos.y + bullet->position.y;
+    rec->posZ = 0.05f;
+    rec->scaleX = vm->scale.x;
+    rec->scaleY = vm->scale.y;
+    rec->sizeX = vm->spriteSize.x;
+    rec->sizeY = vm->spriteSize.y;
+    rec->sine = 0.0f;
+    rec->cosine = 1.0f;
+    rec->uvStartX = vm->loadedSprite->uvStart.x;
+    rec->uvEndX = vm->loadedSprite->uvEnd.x;
+    rec->uvStartY = vm->loadedSprite->uvStart.y;
+    rec->uvEndY = vm->loadedSprite->uvEnd.y;
+    rec->scrollX = vm->uvScrollPos.x;
+    rec->scrollY = vm->uvScrollPos.y;
+    rec->color1 = color1;
+    rec->color2 = vm->color2.d3dColor;
+    rec->anchor = static_cast<unsigned char>(vm->anchor);
+    rec->flag17 = vm->flag17 ? 1U : 0U;
+    rec->pad = 0U;
+    rec->pad2 = 0U;
+    if (!vm->visible || !vm->flag1 || (color1 >> 24) == 0U)
+    {
+        rec->kind = 0xFFU;
+        return;
+    }
+    if (vm->type != 0)
+    {
+        // SetZRotation(renderAngle) then the rotated path (one-pass or
+        // Draw2DWithPrecomputedRotation): TranslateRotation, no rounding.
+        f32 renderAngle;
+        PspMeBulletRenderRotation(bullet, &renderAngle, &rec->sine, &rec->cosine);
+        rec->kind = 1U;
+        return;
+    }
+    const f32 rotation = vm->rotation.z;
+    if (rotation == 0.0f)
+    {
+        rec->kind = 0U; // DrawNoRotation: axis-aligned, rounded
+        return;
+    }
+    th08::psp::RenderSinCos(rotation, &rec->sine, &rec->cosine);
+    rec->kind = 1U;
+}
+// Mirrors ItemManager::OnDraw's per-item VM mutations (position clamp,
+// on/off-screen sprite switch, alpha fade) and Draw2D's inputs, without
+// mutating anything; the draw still performs the original mutations.
+void PspMeItemFillRecord(Item *item, PspMeBulletRecord *rec)
+{
+    const AnmVm *vm = &item->sprite;
+    const float y = item->currentPosition.y;
+    const bool offscreen = y < -8.0f;
+    const AnmLoadedSprite *sprite = vm->loadedSprite;
+    float sizeX = vm->spriteSize.x, sizeY = vm->spriteSize.y;
+    unsigned int color1 = vm->color1.d3dColor;
+    if (offscreen)
+    {
+        if (item->isOnscreen)
+        {
+            sprite = g_BulletManager.bulletAnm->GetSprite(item->itemType + 0xb6);
+            sizeX = sprite->widthPx;
+            sizeY = sprite->heightPx;
+        }
+        i32 alpha = 255 - static_cast<i32>(((8.0f - y) * 255.0f) / 128.0f);
+        if (alpha < 0x40)
+            alpha = 0x40;
+        color1 = (color1 & 0xffffffU) | (static_cast<unsigned int>(alpha) << 24);
+    }
+    else if (!item->isOnscreen)
+    {
+        sprite = g_BulletManager.bulletAnm->GetSprite(item->itemType + 0xac);
+        sizeX = sprite->widthPx;
+        sizeY = sprite->heightPx;
+        color1 = 0xffffffffU;
+    }
+    rec->posX = g_GameManager.arcadeRegionTopLeftPos.x + item->currentPosition.x;
+    rec->posY = offscreen ? 8.0f + g_GameManager.arcadeRegionTopLeftPos.y
+                          : g_GameManager.arcadeRegionTopLeftPos.y + y;
+    rec->posZ = 0.15f;
+    rec->scaleX = vm->scale.x;
+    rec->scaleY = vm->scale.y;
+    rec->sizeX = sizeX;
+    rec->sizeY = sizeY;
+    rec->sine = 0.0f;
+    rec->cosine = 1.0f;
+    rec->uvStartX = sprite != NULL ? sprite->uvStart.x : 0.0f;
+    rec->uvEndX = sprite != NULL ? sprite->uvEnd.x : 0.0f;
+    rec->uvStartY = sprite != NULL ? sprite->uvStart.y : 0.0f;
+    rec->uvEndY = sprite != NULL ? sprite->uvEnd.y : 0.0f;
+    rec->scrollX = vm->uvScrollPos.x;
+    rec->scrollY = vm->uvScrollPos.y;
+    rec->color1 = color1;
+    rec->color2 = vm->color2.d3dColor;
+    rec->anchor = static_cast<unsigned char>(vm->anchor);
+    rec->flag17 = vm->flag17 ? 1U : 0U;
+    rec->pad = 0U;
+    rec->pad2 = 0U;
+    if (sprite == NULL || !vm->visible || !vm->flag1 || (color1 >> 24) == 0U)
+    {
+        rec->kind = 0xFFU;
+        return;
+    }
+    const f32 rotation = vm->rotation.z;
+    if (rotation == 0.0f)
+    {
+        rec->kind = 0U;
+        return;
+    }
+    th08::psp::RenderSinCos(rotation, &rec->sine, &rec->cosine);
+    rec->kind = 1U;
+}
+
+// Draw-side run state shared by ItemManager::OnDraw and the bullet loop.
+struct PspMeRunState
+{
+    bool active;
+    unsigned int count, drawn, index;
+    unsigned int runStart, runCount;
+    AnmVm *runVm;
+    IDirect3DTexture8 *runTexture;
+    u8 runBlend, runZWrite;
+    const u16 *indices;
+    const PspMeClientVertex *verts;
+} g_PspMeRun;
+
+void PspMeRunFlush()
+{
+    if (g_PspMeRun.runCount == 0U)
+        return;
+    // Keep the original order: everything queued so far goes out first.
+    g_AnmManager->FlushVertexBuffer();
+    g_AnmManager->PspMeApplySpriteState(g_PspMeRun.runVm);
+    g_Supervisor.d3dDevice->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    g_Supervisor.d3dDevice->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    g_Supervisor.d3dDevice->SetVertexShader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    th08_psp_bullet_me_submit(g_Supervisor.d3dDevice, g_PspMeRun.verts + g_PspMeRun.runStart * 4U, g_PspMeRun.runCount,
+                              g_PspMeRun.indices);
+    th08_me_bullet_adopt_note(TH08_ME_BULLET_STAT_GROUPS);
+    g_PspMeRun.runCount = 0U;
+}
+
+#if TH08_PSP_ME_BULLET_ADOPT_AUDIT_ENABLED
+// Audit: compare the canonical quad just built in g_QuadVertices with the ME output.
+void PspMeRunAuditCompare(unsigned int status, bool drawn, const AnmVm *vm)
+{
+    const bool expectDrawn = status < TH08_ME_BULLET_STATUS_SKIP;
+    if (drawn != expectDrawn)
+    {
+        static unsigned int samples = 0U;
+        th08_me_bullet_adopt_note(TH08_ME_BULLET_STAT_AUDIT_CULL);
+        if (samples < 12U && vm != NULL)
+        {
+            ++samples;
+            th08::psp::BootLog("ME_AUDIT cull status=%u drawn=%d vis=%d f1=%d color=%08lx pos=%d,%d size=%d,%d scale=%d,%d rot=%d\n",
+                               status, drawn ? 1 : 0, vm->visible ? 1 : 0, vm->flag1 ? 1 : 0,
+                               static_cast<unsigned long>(vm->color1.d3dColor), static_cast<int>(vm->pos.x),
+                               static_cast<int>(vm->pos.y), static_cast<int>(vm->spriteSize.x),
+                               static_cast<int>(vm->spriteSize.y), static_cast<int>(vm->scale.x * 100.0f),
+                               static_cast<int>(vm->scale.y * 100.0f), static_cast<int>(vm->rotation.z * 1000.0f));
+        }
+        return;
+    }
+    if (!drawn)
+        return;
+    PspMeClientVertex got[4];
+    const PspMeClientVertex *src = g_PspMeRun.verts + status * 4U;
+    sceKernelDcacheInvalidateRange(src, sizeof(got));
+    memcpy(got, src, sizeof(got));
+    bool same = true;
+    for (int k = 0; k < 4 && same; ++k)
+    {
+        PspMeClientVertex want;
+        want.u = g_QuadVertices[k].textureUV.x;
+        want.v = g_QuadVertices[k].textureUV.y;
+        const u32 c = g_QuadVertices[k].diffuse;
+        want.r = static_cast<unsigned char>((c >> 16) & 255U);
+        want.g = static_cast<unsigned char>((c >> 8) & 255U);
+        want.b = static_cast<unsigned char>(c & 255U);
+        want.a = static_cast<unsigned char>((c >> 24) & 255U);
+        want.x = g_QuadVertices[k].pos.x + 0.5f;
+        want.y = g_QuadVertices[k].pos.y + 0.5f;
+        want.z = 1.0f - 2.0f * g_QuadVertices[k].pos.z;
+        same = memcmp(&want, &got[k], sizeof(want)) == 0;
+    }
+    if (!same)
+        th08_me_bullet_adopt_note(TH08_ME_BULLET_STAT_AUDIT_QUAD);
+}
+#endif
+
+// Consumes the next ME entry for `tag`; returns 1 when the ME path handled
+// it (drawn or culled), 0 when the caller must draw canonically.
+int PspMeRunTake(const void *tag, AnmVm *vm)
+{
+    if (!g_PspMeRun.active)
+        return 0;
+    if (g_PspMeRun.index >= g_PspMeRun.count || th08_me_bullet_adopt_tag(g_PspMeRun.index) != tag)
+    {
+        // List differs from the capture: SC path for the rest of the frame.
+        PspMeRunFlush();
+        g_PspMeRun.active = false;
+        th08_me_bullet_adopt_note(TH08_ME_BULLET_STAT_FB_ORDER);
+        return 0;
+    }
+    const unsigned int status = th08_me_bullet_adopt_status(g_PspMeRun.index);
+    ++g_PspMeRun.index;
+#if TH08_PSP_ME_BULLET_ADOPT_AUDIT_ENABLED
+    {
+        const unsigned int addedBefore = g_PspSpritesAddedCount;
+        g_AnmManager->Draw2D(vm);
+        PspMeRunAuditCompare(status, g_PspSpritesAddedCount != addedBefore, vm);
+        return 1;
+    }
+#else
+    if (status < TH08_ME_BULLET_STATUS_SKIP)
+    {
+        const bool sameState = g_PspMeRun.runCount != 0U && g_PspMeRun.runTexture == vm->loadedSprite->texture &&
+                               g_PspMeRun.runBlend == vm->blendMode && g_PspMeRun.runZWrite == vm->zWriteDisabled &&
+                               g_PspMeRun.runStart + g_PspMeRun.runCount == status;
+        if (!sameState)
+        {
+            PspMeRunFlush();
+            g_PspMeRun.runStart = status;
+            g_PspMeRun.runVm = vm;
+            g_PspMeRun.runTexture = vm->loadedSprite->texture;
+            g_PspMeRun.runBlend = vm->blendMode;
+            g_PspMeRun.runZWrite = vm->zWriteDisabled;
+        }
+        ++g_PspMeRun.runCount;
+    }
+    return 1;
+#endif
+}
+} // namespace
+
+extern "C" int th08_psp_me_item_take(void *item, void *vm)
+{
+    return PspMeRunTake(item, static_cast<AnmVm *>(vm));
+}
+
+extern "C" void th08_psp_me_item_pass_end(void)
+{
+    PspMeRunFlush();
+}
+
+// Called from the main loop right after the calc chain.
+extern "C" void th08_psp_me_bullet_adopt_capture(void)
+{
+    g_PspMeBulletFrameCaptured = false;
+    const PspMeBulletDrawState &st = g_PspMeBulletDrawState;
+    if (!st.valid)
+        return;
+    if (!th08_me_bullet_adopt_begin(st.shakeX, st.shakeY, st.vpX, st.vpY, st.vpW, st.vpH, st.useMixColor, st.mixColor))
+        return;
+    unsigned int count = 0U;
+    // Items are drawn (ItemManager::OnDraw) before the bullet buckets.
+    for (Item *item = g_ItemManager.itemListHead.next; item != NULL; item = item->next)
+    {
+        PspMeBulletRecord rec;
+        PspMeItemFillRecord(item, &rec);
+        if (!th08_me_bullet_adopt_add(item, &rec))
+        {
+            // Capacity: the ME takes this prefix; the draw walk falls back to
+            // the SC path from the first uncaptured entry (fb_order).
+            th08_me_bullet_adopt_note(TH08_ME_BULLET_STAT_OVERFLOW);
+            goto capture_full;
+        }
+        ++count;
+    }
+    for (i32 i = 0; i < 6; i++)
+    {
+        for (Bullet *node = g_BulletManager.drawBuckets[i]; node != NULL; node = node->nextInDrawBucket)
+        {
+            PspMeBulletRecord rec;
+            PspMeBulletFillRecord(node, &rec);
+            if (!th08_me_bullet_adopt_add(node, &rec))
+            {
+                th08_me_bullet_adopt_note(TH08_ME_BULLET_STAT_OVERFLOW);
+                goto capture_full;
+            }
+            ++count;
+        }
+    }
+capture_full:
+    void *out = NULL;
+    if (count != 0U)
+        out = th08_psp_bullet_me_reserve(g_Supervisor.d3dDevice, count);
+    th08_me_bullet_adopt_submit(out, out != NULL ? count : 0U);
+    g_PspMeBulletFrameCaptured = true;
+}
+
+#endif
+
 ChainCallbackResult BulletManager::OnDraw(BulletManager *bulletManager)
 {
 #if TH08_PSP_PERF_ATTRIBUTION_ENABLED
@@ -2751,6 +3217,47 @@ ChainCallbackResult BulletManager::OnDraw(BulletManager *bulletManager)
         g_AnmManager->SetMixColor(0xfff01010);
 
     laser = bulletManager->lasers;
+#if TH08_PSP_ME_BULLET_ANY_ENABLED
+    {
+        PspMeBulletDrawState &st = g_PspMeBulletDrawState;
+        st.valid = true;
+        st.shakeX = g_AnmManager->screenShakeOffset.x;
+        st.shakeY = g_AnmManager->screenShakeOffset.y;
+        st.vpX = static_cast<float>(g_Supervisor.viewport.X);
+        st.vpY = static_cast<float>(g_Supervisor.viewport.Y);
+        st.vpW = static_cast<float>(g_Supervisor.viewport.Width);
+        st.vpH = static_cast<float>(g_Supervisor.viewport.Height);
+        st.useMixColor = g_AnmManager->useMixColor ? 1U : 0U;
+        st.mixColor = g_AnmManager->color.d3dColor;
+    }
+    g_PspMeRun.active = false;
+    g_PspMeRun.runCount = 0U;
+    g_PspMeRun.index = 0U;
+    if (g_PspMeBulletFrameCaptured)
+    {
+        g_PspMeBulletFrameCaptured = false;
+        const PspMeBulletDrawState &st = g_PspMeBulletDrawState;
+        const int pspMeState = th08_me_bullet_adopt_state_matches(st.shakeX, st.shakeY, st.vpX, st.vpY, st.vpW, st.vpH,
+                                                                  st.useMixColor, st.mixColor);
+        if (pspMeState == 2)
+        {
+            // No items or bullets were captured this frame.
+        }
+        else if (pspMeState == 0)
+            th08_me_bullet_adopt_note(TH08_ME_BULLET_STAT_FB_STATE);
+        else if (!th08_psp_bullet_me_color_identity(g_Supervisor.d3dDevice))
+            th08_me_bullet_adopt_note(TH08_ME_BULLET_STAT_FB_COLOR);
+        else if (th08_me_bullet_adopt_acquire(3000U, &g_PspMeRun.count, &g_PspMeRun.drawn) != 0)
+        {
+            g_PspMeRun.indices = g_AnmManager->PspBulletUnifiedQuadIndices();
+            g_PspMeRun.verts = th08_me_bullet_adopt_vertices();
+            if (g_PspMeRun.indices == NULL)
+                th08_me_bullet_adopt_note(TH08_ME_BULLET_STAT_FB_STATE);
+            else
+                g_PspMeRun.active = true;
+        }
+    }
+#endif
 #if defined(PSP) && TH08_PSP_ITEM_MIXED_QUADS_ENABLED
     g_AnmManager->BeginPspItemMixedQuadBatch();
 #elif defined(PSP) && defined(TH08_PSP_ITEM_DIRECT_GE) && \
@@ -2821,15 +3328,68 @@ ChainCallbackResult BulletManager::OnDraw(BulletManager *bulletManager)
     TH08_PSP_BULLET_UNIFIED_QUADS
     g_AnmManager->BeginPspBulletUnifiedQuadBatch();
 #endif
+#if TH08_PSP_ME_BULLET_ANY_ENABLED
+    struct PspMeBulletReleaseGuard
+    {
+        ~PspMeBulletReleaseGuard()
+        {
+            PspMeRunFlush();
+            g_PspMeRun.active = false;
+            th08_me_bullet_adopt_release();
+        }
+    } pspMeBulletReleaseGuard;
+#endif
     for (i = 0; i < 6; i++)
     {
         node = bulletManager->drawBuckets[i];
         while (node != NULL)
         {
+#if TH08_PSP_ME_BULLET_ANY_ENABLED
+            if (g_PspMeRun.active)
+            {
+#if TH08_PSP_ME_BULLET_ADOPT_AUDIT_ENABLED
+                // Audit: DrawSingleBullet performs the mutations and the canonical draw.
+                if (g_PspMeRun.index < g_PspMeRun.count && th08_me_bullet_adopt_tag(g_PspMeRun.index) == node)
+                {
+                    const unsigned int status = th08_me_bullet_adopt_status(g_PspMeRun.index);
+                    ++g_PspMeRun.index;
+                    const u32 spritesBefore = g_AnmManager->spritesToDraw;
+                    node->DrawSingleBullet();
+                    PspMeRunAuditCompare(status, g_AnmManager->spritesToDraw != spritesBefore, PspMeBulletSelectVm(node));
+                    node = node->nextInDrawBucket;
+                    continue;
+                }
+                g_PspMeRun.active = false;
+                th08_me_bullet_adopt_note(TH08_ME_BULLET_STAT_FB_ORDER);
+#else
+                // The original per-draw VM mutations (position, forced
+                // color, SetZRotation) are kept so VM state is identical.
+                AnmVm *vm = PspMeBulletSelectVm(node);
+                vm->pos.x = g_GameManager.arcadeRegionTopLeftPos.x + node->position.x;
+                vm->pos.y = g_GameManager.arcadeRegionTopLeftPos.y + node->position.y;
+                vm->pos.z = 0.05f;
+                vm->color1.d3dColor = (vm->color1.d3dColor & 0xff000000) | 0xffffff;
+                if (vm->type != 0)
+                {
+                    f32 renderAngle, sine, cosine;
+                    PspMeBulletRenderRotation(node, &renderAngle, &sine, &cosine);
+                    vm->SetZRotation(renderAngle);
+                }
+                if (PspMeRunTake(node, vm))
+                {
+                    node = node->nextInDrawBucket;
+                    continue;
+                }
+#endif
+            }
+#endif
             node->DrawSingleBullet();
             node = node->nextInDrawBucket;
         }
     }
+#if TH08_PSP_ME_BULLET_ANY_ENABLED
+    PspMeRunFlush();
+#endif
 #if defined(PSP) && defined(TH08_PSP_BULLET_UNIFIED_QUADS) && \
     TH08_PSP_BULLET_UNIFIED_QUADS
     g_AnmManager->EndPspBulletUnifiedQuadBatch();
@@ -3098,3 +3658,14 @@ i32 IsBulletManagerAnmReleaseRequired()
 }
 
 } /* namespace th08 */
+
+#if defined(PSP)
+// Occupancy bitmap (bit i = slot i) for the Media Engine bullet job; NULL when
+// the live enumerator cannot be trusted this frame.
+extern "C" const unsigned int *th08_psp_bullet_active_bits(void)
+{
+    return (th08::g_PspBulletRuntimeActiveBitsValid && th08::g_PspBulletRuntimeCache != NULL)
+               ? reinterpret_cast<const unsigned int *>(th08::g_PspBulletRuntimeCache->activeBits)
+               : NULL;
+}
+#endif

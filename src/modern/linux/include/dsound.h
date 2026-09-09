@@ -43,6 +43,9 @@ class IDirectSoundBuffer
     virtual ULONG Release() = 0;
     virtual HRESULT QueryInterface(REFIID, void **) = 0;
     virtual HRESULT GetCurrentPosition(LPDWORD, LPDWORD) = 0;
+    // PSP streaming catch-up: bytes played since the last SetCurrentPosition,
+    // counting whole laps of the ring (E_NOTIMPL when the buffer cannot tell).
+    virtual HRESULT GetPspPlayedTotal(unsigned long long *) { return E_NOTIMPL; }
     virtual HRESULT GetStatus(LPDWORD) = 0;
     virtual HRESULT Initialize(void *, const DSBUFFERDESC *) = 0;
     virtual HRESULT Lock(DWORD, DWORD, LPVOID *, LPDWORD, LPVOID *, LPDWORD, DWORD) = 0;

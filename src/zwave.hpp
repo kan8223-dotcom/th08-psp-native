@@ -153,6 +153,10 @@ class CStreamingSound : public CSound
     ~CStreamingSound();
 
     HRESULT HandleWaveStreamNotification(BOOL bLoopedPlay);
+#if defined(PSP) && defined(TH08_PSP_BGM_CATCHUP) && TH08_PSP_BGM_CATCHUP
+    HRESULT HandleWaveStreamNotificationOnce(BOOL bLoopedPlay);
+    unsigned long long m_pspWrittenTotal;
+#endif
     HRESULT Reset();
 
     // Modifications by ZUN to this class

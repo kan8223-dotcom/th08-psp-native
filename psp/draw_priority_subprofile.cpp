@@ -1,4 +1,5 @@
 #include "draw_priority_subprofile.hpp"
+#include <cstdio>
 
 #if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
 
@@ -34,6 +35,8 @@ std::uint32_t gBinGeWaitCalls[kDrawPriorityBinCount]{};
 std::uint32_t gGeWaitFrames = 0U;
 DrawPriorityDurationStat gDrawChainStat{};
 DrawPriorityDurationStat gEffectBackgroundStat{};
+DrawPriorityDurationStat gSlotStats[kDrawPrioritySlotCount]{};
+std::uint32_t gCounters[kDrawPriorityCounterCount]{};
 std::uint64_t gPresentedFrameOrdinal = 0U;
 std::uint32_t gSampledFrames = 0U;
 std::uint32_t gTimerReads = 0U;
@@ -100,6 +103,8 @@ void ClearWindowCounters()
     std::memset(gPriorityStats, 0, sizeof(gPriorityStats));
     gDrawChainStat = DrawPriorityDurationStat{};
     gEffectBackgroundStat = DrawPriorityDurationStat{};
+    std::memset(gSlotStats, 0, sizeof(gSlotStats));
+    std::memset(gCounters, 0, sizeof(gCounters));
     gSampledFrames = 0U;
     gTimerReads = 0U;
     gClockRegressionCount = 0U;
@@ -206,6 +211,31 @@ void DrawPrioritySubprofileEndEffectBackground(std::uint64_t startUs)
 {
     const std::uint64_t endUs = DrawPrioritySubprofileReadClock();
     RecordDuration(gEffectBackgroundStat, startUs, endUs);
+}
+
+void DrawPrioritySubprofileCount(unsigned counter)
+{
+    if (gCurrentSampleActive && counter < kDrawPriorityCounterCount)
+        IncrementSaturating(gCounters[counter]);
+}
+
+bool DrawPrioritySubprofileBeginSlot(unsigned slot, std::uint64_t &startUs)
+{
+    if (!gCurrentSampleActive || slot >= kDrawPrioritySlotCount)
+    {
+        startUs = 0U;
+        return false;
+    }
+    startUs = DrawPrioritySubprofileReadClock();
+    return true;
+}
+
+void DrawPrioritySubprofileEndSlot(unsigned slot, std::uint64_t startUs)
+{
+    if (slot >= kDrawPrioritySlotCount)
+        return;
+    const std::uint64_t endUs = DrawPrioritySubprofileReadClock();
+    RecordDuration(gSlotStats[slot], startUs, endUs);
 }
 
 void DrawPrioritySubprofileResetWindow(bool active)
@@ -357,6 +387,23 @@ void DrawPrioritySubprofileEmitGeWindow(std::int32_t stage,
         TH08_DRAW_PRIORITY_GE_ARGS(20), TH08_DRAW_PRIORITY_GE_ARGS(21),
         TH08_DRAW_PRIORITY_GE_ARGS(kDrawPriorityOtherBin));
 #undef TH08_DRAW_PRIORITY_GE_ARGS
+    static const char *const kSlotNames[kDrawPrioritySlotCount] = {
+        "clear", "sprites", "effectcb", "zclear", "state", "obj0", "obj1", "obj2", "obj3", "spell",
+        "objdraw", "objfog", "prep", "submit"};
+    char line[640];
+    int used = std::snprintf(line, sizeof(line), "BG_SUB V1 st=%ld sf=%lu-%lu",
+                            static_cast<long>(stage), static_cast<unsigned long>(baselineStageFrame),
+                            static_cast<unsigned long>(stageFrame));
+    for (unsigned i = 0U; i < kDrawPrioritySlotCount && used > 0 && used < static_cast<int>(sizeof(line)); ++i)
+        used += std::snprintf(line + used, sizeof(line) - static_cast<std::size_t>(used), " %s=%llu/%llu/%lu",
+                             kSlotNames[i], static_cast<unsigned long long>(gSlotStats[i].totalUs),
+                             static_cast<unsigned long long>(gSlotStats[i].maxUs),
+                             static_cast<unsigned long>(gSlotStats[i].calls));
+    if (used > 0 && used < static_cast<int>(sizeof(line)))
+        std::snprintf(line + used, sizeof(line) - static_cast<std::size_t>(used), " cnt=%lu/%lu/%lu/%lu",
+                      static_cast<unsigned long>(gCounters[0]), static_cast<unsigned long>(gCounters[1]),
+                      static_cast<unsigned long>(gCounters[2]), static_cast<unsigned long>(gCounters[3]));
+    BootLog("%s\n", line);
 }
 } // namespace th08::psp
 

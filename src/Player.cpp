@@ -1,4 +1,10 @@
 #include "th_pch.h"
+#if defined(PSP)
+#include "laser_trig_cache.hpp"
+#endif
+#if defined(PSP)
+#include "fileio.hpp"
+#endif
 
 #include "AsciiManager.hpp"
 #include "Background.hpp"
@@ -707,6 +713,16 @@ PlayerBombWorkItem::PlayerBombWorkItem() {}
 
 // FUNCTION: th08 0x449ff0
 #pragma var_order(halfSize, yDelta, xDelta, i, rotated, delta, slot, boundsMax)
+#if defined(PSP) && defined(TH08_PSP_CANCEL_TRIG_CACHE) && TH08_PSP_CANCEL_TRIG_CACHE
+namespace
+{
+constexpr int kPspCancelRegionSlots = 192; // ARRAY_SIZE(Player::cancelRegions)
+f32 g_PspCancelTrigAngle[kPspCancelRegionSlots];
+f32 g_PspCancelTrigSin[kPspCancelRegionSlots];
+f32 g_PspCancelTrigCos[kPspCancelRegionSlots];
+u8 g_PspCancelTrigValid[kPspCancelRegionSlots];
+} // namespace
+#endif
 i32 Player::CheckBulletCancelCollision(Float3 *position, Float3 *position2)
 {
     Float3 delta;
@@ -832,7 +848,25 @@ i32 Player::CheckBulletCancelCollision(Float3 *position, Float3 *position2)
         {
             delta.x = position->x - slot->center.x;
             delta.y = position->y - slot->center.y;
+#if defined(PSP) && defined(TH08_PSP_CANCEL_TRIG_CACHE) && TH08_PSP_CANCEL_TRIG_CACHE
+            // Rotate() with its two trig evaluations cached per region: the
+            // angle is constant across the bullet loop, so the sine/cosine are
+            // computed once per region per frame (bit-identical products).
+            {
+                const f32 pspRotAngle = -slot->angle;
+                if (!g_PspCancelTrigValid[i] || g_PspCancelTrigAngle[i] != pspRotAngle)
+                {
+                    g_PspCancelTrigSin[i] = X87CompatibleSin(pspRotAngle);
+                    g_PspCancelTrigCos[i] = X87CompatibleCos(pspRotAngle);
+                    g_PspCancelTrigAngle[i] = pspRotAngle;
+                    g_PspCancelTrigValid[i] = 1;
+                }
+                rotated.x = X87CompatibleMulSub(g_PspCancelTrigCos[i], delta.x, g_PspCancelTrigSin[i], delta.y);
+                rotated.y = X87CompatibleMulAdd(g_PspCancelTrigCos[i], delta.y, g_PspCancelTrigSin[i], delta.x);
+            }
+#else
             Rotate(&rotated, &delta, -slot->angle);
+#endif
             halfSize.x = slot->size.x / 2.0f;
             halfSize.y = slot->size.y / 2.0f;
             if (-halfSize.x <= rotated.x && rotated.x <= halfSize.x && -halfSize.y <= rotated.y &&
@@ -1004,7 +1038,11 @@ u32 Player::CalcLaserHitbox(Float3 *position, Float3 *size, Float3 *origin, f32 
     Float3 playerMax;
 
     incomingMin = this->position - *origin;
+#if TH08_PSP_LASER_TRIG_ENABLED
+    psp::LaserRotate(&incomingMax, &incomingMin, -angle);
+#else
     Rotate(&incomingMax, &incomingMin, -angle);
+#endif
     incomingMax.z = 0.0f;
     incomingMin = incomingMax + *origin;
 
@@ -1112,6 +1150,11 @@ void Player::Die()
     Effect *effect;
 
     utils::DebugPrint("player DEAD");
+#if defined(PSP)
+    th08::psp::BootLog("PLAYER_DIE stage=%d frame=%lu lives=%d replay=%d\n", (int)g_GameManager.currentStage,
+                       (unsigned long)g_GameManager.stageActiveFrames, (int)g_GameManager.globals->livesRemaining,
+                       (int)g_GameManager.flags.isReplay);
+#endif
     g_GameManager.scriptedUpdateFreeze = 0;
     g_GameManager.UpdateAntiTamper();
     g_EffectManager.SpawnEffect(6, reinterpret_cast<D3DXVECTOR3 *>(&this->position), 16, -1);

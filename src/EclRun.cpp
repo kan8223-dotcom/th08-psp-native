@@ -1,4 +1,7 @@
 #include "EclManager.hpp"
+#if defined(PSP)
+#include "fileio.hpp"
+#endif
 #include "EclOperands.hpp"
 #include "AsciiManager.hpp"
 #include "Gui.hpp"
@@ -83,6 +86,14 @@ low_redispatch_instruction:
 #define TH08_ECL_RUN_LOW_BODY
 #define TH08_ECL_RUN_HIGH_BODY
 #define TH08_ECL_RUN_SHARED_SWITCH
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+            if (enemy->enemyIndex == 1 && g_GameManager.currentStage == 0 && g_GameManager.stageActiveFrames >= 7070 &&
+                g_GameManager.stageActiveFrames <= 7077)
+                th08::psp::BootLog("ECL_OP_TRACE f=%lu enemy=1 op=%d f1=%08lx f2=%08lx life=%ld att=%d\n",
+                                   (unsigned long)g_GameManager.stageActiveFrames, (int)instruction->opcode,
+                                   (unsigned long)enemy->flags1, (unsigned long)enemy->flags2, (long)enemy->life,
+                                   (int)enemy->attachedEffectCount);
+#endif
             switch (instruction->opcode)
             {
                 {

@@ -15,6 +15,20 @@
 #if defined(PSP)
 #include "psp/stage_script_arena.hpp"
 #include "psp/debug_start_stage.hpp"
+#if defined(PSP) && TH08_PSP_DEBUG_START_STAGE_ENABLED
+#include "GameManager.hpp"
+#define TH08_PSP_CHAIN_TRACE(kind, prio)                                                                              \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (g_GameManager.currentStage == 7 && g_GameManager.stageActiveFrames >= 1150 &&                              \
+            g_GameManager.stageActiveFrames <= 1950)                                                                   \
+        {                                                                                                              \
+            th08::psp::BootLog("CHAIN " kind " prio=%d\n", static_cast<int>(prio));                                    \
+        }                                                                                                              \
+    } while (0)
+#else
+#define TH08_PSP_CHAIN_TRACE(kind, prio) do { } while (0)
+#endif
 #include "psp/render_resource_arena.hpp"
 #endif
 #include "Supervisor.hpp"
@@ -179,6 +193,7 @@ restart_from_first_job:
         {
         execute_again:
             g_Supervisor.LeaveCriticalSectionWrapper(0);
+            TH08_PSP_CHAIN_TRACE("calc", current->priority);
             result = current->callback(current->arg);
             g_Supervisor.EnterCriticalSectionWrapper(0);
 
@@ -267,6 +282,7 @@ int Chain::RunDrawChain()
                     psp::DrawPrioritySubprofileReadClock();
             }
 #endif
+            TH08_PSP_CHAIN_TRACE("draw", current->priority);
             result = current->callback(current->arg);
 #if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
             if (drawPrioritySampleActive)
@@ -490,8 +506,7 @@ u16 Controller::GetControllerInput(u16 buttons)
 {
 #if defined(PSP) && TH08_PSP_DEBUG_START_STAGE_ENABLED
     // Debug title auto-advance (no host input): tap SHOOT on a schedule.
-    if (th08::psp::DebugAutoStartButtons() != 0U)
-        buttons |= TH_BUTTON_SHOOT;
+    buttons |= static_cast<u16>(th08::psp::DebugAutoStartButtons());
 #endif
     JOYINFOEX joystickState;
     u32 axisDeadzone;
@@ -1163,6 +1178,25 @@ DWORD FileSystem::GetArchiveEntrySize(LPCSTR path)
     return size;
 }
 
+#if defined(PSP)
+namespace
+{
+unsigned char g_PspScoreDatCache[65536];
+DWORD g_PspScoreDatCacheSize = 0;
+bool g_PspScoreDatCacheValid = false;
+bool PspSmallFileCacheMatches(LPCSTR path)
+{
+    if (path == NULL)
+        return false;
+    const char *base = path;
+    for (const char *p = path; *p != '\0'; ++p)
+        if (*p == '/' || *p == '\\')
+            base = p + 1;
+    return strcmp(base, "score.dat") == 0;
+}
+} // namespace
+#endif
+
 LPBYTE FileSystem::OpenArchiveFileInto(LPCSTR path, i32 *fileSize,
                                        LPBYTE destination,
                                        size_t destinationCapacity)
@@ -1288,6 +1322,23 @@ LPBYTE FileSystem::OpenFile(LPCSTR path, i32 *fileSize, BOOL isExternalResource)
 
     utils::DebugPrint("%s Load ... \r\n", path);
 
+#if defined(PSP)
+    // score.dat is re-read at every result/title screen; on the Go's internal
+    // storage any single read can stall for 30 s, so serve it from the copy
+    // taken at the first read (WriteDataToFile refreshes the copy).
+    if (PspSmallFileCacheMatches(path) && g_PspScoreDatCacheValid)
+    {
+        size = g_PspScoreDatCacheSize;
+        data = (LPBYTE)g_ZunMemory.Alloc(size, path);
+        if (data == NULL)
+            goto error;
+        memcpy(data, g_PspScoreDatCache, size);
+        if (fileSize != NULL)
+            *fileSize = size;
+        data = TryDecryptFromTable(data, fileSize, size);
+        goto done;
+    }
+#endif
     handle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING,
                          FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL, NULL);
     if (handle == INVALID_HANDLE_VALUE)
@@ -1312,6 +1363,14 @@ LPBYTE FileSystem::OpenFile(LPCSTR path, i32 *fileSize, BOOL isExternalResource)
     }
 
     CloseHandle(handle);
+#if defined(PSP)
+    if (PspSmallFileCacheMatches(path) && size <= sizeof(g_PspScoreDatCache))
+    {
+        memcpy(g_PspScoreDatCache, data, size);
+        g_PspScoreDatCacheSize = size;
+        g_PspScoreDatCacheValid = true;
+    }
+#endif
     data = TryDecryptFromTable(data, fileSize, size);
 
 done:
@@ -1361,6 +1420,19 @@ int FileSystem::WriteDataToFile(LPCSTR path, LPVOID data, size_t size)
     }
 
     WriteFile(handle, data, size, &numBytesWritten, NULL);
+#if defined(PSP)
+    if (PspSmallFileCacheMatches(path))
+    {
+        if (size == numBytesWritten && size <= sizeof(g_PspScoreDatCache))
+        {
+            memcpy(g_PspScoreDatCache, data, size);
+            g_PspScoreDatCacheSize = size;
+            g_PspScoreDatCacheValid = true;
+        }
+        else
+            g_PspScoreDatCacheValid = false;
+    }
+#endif
     if (size != numBytesWritten)
     {
         CloseHandle(handle);
@@ -1452,8 +1524,25 @@ u32 Rng::GetGenerationCount() const
     return this->generationCount;
 }
 
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+extern "C" unsigned long g_PspRngTraceFrame;
+extern "C" { unsigned long g_PspRngTraceFrame = 0; }
+#define TH08_PSP_RNG_TRACE(tag)                                                                                   \
+    do                                                                                                            \
+    {                                                                                                             \
+        if (g_PspRngTraceFrame != 0)                                                                              \
+        {                                                                                                         \
+            th08::psp::BootLog("RNG_CALL f=%lu %s n=%lu ra=%08lx\n", g_PspRngTraceFrame, tag,                    \
+                               (unsigned long)this->generationCount,                                              \
+                               (unsigned long)(uintptr_t)__builtin_return_address(0));                            \
+        }                                                                                                         \
+    } while (0)
+#else
+#define TH08_PSP_RNG_TRACE(tag) do { } while (0)
+#endif
 u16 Rng::GetRandomU16(void)
 {
+    TH08_PSP_RNG_TRACE("u16");
     u16 temp = (this->seed ^ 0x9630) - 0x6553;
     this->seed = (((temp & 0xc000) >> 14) + temp * 4) & 0xffff;
     this->generationCount++;
@@ -1462,11 +1551,13 @@ u16 Rng::GetRandomU16(void)
 
 u32 Rng::GetRandomU32(void)
 {
+    TH08_PSP_RNG_TRACE("u32");
     return GetRandomU16() << 16 | GetRandomU16();
 }
 
 f32 Rng::GetRandomF32(void)
 {
+    TH08_PSP_RNG_TRACE("f32");
     // XXX: Divisor is rounded is rounded to UINT_MAX+1 because of floating point
     // jank
     return (f32)GetRandomU32() / (f32)UINT_MAX;
@@ -1474,6 +1565,7 @@ f32 Rng::GetRandomF32(void)
 
 f32 Rng::GetRandomF32Signed(void)
 {
+    TH08_PSP_RNG_TRACE("f32s");
     // XXX: Divisor is rounded is rounded to INT_MAX+1 because of floating point
     // jank
     return (f32)GetRandomU32() / (f32)INT_MAX - 1.0f;

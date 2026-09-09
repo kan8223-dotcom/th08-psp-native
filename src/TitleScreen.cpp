@@ -1,4 +1,8 @@
 #include "th_pch.h"
+#if defined(PSP)
+#include "fileio.hpp"
+#include "newlib_heap_geometry.hpp"
+#endif
 
 #include "AsciiManager.hpp"
 #include "GameManager.hpp"
@@ -402,6 +406,75 @@ ChainCallbackResult TitleScreen::OnUpdate(TitleScreen *titleScreen)
     return result;
 }
 
+#if defined(PSP)
+namespace
+{
+// PSP-only sidecar: do not change the retail TitleScreen layout.
+#if defined(TH08_PSP_REPLAY_SURFACE_RECOVERY) && TH08_PSP_REPLAY_SURFACE_RECOVERY
+TitleScreen *g_PspReplaySurfaceOwner = NULL;
+unsigned int g_PspReplaySurfaceAttempts = 0;
+bool PspPrepareReplaySurface(TitleScreen *owner)
+{
+    if (g_PspReplaySurfaceOwner != owner)
+    {
+        g_PspReplaySurfaceOwner = owner;
+        g_PspReplaySurfaceAttempts = 0;
+    }
+    const unsigned int attempt = ++g_PspReplaySurfaceAttempts;
+    if (g_AnmManager->LoadSurface(0, "title/select00.png") == ZUN_SUCCESS)
+    {
+        psp::BootLog("REPLAY_SURFACE result=READY attempt=%u\n", attempt);
+        g_PspReplaySurfaceAttempts = 0;
+        return true;
+    }
+    // Discard only the failed compressed input. Re-read on the next update;
+    // never release the still-valid background, or leak this input into the
+    // later title00.png load (the original preload has no filename tag).
+    if (g_AnmManager->surfaceData[0] != NULL)
+        g_ZunMemory.Free(g_AnmManager->surfaceData[0]);
+    g_AnmManager->surfaceData[0] = NULL;
+    g_AnmManager->surfaceDataSizes[0] = 0;
+    const bool oldLive = g_AnmManager->surfaces[0] != NULL || g_AnmManager->surfacesBis[0] != NULL;
+    psp::BootLog("REPLAY_SURFACE result=%s attempt=%u old_live=%d\n",
+                 attempt < 3U ? "RETRY" : "KEEP_PREVIOUS", attempt, oldLive ? 1 : 0);
+    if (attempt < 3U)
+        return false;
+    g_PspReplaySurfaceAttempts = 0;
+    return true; // Keep the menu functional even if no replacement decodes.
+}
+#endif
+// Per-list-entry copies of the stage records so the replay-select screen
+// needs neither a second file read nor a ~250 KiB decode buffer on the PSP.
+StageReplayData g_PspReplayStageCache[TITLE_MAX_REPLAYS][MAX_STAGES];
+void PspCacheReplayStages(ReplayData *dst, const ReplayData *src, int slot)
+{
+    for (int st = 0; st < MAX_STAGES; st++)
+    {
+#ifdef TH08_PORTABLE_NATIVE_LAYOUT
+        const StageReplayData *rec = TH08_REPLAY_STAGE_DATA(src, st);
+#else
+        // Retail layout: LoadReplayData leaves file offsets in the header;
+        // the pointer fix-up only happens when a replay is selected.
+        const StageReplayData *rec =
+            src->header.stageReplayData[st] != NULL
+                ? reinterpret_cast<const StageReplayData *>(reinterpret_cast<const u8 *>(src) +
+                                                            reinterpret_cast<u32>(src->header.stageReplayData[st]))
+                : NULL;
+#endif
+        if (rec != NULL)
+        {
+            memcpy(&g_PspReplayStageCache[slot][st], rec, sizeof(StageReplayData));
+            TH08_REPLAY_STAGE_DATA(dst, st) = &g_PspReplayStageCache[slot][st];
+        }
+        else
+        {
+            TH08_REPLAY_STAGE_DATA(dst, st) = NULL;
+        }
+        TH08_REPLAY_FPS_DATA(dst, st) = NULL;
+    }
+}
+} // namespace
+#endif
 ChainCallbackResult TitleScreen::OnUpdateStartMenu()
 {
     i32 i;
@@ -554,6 +627,53 @@ ChainCallbackResult TitleScreen::OnUpdateStartMenu()
             }
         }
 
+#if defined(PSP) && TH08_PSP_DEBUG_START_STAGE_ENABLED
+        {
+        const char *pspDebugReplayName = this->stateTimer2 >= 10 ? th08::psp::DebugReplayAutoStart() : NULL;
+        if (pspDebugReplayName != NULL)
+        {
+            char pspDebugReplayPath[96];
+            sprintf(pspDebugReplayPath, "./replay/%s", pspDebugReplayName);
+            this->currentReplay = (ReplayData *)FileSystem::OpenFile(pspDebugReplayPath, &fileSize, TRUE);
+            this->currentReplay = ReplayManager::LoadReplayData(this->currentReplay, fileSize);
+            th08::psp::BootLog("DEBUG_AUTOSTART replay_open=%s loaded=%d size=%ld\n", pspDebugReplayPath,
+                               this->currentReplay != NULL ? 1 : 0, (long)fileSize);
+            if (this->currentReplay != NULL)
+            {
+                g_GameManager.SetIsReplayWeird(TRUE);
+                strcpy(g_GameManager.replayFilename, pspDebugReplayPath);
+                g_GameManager.difficulty = this->currentReplay->difficulty;
+                g_GameManager.shotType = this->currentReplay->shotType;
+                g_GameManager.flags.isSpellPractice = (this->currentReplay->spellcardNumber >= 0);
+                g_GameManager.currentSpellCardNumber = this->currentReplay->spellcardNumber;
+                i = 0;
+                while (i < MAX_STAGES - 1 && TH08_REPLAY_STAGE_DATA(this->currentReplay, i) == NULL)
+                {
+                    i++;
+                }
+                {
+                    const int pspDebugReplayStage = th08::psp::DebugReplayAutoStartStage();
+                    if (pspDebugReplayStage >= 0 && pspDebugReplayStage < MAX_STAGES &&
+                        TH08_REPLAY_STAGE_DATA(this->currentReplay, pspDebugReplayStage) != NULL)
+                        i = pspDebugReplayStage;
+                    th08::psp::BootLog("DEBUG_AUTOSTART replay_stage=%d start=%d\n", pspDebugReplayStage, i);
+                }
+                #if defined(PSP)
+            if (this->currentReplay < &this->replays[0] || this->currentReplay >= &this->replays[TITLE_MAX_REPLAYS])
+                g_ZunMemory.Free(this->currentReplay);
+#else
+            g_ZunMemory.Free(this->currentReplay);
+#endif
+                this->currentReplay = NULL;
+                g_GameManager.currentStage = i;
+                g_Supervisor.curState = SupervisorState_GameManager;
+                g_GameManager.replayMode = REPLAY_MODE_NORMAL;
+                g_Supervisor.StopAudio();
+                return CHAIN_CALLBACK_RESULT_CONTINUE_AND_REMOVE_JOB;
+            }
+        }
+        }
+#endif
         this->startMenuIdleFrames++;
         if (g_CurFrameInput != 0)
         {
@@ -595,7 +715,12 @@ ChainCallbackResult TitleScreen::OnUpdateStartMenu()
 
                 g_GameManager.currentStage = i;
 
+                #if defined(PSP)
+            if (this->currentReplay < &this->replays[0] || this->currentReplay >= &this->replays[TITLE_MAX_REPLAYS])
                 g_ZunMemory.Free(this->currentReplay);
+#else
+            g_ZunMemory.Free(this->currentReplay);
+#endif
                 this->currentReplay = NULL;
 
                 g_Supervisor.curState = SupervisorState_GameManager;
@@ -3365,10 +3490,15 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
         {
             if (this->previousScreen != TitleCurrentScreen_Replay)
             {
+#if defined(PSP) && defined(TH08_PSP_REPLAY_SURFACE_RECOVERY) && TH08_PSP_REPLAY_SURFACE_RECOVERY
+                if (!PspPrepareReplaySurface(this))
+                    return CHAIN_CALLBACK_RESULT_CONTINUE; // Do not advance the init timers.
+#else
                 if (g_AnmManager->LoadSurface(0, "title/select00.png") != ZUN_SUCCESS)
                 {
                     return CHAIN_CALLBACK_RESULT_CONTINUE_AND_REMOVE_JOB;
                 }
+#endif
             }
 
             g_AnmManager->SetInterruptArray(this->vms, this->vmCount, 14);
@@ -3379,10 +3509,52 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
             this->currentHelpTextVm = NULL;
 
             replayCount = 0;
+#if defined(PSP)
+            // One directory listing instead of 15 blind opens: on the Go's
+            // internal storage a burst of small I/O calls is what triggers the
+            // 30 s stall, so only open slot files that exist.
+            bool pspSlotPresent[15];
+            {
+                WIN32_FIND_DATAA pspSlotFind;
+                int pspSlotsFound = 0;
+                for (i = 0; i < 15; i++)
+                {
+                    pspSlotPresent[i] = false;
+                }
+                HANDLE pspSlotHandle = FindFirstFileA("./replay/th8_??.rpy", &pspSlotFind);
+                if (pspSlotHandle != INVALID_HANDLE_VALUE)
+                {
+                    do
+                    {
+                        const char *pspSlotName = strrchr(pspSlotFind.cFileName, '/');
+                        pspSlotName = pspSlotName != NULL ? pspSlotName + 1 : pspSlotFind.cFileName;
+                        if (strlen(pspSlotName) == 10 && pspSlotName[4] >= '0' && pspSlotName[4] <= '9' &&
+                            pspSlotName[5] >= '0' && pspSlotName[5] <= '9')
+                        {
+                            const int pspSlot = (pspSlotName[4] - '0') * 10 + (pspSlotName[5] - '0');
+                            if (pspSlot >= 1 && pspSlot <= 15)
+                            {
+                                pspSlotPresent[pspSlot - 1] = true;
+                                pspSlotsFound++;
+                            }
+                        }
+                    } while (FindNextFileA(pspSlotHandle, &pspSlotFind));
+                    FindClose(pspSlotHandle);
+                }
+                th08::psp::BootLog("REPLAY_MENU scan slots=%d\n", pspSlotsFound);
+            th08::psp::FlushBootLog();
+            }
+#endif
 
             for (i = 0; i < 15; i++)
             {
                 sprintf(path, "./replay/th8_%.2d.rpy", i + 1);
+#if defined(PSP)
+                if (!pspSlotPresent[i])
+                {
+                    continue;
+                }
+#endif
 
                 replayData = (ReplayData *)FileSystem::OpenFile(path, &fileSize, TRUE);
                 if (replayData == NULL)
@@ -3394,6 +3566,11 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
                 if (replayData != NULL)
                 {
                     this->replays[replayCount] = *replayData;
+#if defined(PSP)
+                    PspCacheReplayStages(&this->replays[replayCount], replayData, replayCount);
+                    th08::psp::BootLog("REPLAY_MENU entry=%d cached\n", replayCount);
+                    th08::psp::FlushBootLog();
+#endif
 
                     strcpy(this->replayFilePaths[replayCount], path);
                     sprintf(this->replayNumbers[replayCount], "No.%.2d", i + 1);
@@ -3404,15 +3581,31 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
                 }
             }
 
+#if defined(PSP)
+            // PSP: no chdir.  The kernel and libc keep separate working
+            // directories, so enumerate and open user replays by path instead.
+            _mkdir("./replay");
+            firstFile = FindFirstFileA("./replay/th8_ud????.rpy", &findData);
+#else
             _mkdir("./replay");
             _chdir("./replay");
 
             firstFile = FindFirstFileA("th8_ud????.rpy", &findData);
+#endif
             if (firstFile != INVALID_HANDLE_VALUE)
             {
                 for (i = 0; i < 45; i++)
                 {
+#if defined(PSP)
+                    {
+                        const char *pspUdName = strrchr(findData.cFileName, '/');
+                        pspUdName = pspUdName != NULL ? pspUdName + 1 : findData.cFileName;
+                        sprintf(path, "./replay/%s", pspUdName);
+                        replayData = (ReplayData *)FileSystem::OpenFile(path, &fileSize, TRUE);
+                    }
+#else
                     replayData = (ReplayData *)FileSystem::OpenFile(findData.cFileName, &fileSize, TRUE);
+#endif
                     if (replayData == NULL)
                     {
                         continue;
@@ -3422,8 +3615,17 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
                     if (replayData != NULL)
                     {
                         this->replays[replayCount] = *replayData;
+#if defined(PSP)
+                    PspCacheReplayStages(&this->replays[replayCount], replayData, replayCount);
+                    th08::psp::BootLog("REPLAY_MENU entry=%d cached\n", replayCount);
+                    th08::psp::FlushBootLog();
+#endif
 
+#if defined(PSP)
+                        strcpy(this->replayFilePaths[replayCount], path);
+#else
                         sprintf(this->replayFilePaths[replayCount], "./replay/%s", findData.cFileName);
+#endif
                         sprintf(this->replayNumbers[replayCount], "User ");
 
                         g_ZunMemory.Free(replayData);
@@ -3442,8 +3644,14 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
              * doesn't do anything really if it's invalid.
              */
             FindClose(firstFile);
+#if !defined(PSP)
             _chdir("../");
+#endif
             this->replayCount = replayCount;
+#if defined(PSP)
+            th08::psp::BootLog("REPLAY_MENU scan done total=%d\n", replayCount);
+            th08::psp::FlushBootLog();
+#endif
             this->replayEnumerationResetState = 0;
         }
 
@@ -3498,11 +3706,42 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
             g_AnmManager->SetInterruptArray(this->vms, this->vmCount, 15);
             this->vms[this->selectedReplay % TITLE_REPLAYS_PER_PAGE + 80].SetInterrupt(17);
 
+#if defined(PSP)
+            th08::psp::BootLog("REPLAY_SELECT_BEGIN idx=%d file=%s\n", (int)this->selectedReplay,
+                               this->replayFilePaths[this->selectedReplay]);
+            th08::psp::FlushBootLog();
+#endif
+#if defined(PSP)
+            {
+                const th08::psp::NewlibHeapGeometrySnapshot pspHeap = th08::psp::CaptureNewlibHeapGeometry();
+                th08::psp::BootLog("REPLAY_SELECT heap free=%lu largest=%lu\n", (unsigned long)pspHeap.freeBytes,
+                                   (unsigned long)pspHeap.largestFreeChunkBytes);
+            }
+            // Use the copy made while building the list (stage records cached
+            // above); the real load happens when the stage starts.
+            this->currentReplay = &this->replays[this->selectedReplay];
+            fileSize2 = 0;
+#else
             this->currentReplay =
                 (ReplayData *)FileSystem::OpenFile(this->replayFilePaths[this->selectedReplay], &fileSize2, TRUE);
             this->currentReplay = ReplayManager::LoadReplayData(this->currentReplay, fileSize2);
+#endif
+#if defined(PSP)
+            th08::psp::BootLog("REPLAY_SELECT file=%s size=%ld loaded=%d\n", this->replayFilePaths[this->selectedReplay],
+                               (long)fileSize2, this->currentReplay != NULL ? 1 : 0);
+#endif
+#if defined(PSP)
+            if (this->currentReplay == NULL)
+            {
+                // Could not reload the file: stay on the list instead of
+                // dereferencing NULL below (hard freeze on real hardware).
+                this->currentScreenState = (TitleCurrentScreenState)1;
+                g_SoundPlayer.PlaySoundByIdx(SOUND_BACK, 0);
+                break;
+            }
+#endif
 
-#ifndef TH08_PORTABLE_NATIVE_LAYOUT
+#if !defined(TH08_PORTABLE_NATIVE_LAYOUT) && !defined(PSP)
             for (i = 0; i < MAX_STAGES; i++)
             {
                 if (this->currentReplay->header.stageReplayData[i] != NULL)
@@ -3528,7 +3767,13 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
                 }
             }
 
-            this->resultTextAnm->InitializeAndSetSprite(&this->spellCardNameVms[0], i + 2);
+            // Retail leaves i == MAX_STAGES here (the pointer-fixup loop above);
+            // the portable layout compiles that loop out, so i was stale.
+#if defined(PSP)
+            th08::psp::BootLog("REPLAY_SELECT stage_cursor=%d spellcard=%d\n", (int)this->cursor,
+                               (int)this->replays[this->selectedReplay].spellcardNumber);
+#endif
+            this->resultTextAnm->InitializeAndSetSprite(&this->spellCardNameVms[0], MAX_STAGES + 2);
 
             this->spellCardNameVms[0].pos = Float3(0.0, 0.0, 0.0);
             this->spellCardNameVms[0].anchor = 3;
@@ -3537,6 +3782,10 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
 
             g_AnmManager->DrawTextLeft(&this->spellCardNameVms[0], COLOR_TEXT_WHITE, 0,
                                        this->replays[this->selectedReplay].spellcardName);
+#if defined(PSP)
+            th08::psp::BootLog("REPLAY_SELECT text_done\n");
+            th08::psp::FlushBootLog();
+#endif
 
             this->spellCardNameVms[0].color1.a = 255;
             this->spellCardNameVms[0].color1.r = 255;
@@ -3605,7 +3854,12 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
 
         if (WAS_PRESSED(TH_BUTTON_BOMB | TH_BUTTON_MENU))
         {
+            #if defined(PSP)
+            if (this->currentReplay < &this->replays[0] || this->currentReplay >= &this->replays[TITLE_MAX_REPLAYS])
+                g_ZunMemory.Free(this->currentReplay);
+#else
             g_ZunMemory.Free(this->currentReplay);
+#endif
             this->currentReplay = NULL;
             this->currentScreenState = (TitleCurrentScreenState)1;
             this->stateTimer2 = 0;
@@ -3632,6 +3886,11 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
         }
         if (WAS_PRESSED(TH_BUTTON_SHOOT | TH_BUTTON_ENTER))
         {
+#if defined(PSP)
+            th08::psp::BootLog("REPLAY_LAUNCH file=%s stage=%d mode=%d\n", this->replayFilePaths[this->selectedReplay],
+                               (int)this->selectedReplayStage, (int)this->cursor);
+            th08::psp::FlushBootLog();
+#endif
             g_GameManager.SetIsReplayWeird(TRUE);
 
             strcpy(g_GameManager.replayFilename, this->replayFilePaths[this->selectedReplay]);
@@ -3643,7 +3902,12 @@ ChainCallbackResult TitleScreen::OnUpdateReplayMenu()
             g_GameManager.flags.isSpellPractice = (this->currentReplay->spellcardNumber >= 0);
             g_GameManager.currentSpellCardNumber = this->currentReplay->spellcardNumber;
 
+            #if defined(PSP)
+            if (this->currentReplay < &this->replays[0] || this->currentReplay >= &this->replays[TITLE_MAX_REPLAYS])
+                g_ZunMemory.Free(this->currentReplay);
+#else
             g_ZunMemory.Free(this->currentReplay);
+#endif
             this->currentReplay = NULL;
 
             g_GameManager.currentStage = this->selectedReplayStage;
@@ -4035,7 +4299,12 @@ ZunResult TitleScreen::Release()
 {
     if (this->currentReplay != NULL)
     {
-        g_ZunMemory.Free(this->currentReplay);
+        #if defined(PSP)
+            if (this->currentReplay < &this->replays[0] || this->currentReplay >= &this->replays[TITLE_MAX_REPLAYS])
+                g_ZunMemory.Free(this->currentReplay);
+#else
+            g_ZunMemory.Free(this->currentReplay);
+#endif
         this->currentReplay = NULL;
     }
 
@@ -4051,6 +4320,10 @@ ZunResult TitleScreen::Release()
 
 ZunResult TitleScreen::RegisterChain(i32 registrationReason)
 {
+#if defined(PSP) && defined(TH08_PSP_REPLAY_SURFACE_RECOVERY) && TH08_PSP_REPLAY_SURFACE_RECOVERY
+    g_PspReplaySurfaceOwner = NULL;
+    g_PspReplaySurfaceAttempts = 0;
+#endif
     // GensokyoClub commit 1b630bb supplied this retail-exact allocation
     // shape. The registry label is compiled out of the non-DEBUG target, so
     // "TitleInf" remains upstream provenance rather than a target observation.
@@ -4084,6 +4357,10 @@ ZunResult TitleScreen::AddedCallback(TitleScreen *titleScreen)
 
 ZunResult TitleScreen::DeletedCallback(TitleScreen *titleScreen)
 {
+#if defined(PSP) && defined(TH08_PSP_REPLAY_SURFACE_RECOVERY) && TH08_PSP_REPLAY_SURFACE_RECOVERY
+    g_PspReplaySurfaceOwner = NULL;
+    g_PspReplaySurfaceAttempts = 0;
+#endif
     g_Supervisor.d3dDevice->ResourceManagerDiscardBytes(0);
 
     g_AnmManager->ReleaseAnm(20);

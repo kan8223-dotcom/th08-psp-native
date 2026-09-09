@@ -1,4 +1,35 @@
 #include "th_pch.h"
+#include "psp/me_effect_shadow.hpp"
+#if defined(PSP) && defined(TH08_PSP_ME_BULLET_MOVE) && TH08_PSP_ME_BULLET_MOVE
+#include "psp/me_bullet_move.hpp"
+#endif
+#include "render_math.hpp"
+#include <cstdio>
+#if defined(PSP)
+#include "fileio.hpp"
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+extern "C" unsigned long g_PspRngTraceFrame;
+#endif
+#endif
+#if defined(PSP) && ((defined(TH08_PSP_EFFECT_EARLY_CULL) && TH08_PSP_EFFECT_EARLY_CULL) || \
+    (defined(TH08_PSP_EFFECT_EARLY_CULL_AUDIT) && TH08_PSP_EFFECT_EARLY_CULL_AUDIT))
+#define TH08_PSP_EFFECT_EARLY_CULL_ENABLED 1
+#include "fileio.hpp"
+#include <math.h>
+extern "C" unsigned int sceKernelGetSystemTimeLow(void); // pspkernel.h clashes with the game typedefs
+#else
+#define TH08_PSP_EFFECT_EARLY_CULL_ENABLED 0
+#endif
+#if defined(PSP) && defined(TH08_PSP_EFFECT_EARLY_CULL_AUDIT) && TH08_PSP_EFFECT_EARLY_CULL_AUDIT
+#define TH08_PSP_EFFECT_EARLY_CULL_AUDIT_ENABLED 1
+extern "C" unsigned int g_PspSpritesAddedCount;
+#else
+#define TH08_PSP_EFFECT_EARLY_CULL_AUDIT_ENABLED 0
+#endif
+#if TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+#include <cstring>
+extern "C" unsigned int g_PspSpritesAddedCount;
+#endif
 
 #include "EclManager.hpp"
 #include "EclOperands.hpp"
@@ -1695,6 +1726,13 @@ void EffectManager::ResetEffects()
 #pragma var_order(effect, i)
 Effect *EffectManager::SpawnEffect(i32 id, D3DXVECTOR3 *position, i32 count, i32 color)
 {
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+    {
+        if (g_PspRngTraceFrame != 0)
+            th08::psp::BootLog("EFFECT_SPAWN f=%lu id=%d count=%d ra=%08lx\n", g_PspRngTraceFrame, (int)id, (int)count,
+                               (unsigned long)(uintptr_t)__builtin_return_address(0));
+    }
+#endif
 #if defined(PSP)
     if (count > 0)
         th08::psp::RenderPerfNoteEffectSpawnRequest(static_cast<u32>(count));
@@ -2483,7 +2521,15 @@ i32 __fastcall DrawRadialTrail(Effect *effect)
                     angle -= ZUN_2PI;
 
                 vertex->pos.z = 0.0f;
-#if defined(PSP) && defined(TH08_PSP_RADIAL_TRAIL_TRIG_REUSE) && \
+#if defined(PSP) && defined(TH08_PSP_RADIAL_TRAIL_FAST_TRIG) && \
+    TH08_PSP_RADIAL_TRAIL_FAST_TRIG
+                // Presentation only (nothing feeds simulation): single
+                // precision table trig instead of software binary64.
+                f32 radialFastSin, radialFastCos;
+                th08::psp::RenderSinCos(angle, &radialFastSin, &radialFastCos);
+                vertex->pos.x = radialFastCos * radius;
+                vertex->pos.y = radialFastSin * radius;
+#elif defined(PSP) && defined(TH08_PSP_RADIAL_TRAIL_TRIG_REUSE) && \
     TH08_PSP_RADIAL_TRAIL_TRIG_REUSE
                 // Presentation-only M1: both radii use the same canonical
                 // binary64 sin/cos pair.  Keep the Float3 stores/adds in their
@@ -2506,7 +2552,11 @@ i32 __fastcall DrawRadialTrail(Effect *effect)
                 vertex++;
 
                 vertex->pos.z = 0.0f;
-#if defined(PSP) && defined(TH08_PSP_RADIAL_TRAIL_TRIG_REUSE) && \
+#if defined(PSP) && defined(TH08_PSP_RADIAL_TRAIL_FAST_TRIG) && \
+    TH08_PSP_RADIAL_TRAIL_FAST_TRIG
+                vertex->pos.x = radialFastCos * innerRadius;
+                vertex->pos.y = radialFastSin * innerRadius;
+#elif defined(PSP) && defined(TH08_PSP_RADIAL_TRAIL_TRIG_REUSE) && \
     TH08_PSP_RADIAL_TRAIL_TRIG_REUSE
                 vertex->pos.x =
                     th08::psp::CanonicalRadialCosMul(radialTrig, innerRadius);
@@ -2688,8 +2738,19 @@ i32 __fastcall SyncAnchoredRadialTrail(Effect *effect)
 
 // FUNCTION: th08 0x427bf0
 #pragma var_order(effect, i)
+#if defined(PSP)
+// Which effects are alive, by draw group (0..6, 7 = other) and id: printed
+// as the top entries every 600 updates so heavy scenes can be attributed.
+static unsigned short g_PspEffectGroupHist[8][128];
+static unsigned long g_PspEffectGroupHistCalls = 0UL;
+#endif
 ChainCallbackResult EffectManager::OnUpdate(EffectManager *effectManager)
 {
+#if defined(PSP) && defined(TH08_PSP_ME_BULLET_MOVE) && TH08_PSP_ME_BULLET_MOVE
+    // Bullet states are final here (enemy ECL and the spell-card update ran):
+    // let the ME advance the fired bullets while effects and items update.
+    th08_psp_me_bullet_move_kick();
+#endif
 #if TH08_PSP_PERF_ATTRIBUTION_ENABLED
     th08::psp::PerfAttributionScope perfScope(
         th08::psp::PerfAttributionPhase::EffectUpdate);
@@ -2764,6 +2825,14 @@ ChainCallbackResult EffectManager::OnUpdate(EffectManager *effectManager)
         }
 
         effect->nextInDrawGroup = NULL;
+#if defined(PSP)
+        if (effect->effectId >= 0 && effect->effectId < 128)
+        {
+            const int pspGi = (effect->drawGroup < 0 || effect->drawGroup > 6) ? 7 : effect->drawGroup;
+            if (g_PspEffectGroupHist[pspGi][effect->effectId] < 65535U)
+                ++g_PspEffectGroupHist[pspGi][effect->effectId];
+        }
+#endif
         if (effect->effectId == 0x40)
             continue;
 
@@ -2798,6 +2867,33 @@ ChainCallbackResult EffectManager::OnUpdate(EffectManager *effectManager)
     }
 
 #if defined(PSP)
+    if ((++g_PspEffectGroupHistCalls % 600UL) == 0UL)
+    {
+        // Top 12 (group,id) pairs of the last 600 updates.
+        char line[256];
+        int len = 0;
+        for (int rank = 0; rank < 12; ++rank)
+        {
+            int bg = -1, bi = -1;
+            unsigned int best = 0U;
+            for (int g = 0; g < 8; ++g)
+                for (int id = 0; id < 128; ++id)
+                    if (g_PspEffectGroupHist[g][id] > best)
+                    {
+                        best = g_PspEffectGroupHist[g][id];
+                        bg = g;
+                        bi = id;
+                    }
+            if (best == 0U)
+                break;
+            len += snprintf(line + len, sizeof(line) - len, " g%d:%d=%u", bg, bi, best);
+            g_PspEffectGroupHist[bg][bi] = 0U;
+            if (len >= static_cast<int>(sizeof(line)) - 16)
+                break;
+        }
+        th08::psp::BootLog("EFFECT_GROUPS calls=%lu%s\n", g_PspEffectGroupHistCalls, line);
+        memset(g_PspEffectGroupHist, 0, sizeof(g_PspEffectGroupHist));
+    }
     th08::psp::RenderPerfNoteEffectsActive(
         effectManager->activeCount > 0
             ? static_cast<u32>(effectManager->activeCount)
@@ -2810,6 +2906,22 @@ ChainCallbackResult EffectManager::OnUpdate(EffectManager *effectManager)
     return CHAIN_CALLBACK_RESULT_CONTINUE;
 }
 
+#if TH08_PSP_ME_EFFECT_ADOPT_ENABLED || TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+struct PspMeAdoptDrawState
+{
+    bool valid;
+    float shakeX, shakeY;
+    float vpX, vpY, vpW, vpH;
+    unsigned int useMixColor, mixColor;
+    float view[16], proj[16], camRight[3]; // group 1 (camera-facing) draw matrices
+};
+PspMeAdoptDrawState g_PspMeAdoptDrawState;  // channel 0: DrawBackgroundEffects (list 1)
+PspMeAdoptDrawState g_PspMeAdoptDrawState0; // channel 1: OnDraw (list 0, Draw2D)
+bool g_PspMeAdopt0FrameCaptured = false;
+#if TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+extern VertexTex1DiffuseXyzrhw g_QuadVertices[4];
+#endif
+#endif
 // FUNCTION: th08 0x427f00
 #pragma var_order(effect)
 ChainCallbackResult EffectManager::OnDraw(EffectManager *effectManager)
@@ -2837,11 +2949,75 @@ ChainCallbackResult EffectManager::OnDraw(EffectManager *effectManager)
         effectManager, 0U);
 #endif
 
+#if TH08_PSP_ME_EFFECT_ADOPT_ENABLED || TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+    {
+        PspMeAdoptDrawState &st = g_PspMeAdoptDrawState0;
+        st.valid = true;
+        st.shakeX = g_AnmManager->screenShakeOffset.x;
+        st.shakeY = g_AnmManager->screenShakeOffset.y;
+        st.vpX = static_cast<float>(g_Supervisor.viewport.X);
+        st.vpY = static_cast<float>(g_Supervisor.viewport.Y);
+        st.vpW = static_cast<float>(g_Supervisor.viewport.Width);
+        st.vpH = static_cast<float>(g_Supervisor.viewport.Height);
+        st.useMixColor = g_AnmManager->useMixColor ? 1U : 0U;
+        st.mixColor = g_AnmManager->color.d3dColor;
+    }
+    bool pspAdopt0 = false;
+    unsigned int pspAdopt0Count = 0U, pspAdopt0Index = 0U;
+    th08_me_effect_adopt_select_channel(1U);
+    {
+        static unsigned long pspG0DrawCalls = 0UL, pspG0DrawCaptured = 0UL;
+        ++pspG0DrawCalls;
+        if (g_PspMeAdopt0FrameCaptured)
+            ++pspG0DrawCaptured;
+        if ((pspG0DrawCalls % 600UL) == 0UL)
+            th08::psp::BootLog("ME_G0_DRAW calls=%lu captured=%lu\n", pspG0DrawCalls, pspG0DrawCaptured);
+    }
+    if (g_PspMeAdopt0FrameCaptured)
+    {
+        g_PspMeAdopt0FrameCaptured = false;
+        const PspMeAdoptDrawState &st = g_PspMeAdoptDrawState0;
+        if (th08_me_effect_adopt_state_matches(st.shakeX, st.shakeY, st.vpX, st.vpY, st.vpW, st.vpH, st.useMixColor,
+                                               st.mixColor))
+            pspAdopt0 = th08_me_effect_adopt_acquire(3000U, &pspAdopt0Count) != 0;
+        else
+            th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_FB_STATE);
+    }
+    struct PspMeAdopt0ReleaseGuard
+    {
+        ~PspMeAdopt0ReleaseGuard()
+        {
+            th08_me_effect_adopt_release();
+            th08_me_effect_adopt_select_channel(0U);
+        }
+    } pspMeAdopt0ReleaseGuard;
+#endif
     effect = effectManager->drawGroupSentinel0.nextInDrawGroup;
     while (effect != NULL)
     {
 #if defined(PSP)
         th08::psp::RenderPerfNoteEffectDrawn();
+#endif
+#if TH08_PSP_ME_EFFECT_ADOPT_ENABLED || TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+        bool pspAdoptThis = false;
+        unsigned int pspAdoptKind = 3U;
+        const PspMeEffectQuad *pspAdoptQuad = NULL;
+        if (pspAdopt0)
+        {
+            if (pspAdopt0Index < pspAdopt0Count && th08_me_effect_adopt_entry_tag(pspAdopt0Index) == effect)
+            {
+                pspAdoptKind = th08_me_effect_adopt_entry_kind(pspAdopt0Index);
+                if (pspAdoptKind == 0U)
+                    pspAdoptQuad = th08_me_effect_adopt_entry_quad(pspAdopt0Index);
+                ++pspAdopt0Index;
+                pspAdoptThis = pspAdoptKind != 3U;
+            }
+            else
+            {
+                pspAdopt0 = false;
+                th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_FB_ORDER);
+            }
+        }
 #endif
         if (effect->drawCallback != NULL)
         {
@@ -2865,6 +3041,70 @@ ChainCallbackResult EffectManager::OnDraw(EffectManager *effectManager)
     TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH
             pspEffectSpritePairGroup0.Draw(effect);
 #else
+#if TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+            if (pspAdoptThis)
+            {
+                const unsigned int pspSpritesBefore = g_PspSpritesAddedCount;
+                g_AnmManager->Draw2D(&effect->vm);
+                const bool pspDrawn = g_PspSpritesAddedCount != pspSpritesBefore;
+                const bool pspExpectDrawn = pspAdoptKind == 0U && pspAdoptQuad->culled == 0U;
+                if (pspDrawn != pspExpectDrawn)
+                {
+                    th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_AUDIT_CULL);
+                    static unsigned int pspG0CullSamples = 0U;
+                    if (pspG0CullSamples < 6U)
+                    {
+                        ++pspG0CullSamples;
+                        th08::psp::BootLog("ME_G0_AUDIT cull id=%d drawn=%d kind=%u culled=%u rot=%f pos=%f,%f\n",
+                                           effect->effectId, pspDrawn ? 1 : 0, pspAdoptKind,
+                                           pspAdoptKind == 0U ? pspAdoptQuad->culled : 9U, effect->vm.rotation.z,
+                                           effect->vm.pos.x, effect->vm.pos.y);
+                    }
+                }
+                else if (pspDrawn)
+                {
+                    bool same = true;
+                    int badK = -1;
+                    for (int k = 0; k < 4 && same; ++k)
+                    {
+                        same = std::memcmp(&g_QuadVertices[k].pos.x, &pspAdoptQuad->x[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].pos.y, &pspAdoptQuad->y[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].pos.z, &pspAdoptQuad->z[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].textureUV.x, &pspAdoptQuad->u[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].textureUV.y, &pspAdoptQuad->v[k], 4) == 0 &&
+                               g_QuadVertices[k].diffuse == pspAdoptQuad->color;
+                        if (!same)
+                            badK = k;
+                    }
+                    if (!same)
+                    {
+                        th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_AUDIT_QUAD);
+                        static unsigned int pspG0QuadSamples = 0U;
+                        if (pspG0QuadSamples < 8U)
+                        {
+                            ++pspG0QuadSamples;
+                            const int k = badK;
+                            th08::psp::BootLog("ME_G0_AUDIT quad id=%d rot=%f k=%d want %f,%f,%f uv %f,%f c=%08x got %f,%f,%f uv %f,%f c=%08x\n",
+                                               effect->effectId, effect->vm.rotation.z, k, g_QuadVertices[k].pos.x,
+                                               g_QuadVertices[k].pos.y, g_QuadVertices[k].pos.z,
+                                               g_QuadVertices[k].textureUV.x, g_QuadVertices[k].textureUV.y,
+                                               g_QuadVertices[k].diffuse, pspAdoptQuad->x[k], pspAdoptQuad->y[k],
+                                               pspAdoptQuad->z[k], pspAdoptQuad->u[k], pspAdoptQuad->v[k],
+                                               pspAdoptQuad->color);
+                        }
+                    }
+                }
+            }
+            else
+#elif TH08_PSP_ME_EFFECT_ADOPT_ENABLED
+            if (pspAdoptThis)
+            {
+                if (pspAdoptKind == 0U && pspAdoptQuad->culled == 0U)
+                    g_AnmManager->DrawPspMeQuad(&effect->vm, pspAdoptQuad->x, pspAdoptQuad->y, pspAdoptQuad->z,
+                                                pspAdoptQuad->u, pspAdoptQuad->v, pspAdoptQuad->color);
+            }
+            else
+#endif
             g_AnmManager->Draw2D(&effect->vm);
 #endif
         }
@@ -2902,6 +3142,27 @@ ChainCallbackResult EffectManager::OnDraw(EffectManager *effectManager)
 #if defined(PSP)
         th08::psp::RenderPerfNoteEffectDrawn();
 #endif
+#if TH08_PSP_ME_EFFECT_ADOPT_ENABLED || TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+        bool pspAdoptThis = false;
+        unsigned int pspAdoptKind = 3U;
+        const PspMeEffectQuad *pspAdoptQuad = NULL;
+        if (pspAdopt0)
+        {
+            if (pspAdopt0Index < pspAdopt0Count && th08_me_effect_adopt_entry_tag(pspAdopt0Index) == effect)
+            {
+                pspAdoptKind = th08_me_effect_adopt_entry_kind(pspAdopt0Index);
+                if (pspAdoptKind == 0U)
+                    pspAdoptQuad = th08_me_effect_adopt_entry_quad(pspAdopt0Index);
+                ++pspAdopt0Index;
+                pspAdoptThis = pspAdoptKind != 3U;
+            }
+            else
+            {
+                pspAdopt0 = false;
+                th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_FB_ORDER);
+            }
+        }
+#endif
         if (effect->drawCallback != NULL)
         {
 #if defined(PSP) && defined(TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH) && \
@@ -2924,6 +3185,70 @@ ChainCallbackResult EffectManager::OnDraw(EffectManager *effectManager)
     TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH
             pspEffectSpritePairGroup4.Draw(effect);
 #else
+#if TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+            if (pspAdoptThis)
+            {
+                const unsigned int pspSpritesBefore = g_PspSpritesAddedCount;
+                g_AnmManager->Draw2D(&effect->vm);
+                const bool pspDrawn = g_PspSpritesAddedCount != pspSpritesBefore;
+                const bool pspExpectDrawn = pspAdoptKind == 0U && pspAdoptQuad->culled == 0U;
+                if (pspDrawn != pspExpectDrawn)
+                {
+                    th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_AUDIT_CULL);
+                    static unsigned int pspG4CullSamples = 0U;
+                    if (pspG4CullSamples < 6U)
+                    {
+                        ++pspG4CullSamples;
+                        th08::psp::BootLog("ME_G0_AUDIT cull id=%d drawn=%d kind=%u culled=%u rot=%f pos=%f,%f\n",
+                                           effect->effectId, pspDrawn ? 1 : 0, pspAdoptKind,
+                                           pspAdoptKind == 0U ? pspAdoptQuad->culled : 9U, effect->vm.rotation.z,
+                                           effect->vm.pos.x, effect->vm.pos.y);
+                    }
+                }
+                else if (pspDrawn)
+                {
+                    bool same = true;
+                    int badK = -1;
+                    for (int k = 0; k < 4 && same; ++k)
+                    {
+                        same = std::memcmp(&g_QuadVertices[k].pos.x, &pspAdoptQuad->x[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].pos.y, &pspAdoptQuad->y[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].pos.z, &pspAdoptQuad->z[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].textureUV.x, &pspAdoptQuad->u[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].textureUV.y, &pspAdoptQuad->v[k], 4) == 0 &&
+                               g_QuadVertices[k].diffuse == pspAdoptQuad->color;
+                        if (!same)
+                            badK = k;
+                    }
+                    if (!same)
+                    {
+                        th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_AUDIT_QUAD);
+                        static unsigned int pspG4QuadSamples = 0U;
+                        if (pspG4QuadSamples < 8U)
+                        {
+                            ++pspG4QuadSamples;
+                            const int k = badK;
+                            th08::psp::BootLog("ME_G0_AUDIT quad id=%d rot=%f k=%d want %f,%f,%f uv %f,%f c=%08x got %f,%f,%f uv %f,%f c=%08x\n",
+                                               effect->effectId, effect->vm.rotation.z, k, g_QuadVertices[k].pos.x,
+                                               g_QuadVertices[k].pos.y, g_QuadVertices[k].pos.z,
+                                               g_QuadVertices[k].textureUV.x, g_QuadVertices[k].textureUV.y,
+                                               g_QuadVertices[k].diffuse, pspAdoptQuad->x[k], pspAdoptQuad->y[k],
+                                               pspAdoptQuad->z[k], pspAdoptQuad->u[k], pspAdoptQuad->v[k],
+                                               pspAdoptQuad->color);
+                        }
+                    }
+                }
+            }
+            else
+#elif TH08_PSP_ME_EFFECT_ADOPT_ENABLED
+            if (pspAdoptThis)
+            {
+                if (pspAdoptKind == 0U && pspAdoptQuad->culled == 0U)
+                    g_AnmManager->DrawPspMeQuad(&effect->vm, pspAdoptQuad->x, pspAdoptQuad->y, pspAdoptQuad->z,
+                                                pspAdoptQuad->u, pspAdoptQuad->v, pspAdoptQuad->color);
+            }
+            else
+#endif
             g_AnmManager->Draw2D(&effect->vm);
 #endif
         }
@@ -3007,11 +3332,289 @@ i32 EffectManager::DrawBulletLayerEffects()
 
 // FUNCTION: th08 0x4281e0
 #pragma var_order(effect, i, this)
+#if TH08_PSP_EFFECT_EARLY_CULL_ENABLED
+namespace
+{
+struct PspEffectEarlyCullStats
+{
+    unsigned long frames, tested, culled, auditMismatch;
+    unsigned long walked, group1, groupOther, loopUs, headUs;
+} g_PspEffectEarlyCull;
+
+// True when the Draw2D quad cannot intersect the viewport.  Draw2D places the
+// four corners within pos +/- |spriteSize*scale| (anchor bit doubles the
+// one-sided extent), DrawInner adds screenShakeOffset and rounds each corner
+// by at most 1px, then culls when max < viewport min or min > viewport max.
+// A 2px margin covers rounding; NaN compares false and falls through.
+inline bool PspEffectEarlyCull2D(const AnmVm *vm)
+{
+    const float extX = fabsf(vm->spriteSize.x * vm->scale.x) + 2.0f;
+    const float extY = fabsf(vm->spriteSize.y * vm->scale.y) + 2.0f;
+    const float cx = vm->pos.x + g_AnmManager->screenShakeOffset.x;
+    const float cy = vm->pos.y + g_AnmManager->screenShakeOffset.y;
+    const float vpL = static_cast<float>(g_Supervisor.viewport.X);
+    const float vpT = static_cast<float>(g_Supervisor.viewport.Y);
+    const float vpR = vpL + static_cast<float>(g_Supervisor.viewport.Width);
+    const float vpB = vpT + static_cast<float>(g_Supervisor.viewport.Height);
+    return (cx + extX < vpL) || (cy + extY < vpT) || (cx - extX > vpR) || (cy - extY > vpB);
+}
+} // namespace
+#endif
+
+#if TH08_PSP_ME_EFFECT_ADOPT_ENABLED || TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+namespace
+{
+// Draw-time state seen by the last DrawBackgroundEffects; the capture at the
+// end of the next calc chain assumes it and the draw verifies it.
+extern "C" int th08_psp_bg_predict_camera(float *view16, float *proj16, float *camRight3);
+bool g_PspMeAdoptFrameCaptured = false;
+
+// Same bound as PspEffectEarlyCull2D with explicit position/shake/viewport.
+inline bool PspMeAdoptEarlyCull(const AnmVm *vm, float px, float py, const PspMeAdoptDrawState &st)
+{
+    const float extX = fabsf(vm->spriteSize.x * vm->scale.x) + 2.0f;
+    const float extY = fabsf(vm->spriteSize.y * vm->scale.y) + 2.0f;
+    const float cx = px + st.shakeX;
+    const float cy = py + st.shakeY;
+    const float vpR = st.vpX + st.vpW;
+    const float vpB = st.vpY + st.vpH;
+    return (cx + extX < st.vpX) || (cy + extY < st.vpY) || (cx - extX > vpR) || (cy - extY > vpB);
+}
+} // namespace
+
+// Called from the main loop right after the calc chain.
+extern "C" void th08_psp_me_effect_adopt_capture(void)
+{
+    g_PspMeAdoptFrameCaptured = false;
+    th08_me_effect_adopt_select_channel(0U);
+    const PspMeAdoptDrawState &st = g_PspMeAdoptDrawState;
+    if (!st.valid)
+        return;
+    if (!th08_me_effect_adopt_begin(st.shakeX, st.shakeY, st.vpX, st.vpY, st.vpW, st.vpH, st.useMixColor, st.mixColor))
+        return;
+    float pspCamView[16], pspCamProj[16], pspCamRight[3];
+    const bool pspCamOk = th08_psp_bg_predict_camera(pspCamView, pspCamProj, pspCamRight) != 0;
+    if (pspCamOk)
+        th08_me_effect_adopt_set_matrices(pspCamView, pspCamProj, pspCamRight, g_Player.position.x,
+                                          g_Player.position.y, g_Player.position.z,
+                                          (!g_GameManager.isInGameMenu && !g_GameManager.showRetryMenu) ? 1U : 0U);
+    for (Effect *effect = g_EffectManager.drawGroupSentinel1.nextInDrawGroup; effect != NULL;
+         effect = effect->nextInDrawGroup)
+    {
+        int ok;
+        if (effect->drawGroup == 1 && pspCamOk)
+        {
+            // DrawCameraFacingQuad / DrawWithCallback: world position projected
+            // with the predicted camera (ids 0x33/0x3F also run the stage adjust).
+            const AnmVm *vm = &effect->vm;
+            const float px = effect->position.x, py = effect->position.y, pz = effect->position.z;
+            if (!vm->visible || !vm->flag1 || vm->color1.a == 0)
+                ok = th08_me_effect_adopt_add_entry(effect, 1U);
+            else
+            {
+                f32 pspSine, pspCosine;
+                th08::psp::RenderSinCos(vm->rotation.z, &pspSine, &pspCosine);
+                if (effect->effectId == 0x33 || effect->effectId == 0x3F)
+                    ok = th08_me_effect_adopt_add_record_cam_adjust(
+                        effect, px, py, pz, vm->scale.x, vm->scale.y, vm->spriteSize.x, vm->spriteSize.y, pspSine,
+                        pspCosine, vm->loadedSprite->uvStart.x, vm->loadedSprite->uvEnd.x, vm->loadedSprite->uvStart.y,
+                        vm->loadedSprite->uvEnd.y, vm->uvScrollPos.x, vm->uvScrollPos.y, vm->color1.d3dColor,
+                        vm->color2.d3dColor, vm->anchor, vm->flag17 ? 1U : 0U, reinterpret_cast<const float *>(&vm->pos2),
+                        reinterpret_cast<const float *>(&vm->posFinal), vm->posInitial.x);
+                else
+                    ok = th08_me_effect_adopt_add_record_cam(effect, px, py, pz, vm->scale.x, vm->scale.y, vm->spriteSize.x,
+                                                             vm->spriteSize.y, pspSine, pspCosine, vm->loadedSprite->uvStart.x,
+                                                             vm->loadedSprite->uvEnd.x, vm->loadedSprite->uvStart.y,
+                                                             vm->loadedSprite->uvEnd.y, vm->uvScrollPos.x, vm->uvScrollPos.y,
+                                                             vm->color1.d3dColor, vm->color2.d3dColor, vm->anchor,
+                                                             vm->flag17 ? 1U : 0U);
+            }
+        }
+        else if (effect->drawGroup != 4)
+        {
+            ok = th08_me_effect_adopt_add_entry(effect, 3U);
+        }
+        else
+        {
+            const AnmVm *vm = &effect->vm;
+            // DrawBackgroundEffects copies position into vm->pos right before Draw2D.
+            const float px = effect->position.x, py = effect->position.y, pz = effect->position.z;
+            if (!vm->visible || !vm->flag1 || vm->color1.a == 0)
+                ok = th08_me_effect_adopt_add_entry(effect, 1U);
+            else if (PspMeAdoptEarlyCull(vm, px, py, st))
+                ok = th08_me_effect_adopt_add_entry(effect, 2U);
+            else
+                ok = th08_me_effect_adopt_add_record(effect, px, py, pz, vm->scale.x, vm->scale.y, vm->spriteSize.x,
+                                                     vm->spriteSize.y, vm->loadedSprite->uvStart.x,
+                                                     vm->loadedSprite->uvEnd.x, vm->loadedSprite->uvStart.y,
+                                                     vm->loadedSprite->uvEnd.y, vm->uvScrollPos.x, vm->uvScrollPos.y,
+                                                     vm->color1.d3dColor, vm->color2.d3dColor, vm->anchor,
+                                                     vm->flag17 ? 1U : 0U);
+        }
+        if (!ok)
+        {
+            th08_me_effect_adopt_abort();
+            return;
+        }
+    }
+    th08_me_effect_adopt_submit();
+    g_PspMeAdoptFrameCaptured = true;
+}
+
+// Draw list 0 (EffectManager::OnDraw): Draw2D at position + arcade offset +
+// pos2, z 0.07, with rotation.z (kernel kind 1) or without (kind 0).
+static int PspMeAdopt0CaptureEffect(Effect *effect, const PspMeAdoptDrawState &st, float arcadeX, float arcadeY)
+{
+    if (effect->drawCallback != NULL)
+        return th08_me_effect_adopt_add_entry(effect, 3U);
+    const AnmVm *vm = &effect->vm;
+    // OnDraw: vm.pos = position; pos.x += arcade.x; pos.y += arcade.y; pos.z = 0.07f; pos += pos2.
+    float px = effect->position.x;
+    px += arcadeX;
+    float py = effect->position.y;
+    py += arcadeY;
+    float pz = 0.07f;
+    px += vm->pos2.x;
+    py += vm->pos2.y;
+    pz += vm->pos2.z;
+    th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_G0);
+    if (!vm->visible || !vm->flag1 || vm->color1.a == 0)
+        return th08_me_effect_adopt_add_entry(effect, 1U);
+    if (vm->rotation.z == 0.0f)
+    {
+        if (PspMeAdoptEarlyCull(vm, px, py, st))
+            return th08_me_effect_adopt_add_entry(effect, 2U);
+        return th08_me_effect_adopt_add_record(effect, px, py, pz, vm->scale.x, vm->scale.y, vm->spriteSize.x,
+                                               vm->spriteSize.y, vm->loadedSprite->uvStart.x, vm->loadedSprite->uvEnd.x,
+                                               vm->loadedSprite->uvStart.y, vm->loadedSprite->uvEnd.y, vm->uvScrollPos.x,
+                                               vm->uvScrollPos.y, vm->color1.d3dColor, vm->color2.d3dColor, vm->anchor,
+                                               vm->flag17 ? 1U : 0U);
+    }
+    f32 pspSine, pspCosine;
+    th08::psp::RenderSinCos(vm->rotation.z, &pspSine, &pspCosine);
+    return th08_me_effect_adopt_add_record_rot(effect, px, py, pz, vm->scale.x, vm->scale.y, vm->spriteSize.x,
+                                               vm->spriteSize.y, pspSine, pspCosine, vm->loadedSprite->uvStart.x,
+                                               vm->loadedSprite->uvEnd.x, vm->loadedSprite->uvStart.y,
+                                               vm->loadedSprite->uvEnd.y, vm->uvScrollPos.x, vm->uvScrollPos.y,
+                                               vm->color1.d3dColor, vm->color2.d3dColor, vm->anchor, vm->flag17 ? 1U : 0U);
+}
+
+// Draw lists 0 and 4 (EffectManager::OnDraw, in draw order): Draw2D at
+// position + arcade offset + pos2, z 0.07, rotated (kind 1) or not (kind 0).
+extern "C" void th08_psp_me_effect0_adopt_capture(void)
+{
+    g_PspMeAdopt0FrameCaptured = false;
+    const PspMeAdoptDrawState &st = g_PspMeAdoptDrawState0;
+    if (!st.valid)
+        return;
+    th08_me_effect_adopt_select_channel(1U);
+    if (!th08_me_effect_adopt_begin(st.shakeX, st.shakeY, st.vpX, st.vpY, st.vpW, st.vpH, st.useMixColor, st.mixColor))
+    {
+        th08_me_effect_adopt_select_channel(0U);
+        return;
+    }
+    const float arcadeX = g_GameManager.arcadeRegionTopLeftPos.x;
+    const float arcadeY = g_GameManager.arcadeRegionTopLeftPos.y;
+    Effect *const heads[2] = {g_EffectManager.drawGroupSentinel0.nextInDrawGroup,
+                              g_EffectManager.drawGroupSentinel4.nextInDrawGroup};
+    for (int list = 0; list < 2; ++list)
+    {
+        for (Effect *effect = heads[list]; effect != NULL; effect = effect->nextInDrawGroup)
+        {
+            if (!PspMeAdopt0CaptureEffect(effect, st, arcadeX, arcadeY))
+            {
+                th08_me_effect_adopt_abort();
+                th08_me_effect_adopt_select_channel(0U);
+                return;
+            }
+        }
+    }
+    th08_me_effect_adopt_submit();
+    g_PspMeAdopt0FrameCaptured = true;
+    th08_me_effect_adopt_select_channel(0U);
+}
+#endif
+#if TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+extern VertexTex1DiffuseXyzrhw g_QuadVertices[4];
+#endif
+
 i32 EffectManager::DrawBackgroundEffects()
 {
+#if TH08_PSP_EFFECT_EARLY_CULL_ENABLED
+    if ((++g_PspEffectEarlyCull.frames % 600UL) == 0UL)
+    {
+        th08::psp::BootLog("EFFECT_EARLY_CULL stats frames=%lu tested=%lu culled=%lu audit_mismatch=%lu walked=%lu "
+                           "g1=%lu gx=%lu loop_us=%lu head_us=%lu\n",
+                           g_PspEffectEarlyCull.frames, g_PspEffectEarlyCull.tested, g_PspEffectEarlyCull.culled,
+                           g_PspEffectEarlyCull.auditMismatch, g_PspEffectEarlyCull.walked, g_PspEffectEarlyCull.group1,
+                           g_PspEffectEarlyCull.groupOther, g_PspEffectEarlyCull.loopUs, g_PspEffectEarlyCull.headUs);
+        th08::psp::FlushBootLog();
+    }
+    const unsigned int pspEarlyCullT0 = sceKernelGetSystemTimeLow();
+#endif
+#if TH08_PSP_ME_EFFECT_SHADOW_ENABLED
+    struct PspMeEffectCaptureGuard
+    {
+        PspMeEffectCaptureGuard()
+        {
+            th08_me_effect_set_frame_state(g_AnmManager->screenShakeOffset.x, g_AnmManager->screenShakeOffset.y,
+                                           static_cast<float>(g_Supervisor.viewport.X), static_cast<float>(g_Supervisor.viewport.Y),
+                                           static_cast<float>(g_Supervisor.viewport.Width), static_cast<float>(g_Supervisor.viewport.Height),
+                                           g_AnmManager->useMixColor ? 1U : 0U, g_AnmManager->color.d3dColor,
+                                           static_cast<const float *>(g_Supervisor.viewMatrix),
+                                           static_cast<const float *>(g_Supervisor.projectionMatrix),
+                                           reinterpret_cast<const float *>(&g_Background.cameraCurrent.right));
+            th08_me_effect_capture_arm(1);
+        }
+        ~PspMeEffectCaptureGuard() { th08_me_effect_capture_arm(0); }
+    } pspMeEffectCaptureGuard;
+#endif
 #if TH08_PSP_PERF_ATTRIBUTION_ENABLED
     th08::psp::PerfAttributionScope perfScope(
         th08::psp::PerfAttributionPhase::EffectDrawBackground);
+#endif
+#if TH08_PSP_ME_EFFECT_ADOPT_ENABLED || TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+    {
+        PspMeAdoptDrawState &st = g_PspMeAdoptDrawState;
+        st.valid = true;
+        st.shakeX = g_AnmManager->screenShakeOffset.x;
+        st.shakeY = g_AnmManager->screenShakeOffset.y;
+        st.vpX = static_cast<float>(g_Supervisor.viewport.X);
+        st.vpY = static_cast<float>(g_Supervisor.viewport.Y);
+        st.vpW = static_cast<float>(g_Supervisor.viewport.Width);
+        st.vpH = static_cast<float>(g_Supervisor.viewport.Height);
+        st.useMixColor = g_AnmManager->useMixColor ? 1U : 0U;
+        st.mixColor = g_AnmManager->color.d3dColor;
+        memcpy(st.view, &g_Supervisor.viewMatrix, sizeof(st.view));
+        memcpy(st.proj, &g_Supervisor.projectionMatrix, sizeof(st.proj));
+        st.camRight[0] = g_Background.cameraCurrent.right.x;
+        st.camRight[1] = g_Background.cameraCurrent.right.y;
+        st.camRight[2] = g_Background.cameraCurrent.right.z;
+    }
+    bool pspAdopt = false;
+    bool pspAdoptCam = false;
+    unsigned int pspAdoptCount = 0U, pspAdoptIndex = 0U;
+    th08_me_effect_adopt_select_channel(0U);
+    if (g_PspMeAdoptFrameCaptured)
+    {
+        g_PspMeAdoptFrameCaptured = false;
+        const PspMeAdoptDrawState &st = g_PspMeAdoptDrawState;
+        if (th08_me_effect_adopt_state_matches(st.shakeX, st.shakeY, st.vpX, st.vpY, st.vpW, st.vpH, st.useMixColor,
+                                               st.mixColor))
+            pspAdopt = th08_me_effect_adopt_acquire(3000U, &pspAdoptCount) != 0;
+        else
+            th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_FB_STATE);
+        if (pspAdopt)
+        {
+            pspAdoptCam = th08_me_effect_adopt_matrices_match(st.view, st.proj, st.camRight) != 0;
+            if (!pspAdoptCam)
+                th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_FB_CAM);
+        }
+    }
+    struct PspMeAdoptReleaseGuard
+    {
+        ~PspMeAdoptReleaseGuard() { th08_me_effect_adopt_release(); }
+    } pspMeAdoptReleaseGuard;
 #endif
     Effect *effect = this->drawGroupSentinel1.nextInDrawGroup;
     i32 i = 0;
@@ -3037,9 +3640,21 @@ i32 EffectManager::DrawBackgroundEffects()
     PspEffectSpritePairProductPass pspEffectSpritePairGroup1(this, 1U);
 #endif
 
+#if TH08_PSP_EFFECT_EARLY_CULL_ENABLED
+    const unsigned int pspEarlyCullT1 = sceKernelGetSystemTimeLow();
+    g_PspEffectEarlyCull.headUs += pspEarlyCullT1 - pspEarlyCullT0;
+    struct PspEarlyCullLoopTimer
+    {
+        unsigned int start;
+        ~PspEarlyCullLoopTimer() { g_PspEffectEarlyCull.loopUs += sceKernelGetSystemTimeLow() - start; }
+    } pspEarlyCullLoopTimer = {pspEarlyCullT1};
+#endif
     while (effect != NULL)
     {
         i++;
+#if TH08_PSP_EFFECT_EARLY_CULL_ENABLED
+        ++g_PspEffectEarlyCull.walked;
+#endif
         if (g_Supervisor.cfg.effectQuality == MODERATE && (i & 1) != 0)
         {
             return 1;
@@ -3050,6 +3665,28 @@ i32 EffectManager::DrawBackgroundEffects()
 #endif
 
         effect->vm.pos = effect->position;
+#if TH08_PSP_ME_EFFECT_ADOPT_ENABLED || TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+        bool pspAdoptThis = false;
+        unsigned int pspAdoptKind = 3U;
+        const PspMeEffectQuad *pspAdoptQuad = NULL;
+        if (pspAdopt)
+        {
+            if (pspAdoptIndex < pspAdoptCount && th08_me_effect_adopt_entry_tag(pspAdoptIndex) == effect)
+            {
+                pspAdoptKind = th08_me_effect_adopt_entry_kind(pspAdoptIndex);
+                if (pspAdoptKind == 0U)
+                    pspAdoptQuad = th08_me_effect_adopt_entry_quad(pspAdoptIndex);
+                ++pspAdoptIndex;
+                pspAdoptThis = pspAdoptKind != 3U;
+            }
+            else
+            {
+                // List differs from the capture: SC path for the rest of the frame.
+                pspAdopt = false;
+                th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_FB_ORDER);
+            }
+        }
+#endif
         if (effect->drawGroup == 4)
         {
 #if defined(PSP) && defined(TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT) && \
@@ -3059,14 +3696,162 @@ i32 EffectManager::DrawBackgroundEffects()
     TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH
             pspEffectSpritePairGroup1.Draw(effect);
 #else
-            g_AnmManager->Draw2D(&effect->vm);
+#if TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+            if (pspAdoptThis)
+            {
+                // Audit: draw through the SC path and compare with the ME decision/quad.
+                const unsigned int pspSpritesBefore = g_PspSpritesAddedCount;
+                g_AnmManager->Draw2D(&effect->vm);
+                const bool pspDrawn = g_PspSpritesAddedCount != pspSpritesBefore;
+                const bool pspExpectDrawn = pspAdoptKind == 0U && pspAdoptQuad->culled == 0U;
+                if (pspDrawn != pspExpectDrawn)
+                    th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_AUDIT_CULL);
+                else if (pspDrawn)
+                {
+                    bool same = true;
+                    for (int k = 0; k < 4 && same; ++k)
+                        same = std::memcmp(&g_QuadVertices[k].pos.x, &pspAdoptQuad->x[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].pos.y, &pspAdoptQuad->y[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].pos.z, &pspAdoptQuad->z[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].textureUV.x, &pspAdoptQuad->u[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].textureUV.y, &pspAdoptQuad->v[k], 4) == 0 &&
+                               g_QuadVertices[k].diffuse == pspAdoptQuad->color;
+                    if (!same)
+                        th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_AUDIT_QUAD);
+                }
+            }
+            else
+#elif TH08_PSP_ME_EFFECT_ADOPT_ENABLED
+            if (pspAdoptThis)
+            {
+                if (pspAdoptKind == 0U && pspAdoptQuad->culled == 0U)
+                    g_AnmManager->DrawPspMeQuad(&effect->vm, pspAdoptQuad->x, pspAdoptQuad->y, pspAdoptQuad->z,
+                                                pspAdoptQuad->u, pspAdoptQuad->v, pspAdoptQuad->color);
+            }
+            else
+#endif
+            {
+#if TH08_PSP_EFFECT_EARLY_CULL_ENABLED
+                ++g_PspEffectEarlyCull.tested;
+                if (PspEffectEarlyCull2D(&effect->vm))
+                {
+                    ++g_PspEffectEarlyCull.culled;
+#if TH08_PSP_EFFECT_EARLY_CULL_AUDIT_ENABLED
+                    const unsigned int pspSpritesBefore = g_PspSpritesAddedCount;
+                    g_AnmManager->Draw2D(&effect->vm);
+                    if (g_PspSpritesAddedCount != pspSpritesBefore)
+                        ++g_PspEffectEarlyCull.auditMismatch;
+#endif
+                }
+                else
+#endif
+                g_AnmManager->Draw2D(&effect->vm);
+            }
 #endif
         }
         else if (effect->drawGroup == 1)
         {
+#if TH08_PSP_EFFECT_EARLY_CULL_ENABLED
+            ++g_PspEffectEarlyCull.group1;
+#endif
 #if defined(PSP) && defined(TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH) && \
     TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH
             pspEffectSpritePairGroup1.Boundary();
+#endif
+#if TH08_PSP_ME_EFFECT_ADOPT_AUDIT_ENABLED
+            if (pspAdoptThis && pspAdoptCam)
+            {
+                const unsigned int pspSpritesBefore = g_PspSpritesAddedCount;
+                const bool pspAdjust = effect->effectId == 0x33 || effect->effectId == 0x3F;
+                if (pspAdjust)
+                    g_AnmManager->DrawWithCallback(&effect->vm, AdjustStageEffectDrawPosition);
+                else
+                    g_AnmManager->DrawCameraFacingQuad(&effect->vm);
+                const bool pspDrawn = g_PspSpritesAddedCount != pspSpritesBefore;
+                if (pspAdjust && pspAdoptKind == 0U && pspAdoptQuad->adjApplied != 0U)
+                {
+                    if (effect->vm.posFinal.x != pspAdoptQuad->adjX || effect->vm.posFinal.y != pspAdoptQuad->adjY ||
+                        effect->vm.posFinal.z != pspAdoptQuad->adjZ || effect->vm.posInitial.x != pspAdoptQuad->adjW)
+                    {
+                        th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_AUDIT_QUAD);
+                        static unsigned int pspAdjSamples = 0U;
+                        if (pspAdjSamples < 6U)
+                        {
+                            ++pspAdjSamples;
+                            th08::psp::BootLog("ME_CAM_AUDIT adjust id=%d want %f,%f,%f pi=%f got %f,%f,%f pi=%f\n",
+                                               effect->effectId, effect->vm.posFinal.x, effect->vm.posFinal.y,
+                                               effect->vm.posFinal.z, effect->vm.posInitial.x, pspAdoptQuad->adjX,
+                                               pspAdoptQuad->adjY, pspAdoptQuad->adjZ, pspAdoptQuad->adjW);
+                        }
+                    }
+                }
+                const bool pspExpectDrawn = pspAdoptKind == 0U && pspAdoptQuad->culled == 0U;
+                if (pspDrawn != pspExpectDrawn)
+                {
+                    th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_AUDIT_CULL);
+                    static unsigned int pspCamCullSamples = 0U;
+                    if (pspCamCullSamples < 6U)
+                    {
+                        ++pspCamCullSamples;
+                        th08::psp::BootLog("ME_CAM_AUDIT cull id=%d drawn=%d kind=%u culled=%u pos=%f,%f,%f\n",
+                                           effect->effectId, pspDrawn ? 1 : 0, pspAdoptKind,
+                                           pspAdoptKind == 0U ? pspAdoptQuad->culled : 9U, effect->position.x,
+                                           effect->position.y, effect->position.z);
+                    }
+                }
+                else if (pspDrawn)
+                {
+                    bool same = true;
+                    int badK = -1;
+                    for (int k = 0; k < 4 && same; ++k)
+                    {
+                        same = std::memcmp(&g_QuadVertices[k].pos.x, &pspAdoptQuad->x[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].pos.y, &pspAdoptQuad->y[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].pos.z, &pspAdoptQuad->z[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].textureUV.x, &pspAdoptQuad->u[k], 4) == 0 &&
+                               std::memcmp(&g_QuadVertices[k].textureUV.y, &pspAdoptQuad->v[k], 4) == 0 &&
+                               g_QuadVertices[k].diffuse == pspAdoptQuad->color;
+                        if (!same)
+                            badK = k;
+                    }
+                    if (!same)
+                    {
+                        th08_me_effect_adopt_note(TH08_ME_ADOPT_STAT_AUDIT_QUAD);
+                        static unsigned int pspCamQuadSamples = 0U;
+                        if (pspCamQuadSamples < 8U)
+                        {
+                            ++pspCamQuadSamples;
+                            const int k = badK;
+                            th08::psp::BootLog("ME_CAM_AUDIT quad id=%d k=%d want %f,%f,%f uv %f,%f c=%08x got %f,%f,%f uv %f,%f c=%08x\n",
+                                               effect->effectId, k, g_QuadVertices[k].pos.x, g_QuadVertices[k].pos.y,
+                                               g_QuadVertices[k].pos.z, g_QuadVertices[k].textureUV.x,
+                                               g_QuadVertices[k].textureUV.y, g_QuadVertices[k].diffuse,
+                                               pspAdoptQuad->x[k], pspAdoptQuad->y[k], pspAdoptQuad->z[k],
+                                               pspAdoptQuad->u[k], pspAdoptQuad->v[k], pspAdoptQuad->color);
+                        }
+                    }
+                }
+            }
+            else
+#elif TH08_PSP_ME_EFFECT_ADOPT_ENABLED
+            if (pspAdoptThis && pspAdoptCam)
+            {
+                if (pspAdoptKind == 0U)
+                {
+                    if (pspAdoptQuad->adjApplied != 0U)
+                    {
+                        // The callback's state change, applied at draw time as canonically.
+                        effect->vm.posFinal.x = pspAdoptQuad->adjX;
+                        effect->vm.posFinal.y = pspAdoptQuad->adjY;
+                        effect->vm.posFinal.z = pspAdoptQuad->adjZ;
+                        effect->vm.posInitial.x = pspAdoptQuad->adjW;
+                    }
+                    if (pspAdoptQuad->culled == 0U)
+                        g_AnmManager->DrawPspMeQuad(&effect->vm, pspAdoptQuad->x, pspAdoptQuad->y, pspAdoptQuad->z,
+                                                    pspAdoptQuad->u, pspAdoptQuad->v, pspAdoptQuad->color);
+                }
+            }
+            else
 #endif
             if (effect->effectId == 0x33 || effect->effectId == 0x3F)
             {
@@ -3080,6 +3865,9 @@ i32 EffectManager::DrawBackgroundEffects()
         }
         else
         {
+#if TH08_PSP_EFFECT_EARLY_CULL_ENABLED
+            ++g_PspEffectEarlyCull.groupOther;
+#endif
 #if defined(PSP) && defined(TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH) && \
     TH08_PSP_EFFECT_SPRITE_PAIR_FASTPATH
             pspEffectSpritePairGroup1.Boundary();

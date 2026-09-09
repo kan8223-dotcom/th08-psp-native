@@ -25,7 +25,7 @@ bool DebugFileContains(const char *needle)
     const SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
     if (fd < 0)
         return false;
-    char text[48];
+    char text[128];
     const int got = sceIoRead(fd, text, sizeof(text) - 1);
     sceIoClose(fd);
     if (got <= 0)
@@ -37,14 +37,52 @@ bool DebugFileContains(const char *needle)
 
 unsigned int DebugAutoStartButtons()
 {
+    static int menuMode = -1;
     if (gAutoStartState == -1)
     {
-        gAutoStartState = DebugFileContains("auto") ? 1 : 0;
-        BootLog("DEBUG_AUTOSTART armed=%d\n", gAutoStartState);
+        // Optional emulator-only test acceleration; absent from release builds.
+        // PPSSPP's emulator devctl 0x30 enables fast-forward for a non-null input.
+        if (DebugFileContains("fastforward=1"))
+        {
+            SceIoStat stat;
+            if (sceIoGetstat("ms0:/PSP/SYSTEM/ppsspp.ini", &stat) >= 0)
+            {
+                int enabled = 1;
+                const int result = sceIoDevctl("emulator:", 0x30, &enabled, sizeof(enabled), nullptr, 0);
+                BootLog("DEBUG_AUTOSTART fastforward=1 result=%d\n", result);
+            }
+        }
+        menuMode = DebugFileContains("menu=replay") ? 1 : 0;
+        gAutoStartState = (menuMode != 0 || DebugFileContains("auto")) ? 1 : 0;
+        BootLog("DEBUG_AUTOSTART armed=%d menu=%d\n", gAutoStartState, menuMode);
     }
     if (gAutoStartState != 1)
         return 0U;
     ++gAutoStartCalls;
+    if (menuMode == 1)
+    {
+        // Calls run about twice per frame.  Each tap lasts 8 calls (~4 frames).
+        static const struct { unsigned long at; unsigned int mask; } kSteps[] = {
+            {400, 1U << 5}, {500, 1U << 5},                   // DOWN x2 -> "Replay" (locked items are skipped)
+            {900, 1U << 0},                                     // SHOOT -> list
+            {1400, 1U << 5}, {1500, 1U << 5}, {1600, 1U << 5},   // DOWN x3 -> 4th entry
+            {1800, 1U << 0},                                    // SHOOT -> stage select
+            {2100, 1U << 0},                                    // SHOOT -> mode select
+            {2400, 1U << 0},                                    // SHOOT -> start
+        };
+        for (unsigned i = 0; i < sizeof(kSteps) / sizeof(kSteps[0]); ++i)
+        {
+            if (gAutoStartCalls >= kSteps[i].at && gAutoStartCalls < kSteps[i].at + 8UL)
+            {
+                if (gAutoStartCalls == kSteps[i].at)
+                    BootLog("DEBUG_AUTOSTART menu step %u mask=%u\n", i, kSteps[i].mask);
+                return kSteps[i].mask;
+            }
+        }
+        if (gAutoStartCalls > 2500UL)
+            gAutoStartState = 2;
+        return 0U;
+    }
     if (gAutoStartCalls > 6000UL)
     {
         gAutoStartState = 2;
@@ -52,7 +90,90 @@ unsigned int DebugAutoStartButtons()
     }
     // FillKeyboard runs about twice per frame: tap for ~4 frames every ~2 s.
     const unsigned long phase = gAutoStartCalls % 240UL;
-    return (gAutoStartCalls > 400UL && phase < 8UL) ? static_cast<unsigned int>(PSP_CTRL_CROSS) : 0U;
+    return (gAutoStartCalls > 400UL && phase < 8UL) ? 1U : 0U;   // TH_BUTTON_SHOOT
+}
+
+bool DebugRetainStreamLeaseForTest()
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        SceIoStat stat;
+        enabled = DebugFileContains("retain_stream=1") &&
+                  sceIoGetstat("ms0:/PSP/SYSTEM/ppsspp.ini", &stat) >= 0 ? 1 : 0;
+        BootLog("DEBUG_STREAM_LEASE retain=%d test_only=1\n", enabled);
+    }
+    return enabled == 1;
+}
+
+const char *DebugReplayAutoStart()
+{
+    static char name[64];
+    static int state = -1;
+    if (state == -1)
+    {
+        state = 0;
+        char path[640];
+        const char *directory = GameDirectory();
+        if (directory != nullptr &&
+            std::snprintf(path, sizeof(path), "%s/TH08PSP_DEBUG_STAGE.txt", directory) >= 0)
+        {
+            const SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
+            if (fd >= 0)
+            {
+                char text[96];
+                const int got = sceIoRead(fd, text, sizeof(text) - 1);
+                sceIoClose(fd);
+                if (got > 0)
+                {
+                    text[got] = 0;
+                    const char *p = std::strstr(text, "replay=");
+                    if (p != nullptr)
+                    {
+                        p += 7;
+                        size_t len = 0;
+                        while (p[len] != 0 && p[len] != ' ' && p[len] != '\r' && p[len] != '\n' &&
+                               len < sizeof(name) - 1)
+                        {
+                            name[len] = p[len];
+                            ++len;
+                        }
+                        name[len] = 0;
+                        if (len != 0)
+                            state = 1;
+                    }
+                }
+            }
+        }
+        BootLog("DEBUG_AUTOSTART replay=%s\n", state == 1 ? name : "-");
+    }
+    if (state != 1)
+        return nullptr;
+    state = 2; // fire once
+    return name;
+}
+
+int DebugReplayAutoStartStage()
+{
+    char path[640];
+    const char *directory = GameDirectory();
+    if (directory == nullptr ||
+        std::snprintf(path, sizeof(path), "%s/TH08PSP_DEBUG_STAGE.txt", directory) < 0)
+        return -1;
+    const SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
+    if (fd < 0)
+        return -1;
+    char text[96];
+    const int got = sceIoRead(fd, text, sizeof(text) - 1);
+    sceIoClose(fd);
+    if (got <= 0)
+        return -1;
+    text[got] = 0;
+    const char *p = std::strstr(text, "replay_stage=");
+    if (p == nullptr)
+        return -1;
+    const int stage = std::atoi(p + 13);
+    return (stage >= 0 && stage < 8) ? stage : -1;
 }
 
 static void LogArchiveEntrySizes()

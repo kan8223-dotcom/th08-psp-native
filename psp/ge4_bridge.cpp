@@ -275,8 +275,12 @@ void UnlockPower()
     if (!__atomic_load_n(&gPowerLocked, __ATOMIC_ACQUIRE))
         return;
     const int result = scePowerUnlock(0);
-    if (result != 0)
+    // A positive result is the number of locks still held by other owners
+    // (the ME core keeps its own until its shutdown): only an error is fatal.
+    if (result < 0)
         ColdOffLoop("cleanup-power-unlock", result, sceGeEdramGetSize());
+    else if (result > 0)
+        th08::psp::BootLog("GE4 power unlock: %d lock(s) still held by other owners\n", result);
     __atomic_store_n(&gPowerLocked, 0, __ATOMIC_RELEASE);
 }
 
@@ -739,7 +743,20 @@ extern "C" void th08_psp_ge4_shutdown()
 
     Th08PspGe4UpperTelemetry telemetry{};
     th08_psp_ge4_get_upper_telemetry(&telemetry);
-    if (telemetry.live_bytes != 0u ||
+    // The triple-buffer third colour buffer (one 512x272x16-bit or x32-bit
+    // allocation) is PSPGL-owned and is only released with the context: at
+    // exit it is tolerated, the aperture is restored below regardless.
+    const bool tripleSpareOnly =
+        telemetry.live_allocation_count == 1u &&
+        (telemetry.live_bytes == 278528u || telemetry.live_bytes == 557056u) &&
+        telemetry.static_upload_depth == 0u && telemetry.violations == 0u;
+    if (tripleSpareOnly)
+    {
+        th08::psp::BootLog("GE4 shutdown tolerated live_bytes=%u (triple-buffer spare)\n",
+                           telemetry.live_bytes);
+        th08::psp::FlushBootLog();
+    }
+    else if (telemetry.live_bytes != 0u ||
         telemetry.live_allocation_count != 0u ||
         telemetry.static_upload_depth != 0u || telemetry.violations != 0u)
     {

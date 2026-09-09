@@ -30,6 +30,7 @@ public:
     std::uint8_t Divisor() const;
     std::uint8_t PendingSimulationTicks() const;
     std::uint32_t SelectEdgeCount() const;
+    void SetModeAuto(std::uint8_t newMode) { if (newMode < 3U) mode = newMode; }
 
 private:
     std::uint32_t selectEdgeCount;
@@ -45,4 +46,7 @@ std::uint8_t InitialRenderCadenceMode();
 std::uint8_t CurrentRenderCadenceMode();
 std::uint8_t CurrentDrawSimulationTicks();
 std::uint32_t RenderCadenceSelectEdgeCount();
+// Automatic cadence (TH08_PSP_AUTO_CADENCE): change the mode as if SELECT had
+// cycled to it, without counting a manual edge.
+void SetRenderCadenceModeAuto(std::uint8_t mode);
 } // namespace th08::psp

@@ -131,4 +131,8 @@ std::uint32_t RenderCadenceSelectEdgeCount()
 {
     return gRenderCadence.SelectEdgeCount();
 }
+void SetRenderCadenceModeAuto(std::uint8_t mode)
+{
+    gRenderCadence.SetModeAuto(mode);
+}
 } // namespace th08::psp

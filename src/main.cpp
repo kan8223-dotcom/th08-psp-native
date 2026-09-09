@@ -24,6 +24,14 @@
 #if defined(PSP)
 #include "boot_checkpoint.hpp"
 #include "fileio.hpp"
+#include "EclManager.hpp"
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+extern "C" unsigned long g_PspRngTraceFrame;
+#endif
+#include "ItemManager.hpp"
+#include "EnemyManager.hpp"
+#include "BulletManager.hpp"
+#include "Player.hpp"
 #if defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
 #include "io_activity_lamp.hpp"
 #endif
@@ -31,6 +39,30 @@
 #include "perf_attribution.hpp"
 #include "swap_nowait.hpp"
 #include "perf_env.hpp"
+#include "usage_meter.hpp"
+#if defined(PSP) && ((defined(TH08_PSP_ME_EFFECT_ADOPT) && TH08_PSP_ME_EFFECT_ADOPT) || \
+    (defined(TH08_PSP_ME_EFFECT_ADOPT_AUDIT) && TH08_PSP_ME_EFFECT_ADOPT_AUDIT))
+extern "C" void th08_psp_me_effect_adopt_capture(void);
+extern "C" void th08_psp_me_effect0_adopt_capture(void);
+#define TH08_PSP_ME_EFFECT_ADOPT_CAPTURE_ENABLED 1
+#else
+#define TH08_PSP_ME_EFFECT_ADOPT_CAPTURE_ENABLED 0
+#endif
+#if defined(PSP) && ((defined(TH08_PSP_ME_BULLET_ADOPT) && TH08_PSP_ME_BULLET_ADOPT) || \
+    (defined(TH08_PSP_ME_BULLET_ADOPT_AUDIT) && TH08_PSP_ME_BULLET_ADOPT_AUDIT))
+extern "C" void th08_psp_me_bullet_adopt_capture(void);
+#define TH08_PSP_ME_BULLET_ADOPT_CAPTURE_ENABLED 1
+#else
+#define TH08_PSP_ME_BULLET_ADOPT_CAPTURE_ENABLED 0
+#endif
+#if defined(PSP) && ((defined(TH08_PSP_ME_BG_ADOPT) && TH08_PSP_ME_BG_ADOPT) || \
+    (defined(TH08_PSP_ME_BG_ADOPT_AUDIT) && TH08_PSP_ME_BG_ADOPT_AUDIT))
+extern "C" void th08_psp_me_bg_adopt_capture(void);
+extern "C" void th08_psp_me_popup_capture(void);
+#define TH08_PSP_ME_BG_ADOPT_CAPTURE_ENABLED 1
+#else
+#define TH08_PSP_ME_BG_ADOPT_CAPTURE_ENABLED 0
+#endif
 #include "tick_gate_bypass.hpp"
 #include "swap_triple.hpp"
 // psptypes.h (via pspthreadman.h) collides with the game typedefs; declare
@@ -38,6 +70,8 @@
 extern "C" long long sceKernelGetSystemTimeWide(void);
 #include "platform.hpp"
 #include "render_cadence.hpp"
+#include "psp/debug_start_stage.hpp"
+#include "psp/auto_cadence.hpp"
 #include <pspdisplay.h>
 #else
 #define TH08_PSP_BOOT_CHECKPOINT(phase, state, result) ((void)0)
@@ -106,6 +140,12 @@ DIFFABLE_STATIC(GameWindow, g_GameWindow);
 
 #if defined(PSP)
 static u32 gPspLastPresentVcount;
+#if defined(PSP) && defined(TH08_PSP_AUTO_CADENCE) && TH08_PSP_AUTO_CADENCE
+#define TH08_PSP_AUTO_CADENCE_ENABLED 1
+static std::uint64_t gPspAutoDrawStartUs = 0U;
+#else
+#define TH08_PSP_AUTO_CADENCE_ENABLED 0
+#endif
 static ZunBool gPspHasPresented;
 
 #if defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
@@ -164,11 +204,17 @@ static void WaitForPspRenderCadence(u8 simulatedTicksCovered)
     psp::PerfAttributionWaitContextScope waitContext(
         psp::PerfAttributionWaitContext::Cadence);
 #endif
+#if TH08_PSP_USAGE_METER_ENABLED
+    const unsigned long long pspMeterWaitStart = static_cast<unsigned long long>(sceKernelGetSystemTimeWide());
+#endif
     while (static_cast<u32>(sceDisplayGetVcount() - gPspLastPresentVcount) <
            requiredElapsedVblanks)
     {
         sceDisplayWaitVblankStart();
     }
+#if TH08_PSP_USAGE_METER_ENABLED
+    psp::UsageMeterNoteWait(static_cast<unsigned long long>(sceKernelGetSystemTimeWide()) - pspMeterWaitStart);
+#endif
 }
 
 static void MarkPspRenderPresented()
@@ -391,12 +437,23 @@ restart:
             }
         }
 #if defined(PSP)
+        if (g_GameWindow.windowIsClosing || !psp::PlatformRunning() ||
+            renderResult == RENDER_RESULT_EXIT_SUCCESS || renderResult == RENDER_RESULT_EXIT_SUCCESS_2)
+            psp::PlatformArmExitWatchdog();
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+        psp::PerfAttributionFinish(static_cast<std::int32_t>(g_GameManager.currentStage),
+                                   static_cast<std::uint32_t>(g_GameManager.stageActiveFrames));
+#endif
         psp::BootLog(
             "RENDER_CADENCE_SUMMARY initial_mode=%u final_mode=%u "
             "select_edge_count=%lu\n",
             static_cast<unsigned int>(psp::InitialRenderCadenceMode()),
             static_cast<unsigned int>(psp::CurrentRenderCadenceMode()),
             static_cast<unsigned long>(psp::RenderCadenceSelectEdgeCount()));
+        psp::BootLog("MAIN_LOOP_EXIT closing=%d running=%d stage=%d frame=%lu\n", g_GameWindow.windowIsClosing ? 1 : 0,
+                     psp::PlatformRunning() ? 1 : 0, static_cast<int>(g_GameManager.currentStage),
+                     static_cast<unsigned long>(g_GameManager.stageActiveFrames));
+        psp::FlushBootLog();
         if (!psp::PlatformRunning())
         {
             TH08_PSP_BOOT_CHECKPOINT("main_loop", "platform_exit_observed", 0);
@@ -562,6 +619,16 @@ RenderResult GameWindow::Render()
         psp::PerfEnvNoteMain(2U, static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - pspLoopHeadStartUs);
 #endif
 #if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+        psp::PerfAttributionObserveRun(g_Supervisor.curState == SupervisorState_GameManager,
+            static_cast<std::int32_t>(g_GameManager.currentStage),
+            static_cast<std::uint32_t>(g_GameManager.stageActiveFrames),
+            g_GameManager.flags.isReplay != 0, g_GameManager.flags.isDemoMode != 0,
+            g_GameManager.currentDemoReplay);
+#endif
+#if TH08_PSP_AUTO_CADENCE_ENABLED
+        const std::uint64_t pspAutoCalcStartUs = static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
+#endif
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
         {
             psp::PerfAttributionScope calcScope(
                 psp::PerfAttributionPhase::CalcChain);
@@ -570,6 +637,150 @@ RenderResult GameWindow::Render()
 #else
         calcChainResult = g_Chain.RunCalcChain();
 #endif
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+        // Replay sync trace (debug builds only): one line per simulated frame
+        // while a replay plays, for comparison with the original game.
+        if (g_GameManager.flags.isReplay && g_GameManager.globals != NULL)
+        {
+            static unsigned long pspSyncLastFrame = 0xFFFFFFFFUL;
+            static int pspSyncLastStage = -1;
+            static unsigned long pspSyncDumpedFrame = 0xFFFFFFFFUL;
+            const unsigned long pspSyncFrame = static_cast<unsigned long>(g_GameManager.stageActiveFrames);
+            const int pspSyncStage = static_cast<int>(g_GameManager.currentStage);
+            g_PspRngTraceFrame = (pspSyncStage == 0 && ((pspSyncFrame >= 7165 && pspSyncFrame <= 7180) || (pspSyncFrame >= 5500 && pspSyncFrame <= 5560))) ? pspSyncFrame : 0UL;
+            {
+                static bool pspBasesLogged = false;
+                if (!pspBasesLogged && g_PspRngTraceFrame != 0)
+                {
+                    pspBasesLogged = true;
+                    psp::BootLog("ANM_BASES items=%08lx items_end=%08lx enemies=%08lx enemies_end=%08lx bullets=%08lx bullets_end=%08lx player=%08lx player_end=%08lx effects=%08lx effects_end=%08lx\n",
+                                 (unsigned long)(uintptr_t)&g_ItemManager.items[0], (unsigned long)(uintptr_t)&g_ItemManager.items[MAX_ITEMS + 1],
+                                 (unsigned long)(uintptr_t)&g_EnemyManager.enemies[0], (unsigned long)(uintptr_t)&g_EnemyManager.enemies[481],
+                                 (unsigned long)(uintptr_t)g_BulletManager.bullets, (unsigned long)(uintptr_t)(g_BulletManager.bullets + 0x601),
+                                 (unsigned long)(uintptr_t)&g_Player, (unsigned long)((uintptr_t)&g_Player + sizeof(g_Player)),
+                                 (unsigned long)(uintptr_t)&g_EffectManager, (unsigned long)((uintptr_t)&g_EffectManager + sizeof(g_EffectManager)));
+                }
+            }
+            if (pspSyncFrame != pspSyncLastFrame || pspSyncStage != pspSyncLastStage)
+            {
+                union { f32 f; u32 u; } pspSyncX, pspSyncY;
+                union { f32 f; u32 u; } pspSyncFm;
+                pspSyncFm.f = g_Supervisor.framerateMultiplier;
+                pspSyncX.f = g_Player.position.x;
+                pspSyncY.f = g_Player.position.y;
+                psp::BootLog("SYNC_TRACE st=%d f=%lu s=%04x x=%08lx y=%08lx sc=%lu lv=%ld g=%lu o=%ld to=%ld piv=%ld ga=%d pw=%ld gr=%ld fm=%08lx\n", pspSyncStage, pspSyncFrame,
+                             static_cast<unsigned int>(g_Rng.GetSeed()), static_cast<unsigned long>(pspSyncX.u),
+                             static_cast<unsigned long>(pspSyncY.u), static_cast<unsigned long>(g_GameManager.globals->score),
+                             static_cast<long>(g_GameManager.globals->livesRemaining),
+                             static_cast<unsigned long>(g_Rng.GetGenerationCount()),
+                             static_cast<long>(g_GameManager.globals->currentTimeOrbs),
+                             static_cast<long>(g_GameManager.globals->totalTimeOrbs),
+                             static_cast<long>(g_GameManager.globals->pointItemValue),
+                             static_cast<int>(g_GameManager.globals->youkaiGauge),
+                             static_cast<long>(g_GameManager.globals->playerPower),
+                             static_cast<long>(g_GameManager.globals->graze), (unsigned long)pspSyncFm.u);
+                pspSyncLastFrame = pspSyncFrame;
+                pspSyncLastStage = pspSyncStage;
+                // 6B replay hardware freeze hunt: flush every frame around the stop window.
+                if (pspSyncStage == 7 && pspSyncFrame >= 1150 && pspSyncFrame <= 1950)
+                    psp::FlushBootLog();
+            }
+            if (pspSyncStage == 0 && ((pspSyncFrame >= 7060 && pspSyncFrame <= 7180) || (pspSyncFrame >= 5500 && pspSyncFrame <= 5560) || (pspSyncFrame >= 4150 && pspSyncFrame <= 4180)) && pspSyncFrame != pspSyncDumpedFrame)
+            {
+                pspSyncDumpedFrame = pspSyncFrame;
+                {
+                    int pspActive = 0, pspFirst = -1, pspLast = -1;
+                    for (int bi = 0; bi < 0x601; bi++)
+                    {
+                        if (g_BulletManager.bullets[bi].state != 0)
+                        {
+                            pspActive++;
+                            if (pspFirst < 0) pspFirst = bi;
+                            pspLast = bi;
+                        }
+                    }
+                    psp::BootLog("BULLET_DUMP_SUMMARY f=%lu active=%d first=%d last=%d sizeof=%lu off_state=%lu off_pos=%lu\n", pspSyncFrame,
+                                 pspActive, pspFirst, pspLast, (unsigned long)sizeof(Bullet), (unsigned long)offsetof(Bullet, state),
+                                 (unsigned long)offsetof(Bullet, position));
+                }
+                for (int bi = 0; bi < 0x601; bi++)
+                {
+                    const Bullet &bb = g_BulletManager.bullets[bi];
+                    if (bb.state == 0)
+                        continue;
+                    union { f32 f; u32 u; } bx, by, bvx, bvy, bsp, ban;
+                    bx.f = bb.position.x; by.f = bb.position.y; bvx.f = bb.velocity.x; bvy.f = bb.velocity.y;
+                    bsp.f = bb.speed; ban.f = bb.angle;
+                    psp::BootLog("BULLET_DUMP f=%lu i=%d st=%d x=%08lx y=%08lx vx=%08lx vy=%08lx sp=%08lx an=%08lx\n",
+                                 pspSyncFrame, bi, (int)bb.state, (unsigned long)bx.u, (unsigned long)by.u,
+                                 (unsigned long)bvx.u, (unsigned long)bvy.u, (unsigned long)bsp.u, (unsigned long)ban.u);
+                }
+                for (int ii = 0; ii < 512; ii++)
+                {
+                    const Item &it = g_ItemManager.items[ii];
+                    if (it.isInUse == 0)
+                        continue;
+                    union { f32 f; u32 u; } cx, cy, vx, vy, tx, ty;
+                    cx.f = it.currentPosition.x; cy.f = it.currentPosition.y;
+                    vx.f = it.startPositionOrVelocity.x; vy.f = it.startPositionOrVelocity.y;
+                    tx.f = it.targetPosition.x; ty.f = it.targetPosition.y;
+                    psp::BootLog("ITEM_DUMP f=%lu i=%d ty=%d st=%d on=%d x=%08lx y=%08lx vx=%08lx vy=%08lx tx=%08lx ty=%08lx t=%ld\n",
+                                 pspSyncFrame, ii, (int)it.itemType, (int)it.state, (int)it.isOnscreen, (unsigned long)cx.u,
+                                 (unsigned long)cy.u, (unsigned long)vx.u, (unsigned long)vy.u, (unsigned long)tx.u,
+                                 (unsigned long)ty.u, (long)it.timer.current);
+                }
+                if ((pspSyncFrame >= 7060 && pspSyncFrame <= 7180) || (pspSyncFrame >= 5500 && pspSyncFrame <= 5560) || (pspSyncFrame >= 4150 && pspSyncFrame <= 4180))
+                {
+                    for (int fi = 0; fi < 0x200; fi++)
+                    {
+                        const Effect &ef = g_EffectManager.effects[fi];
+                        if (ef.active == 0)
+                            continue;
+                        union { f32 f; u32 u; } fx, fy;
+                        fx.f = ef.position.x; fy.f = ef.position.y;
+                        psp::BootLog("EFFECT_DUMP f=%lu i=%d id=%d t=%ld script=%d anm=%d rel=%d x=%08lx y=%08lx\n", pspSyncFrame, fi,
+                                     (int)ef.effectId, (long)ef.timer.current, (int)ef.vm.scriptIndex, (int)ef.vm.anmFileIndex,
+                                     (int)ef.releaseRequested, (unsigned long)fx.u, (unsigned long)fy.u);
+                    }
+                }
+                for (int ei = 0; ei < 96; ei++)
+                {
+                    const Enemy &ee = g_EnemyManager.enemies[ei];
+                    if ((ee.flags1 & 1U) == 0)
+                        continue;
+                    union { f32 f; u32 u; } ex, ey;
+                    ex.f = ee.position.x; ey.f = ee.position.y;
+                    psp::BootLog("ENEMY_DUMP f=%lu i=%d x=%08lx y=%08lx life=%ld f1=%08lx f2=%08lx att=%d bt=%ld ecl=%d\n", pspSyncFrame, ei,
+                                 (unsigned long)ex.u, (unsigned long)ey.u, (long)ee.life, (unsigned long)ee.flags1,
+                                 (unsigned long)ee.flags2, (int)ee.attachedEffectCount, (long)ee.bossTimer.current,
+                                 ee.activeEclContext != NULL ? 1 : 0);
+                }
+            }
+        }
+#endif
+#if TH08_PSP_AUTO_CADENCE_ENABLED
+        psp::AutoCadenceNoteCalc(static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - pspAutoCalcStartUs);
+#endif
+#if TH08_PSP_PERF_ATTRIBUTION_ENABLED
+        psp::PerfAttributionAfterCalc(static_cast<std::int32_t>(g_GameManager.currentStage),
+                                     static_cast<std::uint32_t>(g_GameManager.stageActiveFrames));
+#endif
+#if TH08_PSP_ME_EFFECT_ADOPT_CAPTURE_ENABLED
+        // Background-effect inputs are final here; hand them to the ME so the
+        // quads are ready when the draw chain reaches DrawBackgroundEffects.
+        th08_psp_me_effect_adopt_capture();
+        th08_psp_me_effect0_adopt_capture();
+#endif
+#if TH08_PSP_ME_BULLET_ADOPT_CAPTURE_ENABLED
+        // Bullet draw buckets are final after BulletManager::OnUpdate.
+        th08_psp_me_bullet_adopt_capture();
+#endif
+#if TH08_PSP_ME_BG_ADOPT_CAPTURE_ENABLED
+        th08_psp_me_bg_adopt_capture();
+#endif
+        // (ME popup capture moved below the cadence decision: kicking a job on a
+        // frame that is not drawn recycles the output slot the GE may still be
+        // reading, which showed up as stretched score digits under load.)
 #if defined(PSP)
 #if TH08_PSP_PERF_ENV_ENABLED
         {
@@ -637,6 +848,10 @@ RenderResult GameWindow::Render()
         psp::PerfEnvNoteMain(7U, static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - pspCadenceTickStartUs);
 #endif
 
+#if defined(PSP) && ((defined(TH08_PSP_ME_POPUP) && TH08_PSP_ME_POPUP) || (defined(TH08_PSP_ME_POPUP_AUDIT) && TH08_PSP_ME_POPUP_AUDIT))
+        if (shouldDraw)
+            th08_psp_me_popup_capture();
+#endif
         if (shouldDraw)
 #else
         this->framesSinceRedraw++;
@@ -647,6 +862,9 @@ RenderResult GameWindow::Render()
 #if TH08_PSP_PERF_ATTRIBUTION_ENABLED
             psp::PerfAttributionScope drawFrameScope(
                 psp::PerfAttributionPhase::DrawFrame);
+#endif
+#if TH08_PSP_AUTO_CADENCE_ENABLED
+            gPspAutoDrawStartUs = static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
 #endif
             g_Supervisor.d3dDevice->BeginScene();
             g_AnmManager->ClearVertexBuffer();
@@ -662,6 +880,14 @@ RenderResult GameWindow::Render()
             g_Chain.RunDrawChain();
 #endif
             g_AnmManager->FlushVertexBuffer();
+#if defined(PSP) && TH08_PSP_DEBUG_START_STAGE_ENABLED
+            if (g_GameManager.currentStage == 7 && g_GameManager.stageActiveFrames >= 1150 &&
+                g_GameManager.stageActiveFrames <= 1950)
+            {
+                psp::BootLog("FRAME_DRAWN st=7 f=%lu\n", static_cast<unsigned long>(g_GameManager.stageActiveFrames));
+                psp::FlushBootLog();
+            }
+#endif
 #if defined(PSP) && defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
             DrawPspGoIoActivityLamp();
 #endif
@@ -676,8 +902,17 @@ RenderResult GameWindow::Render()
 #if defined(PSP)
         if (shouldDraw)
         {
+#if TH08_PSP_AUTO_CADENCE_ENABLED
+            const std::uint64_t pspAutoWaitStartUs = static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
+#endif
             WaitForPspRenderCadence(cadenceResult.simulatedTicksCovered);
+#if TH08_PSP_AUTO_CADENCE_ENABLED
+            const std::uint64_t pspAutoWaitUs = static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - pspAutoWaitStartUs;
+#endif
             Present();
+#if TH08_PSP_AUTO_CADENCE_ENABLED
+            psp::AutoCadenceNoteDraw(static_cast<std::uint64_t>(sceKernelGetSystemTimeWide()) - gPspAutoDrawStartUs - pspAutoWaitUs);
+#endif
 #if TH08_PSP_PERF_ENV_ENABLED
             const std::uint64_t pspPostPresentStartUs =
                 static_cast<std::uint64_t>(sceKernelGetSystemTimeWide());
@@ -697,6 +932,9 @@ RenderResult GameWindow::Render()
 
         // This counter is shared by loading/dialogue/spell presentation but
         // is a game-tick value.  It must not slow down with 1/2 or 1/3 draws.
+#if TH08_PSP_AUTO_CADENCE_ENABLED
+        psp::AutoCadenceTick(shouldDraw != 0);
+#endif
         if (g_Supervisor.screenTransitionCountdown != 0 &&
             !g_GameManager.isInGameMenu)
         {

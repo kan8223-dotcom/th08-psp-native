@@ -81,6 +81,16 @@ private:
 // Initialize after FileIoInitialize(), on the thread that runs WinMain.
 void PerfAttributionInitialize();
 
+// Independent mixed-cadence spans reuse the existing phase timestamps. Observe
+// the run before CalcChain, so title/loading work cannot enter the previous run.
+void PerfAttributionObserveRun(bool gameplay, std::int32_t stage,
+                               std::uint32_t stageFrame, bool replay,
+                               bool demoMode, std::uint8_t demoReplay);
+// Position bookkeeping after CalcChain has closed, including non-drawn ticks.
+void PerfAttributionAfterCalc(std::int32_t stage, std::uint32_t stageFrame);
+// Idempotent; called after exit watchdog arming and outside all measured scopes.
+void PerfAttributionFinish(std::int32_t stage, std::uint32_t stageFrame);
+
 // Called after a completed Present, never on simulation-only cadence ticks.
 // Windows are rearmed on stage/frame rewind, replay/demo identity, or cadence
 // changes, and emit exactly one compact line per 600 uninterrupted stage ticks.

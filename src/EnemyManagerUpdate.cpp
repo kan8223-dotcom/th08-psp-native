@@ -1,4 +1,7 @@
 #include "inttypes.hpp"
+#if defined(PSP)
+#include "fileio.hpp"
+#endif
 #include "Supervisor.hpp"
 #include "AnmManager.hpp"
 #include "AsciiManager.hpp"
@@ -472,6 +475,14 @@ i32 EnemyManager::OnUpdate()
             i32 deathVmIndex;
 
             enemy->flags2 |= ENEMY_FLAG2_DEATH_LATCH;
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+            if (g_GameManager.flags.isReplay && g_GameManager.currentStage == 0 && g_GameManager.stageActiveFrames >= 7070 &&
+                g_GameManager.stageActiveFrames <= 7077)
+                th08::psp::BootLog("DEATH_BLOCK f=%lu enemy=%d f1=%08lx f2=%08lx life=%ld att=%d\n",
+                                   (unsigned long)g_GameManager.stageActiveFrames, (int)enemy->enemyIndex,
+                                   (unsigned long)enemy->flags1, (unsigned long)enemy->flags2, (long)enemy->life,
+                                   (int)enemy->attachedEffectCount);
+#endif
             D3DXVECTOR3 bonus;
             i32 deathPosition;
             enemy->phaseEndTimeRemainingSeconds =
@@ -552,13 +563,18 @@ i32 EnemyManager::OnUpdate()
                 }
                 goto common_death_mode;
 
-            case 2:
             common_death_mode:
                 if (reinterpret_cast<EnemyFlag1Bits *>(&enemy->flags1)->boss)
                 {
                     g_Gui.SetBossPresent(false);
                     enemy->ReleaseAttachedEffects();
                 }
+            // Retail 1.00d (jump table at 0x42de96): death mode 2 (keep runtime
+            // state) enters at DropItems and skips the boss-present/attached-
+            // effect release above.  The upstream reconstruction put the case
+            // label before that block, which released the spell-card orbit
+            // effects one phase early and desynchronised PC replays.
+            case 2:
                 enemy->DropItems(bombHit);
                 if (reinterpret_cast<EnemyFlag1Bits *>(&enemy->flags1)->boss &&
                     !g_Spellcard.IsActive())

@@ -240,7 +240,9 @@ class GameErrorContext
                 MessageBoxA(NULL, this->buffer, "log", MB_ICONSTOP);
             }
 
+#if !defined(PSP) || !defined(TH08_PSP_LOGGING) || TH08_PSP_LOGGING
             FileSystem::WriteDataToFile("./log.txt", this->buffer, strlen(this->buffer));
+#endif
         }
     }
 

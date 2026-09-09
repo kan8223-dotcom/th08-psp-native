@@ -1,10 +1,15 @@
 #include "anm_scratch.hpp"
 #include "boot_checkpoint.hpp"
 #include "fileio.hpp"
+#if !TH08_PSP_LOGGING
+#include <SDL_log.h>
+#endif
 #include "ge4_bridge.hpp"
 #if defined(TH08_PSP_GO_IO_LAMP) && TH08_PSP_GO_IO_LAMP
 #include "io_activity_lamp.hpp"
 #endif
+#include "me_core.hpp"
+#include "stage_pool_arena.hpp"
 #include "memory_telemetry.hpp"
 #include "newlib_heap_geometry.hpp"
 #include "perf_attribution.hpp"
@@ -17,6 +22,7 @@
 #include <pspdisplay.h>
 #include <pspiofilemgr.h>
 #include <pspkernel.h>
+#include <psppower.h>
 #include <pspmoduleinfo.h>
 
 #include <cstddef>
@@ -29,7 +35,7 @@
 static void TerminateHandler()
 {
     th08::psp::BootLog("TERMINATE uncaught_failure=1\n");
-    th08::psp::FlushBootLog();
+    th08::psp::FlushBootLogHard();
     sceKernelExitGame();
     for (;;)
         sceKernelDelayThread(1000000);
@@ -274,6 +280,26 @@ static void TerminateHandler()
 #else
 #define TH08_PSP_FEATURE_SCORE_POPUP_NATIVE_GE 0
 #endif
+#if defined(TH08_PSP_HUD_TEXT_NATIVE) && TH08_PSP_HUD_TEXT_NATIVE
+#define TH08_PSP_FEATURE_HUD_TEXT_NATIVE 1
+#else
+#define TH08_PSP_FEATURE_HUD_TEXT_NATIVE 0
+#endif
+#if defined(TH08_PSP_HUD_TEXT_BATCH) && TH08_PSP_HUD_TEXT_BATCH
+#define TH08_PSP_FEATURE_HUD_TEXT_BATCH 1
+#else
+#define TH08_PSP_FEATURE_HUD_TEXT_BATCH 0
+#endif
+#if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
+#define TH08_PSP_FEATURE_SUBMIT_SUBPROFILE 1
+#else
+#define TH08_PSP_FEATURE_SUBMIT_SUBPROFILE 0
+#endif
+#if defined(TH08_PSP_GUI_FRONT_NATIVE) && TH08_PSP_GUI_FRONT_NATIVE
+#define TH08_PSP_FEATURE_GUI_FRONT_NATIVE 1
+#else
+#define TH08_PSP_FEATURE_GUI_FRONT_NATIVE 0
+#endif
 #if defined(TH08_PSP_STAGE_RELATIVE_PERF_SAMPLING) && \
     TH08_PSP_STAGE_RELATIVE_PERF_SAMPLING
 #define TH08_PSP_FEATURE_STAGE_RELATIVE_PERF_SAMPLING 1
@@ -493,6 +519,113 @@ static void TerminateHandler()
 #else
 #define TH08_PSP_FEATURE_EFFECT_OCCUPANCY_AUDIT 0
 #endif
+#if defined(TH08_PSP_EFFECT_EARLY_CULL) && TH08_PSP_EFFECT_EARLY_CULL
+#define TH08_PSP_FEATURE_EFFECT_EARLY_CULL 1
+#else
+#define TH08_PSP_FEATURE_EFFECT_EARLY_CULL 0
+#endif
+#if defined(TH08_PSP_EFFECT_EARLY_CULL_AUDIT) && TH08_PSP_EFFECT_EARLY_CULL_AUDIT
+#define TH08_PSP_FEATURE_EFFECT_EARLY_CULL_AUDIT 1
+#else
+#define TH08_PSP_FEATURE_EFFECT_EARLY_CULL_AUDIT 0
+#endif
+#if defined(TH08_PSP_ME_EFFECT_ADOPT) && TH08_PSP_ME_EFFECT_ADOPT
+#define TH08_PSP_FEATURE_ME_EFFECT_ADOPT 1
+#else
+#define TH08_PSP_FEATURE_ME_EFFECT_ADOPT 0
+#endif
+#if defined(TH08_PSP_ME_EFFECT_ADOPT_AUDIT) && TH08_PSP_ME_EFFECT_ADOPT_AUDIT
+#define TH08_PSP_FEATURE_ME_EFFECT_ADOPT_AUDIT 1
+#else
+#define TH08_PSP_FEATURE_ME_EFFECT_ADOPT_AUDIT 0
+#endif
+#if defined(TH08_PSP_ME_BULLET_ADOPT) && TH08_PSP_ME_BULLET_ADOPT
+#define TH08_PSP_FEATURE_ME_BULLET_ADOPT 1
+#else
+#define TH08_PSP_FEATURE_ME_BULLET_ADOPT 0
+#endif
+#if defined(TH08_PSP_ME_BULLET_ADOPT_AUDIT) && TH08_PSP_ME_BULLET_ADOPT_AUDIT
+#define TH08_PSP_FEATURE_ME_BULLET_ADOPT_AUDIT 1
+#else
+#define TH08_PSP_FEATURE_ME_BULLET_ADOPT_AUDIT 0
+#endif
+#if defined(TH08_PSP_QUAD_BATCH) && TH08_PSP_QUAD_BATCH
+#define TH08_PSP_FEATURE_QUAD_BATCH 1
+#else
+#define TH08_PSP_FEATURE_QUAD_BATCH 0
+#endif
+#if defined(TH08_PSP_GE_KICK) && TH08_PSP_GE_KICK
+#define TH08_PSP_FEATURE_GE_KICK TH08_PSP_GE_KICK_DRAWS
+#else
+#define TH08_PSP_FEATURE_GE_KICK 0
+#endif
+#if defined(TH08_PSP_GE_2D_DIRECT) && TH08_PSP_GE_2D_DIRECT
+#define TH08_PSP_FEATURE_GE_2D_DIRECT 1
+#else
+#define TH08_PSP_FEATURE_GE_2D_DIRECT 0
+#endif
+#if defined(TH08_PSP_PSPGL_STREAM_LIST) && TH08_PSP_PSPGL_STREAM_LIST
+#define TH08_PSP_FEATURE_PSPGL_STREAM_LIST 1
+#else
+#define TH08_PSP_FEATURE_PSPGL_STREAM_LIST 0
+#endif
+#if defined(TH08_PSP_GE4_HOT_TEXTURES) && TH08_PSP_GE4_HOT_TEXTURES
+#define TH08_PSP_FEATURE_GE4_HOT_TEXTURES 1
+#else
+#define TH08_PSP_FEATURE_GE4_HOT_TEXTURES 0
+#endif
+#if defined(TH08_PSP_CANCEL_TRIG_CACHE) && TH08_PSP_CANCEL_TRIG_CACHE
+#define TH08_PSP_FEATURE_CANCEL_TRIG_CACHE 1
+#else
+#define TH08_PSP_FEATURE_CANCEL_TRIG_CACHE 0
+#endif
+#if defined(TH08_PSP_AUTO_CADENCE) && TH08_PSP_AUTO_CADENCE
+#define TH08_PSP_FEATURE_AUTO_CADENCE 1
+#else
+#define TH08_PSP_FEATURE_AUTO_CADENCE 0
+#endif
+#if defined(TH08_PSP_ME_POPUP) && TH08_PSP_ME_POPUP
+#define TH08_PSP_FEATURE_ME_POPUP 1
+#elif defined(TH08_PSP_ME_POPUP_AUDIT) && TH08_PSP_ME_POPUP_AUDIT
+#define TH08_PSP_FEATURE_ME_POPUP 2
+#else
+#define TH08_PSP_FEATURE_ME_POPUP 0
+#endif
+#if defined(TH08_PSP_STAGE_POOL_LOW) && TH08_PSP_STAGE_POOL_LOW
+#define TH08_PSP_FEATURE_STAGE_POOL_LOW 1
+#else
+#define TH08_PSP_FEATURE_STAGE_POOL_LOW 0
+#endif
+#if defined(TH08_PSP_ME_BULLET_MOVE) && TH08_PSP_ME_BULLET_MOVE
+#define TH08_PSP_FEATURE_ME_BULLET_MOVE TH08_PSP_ME_BULLET_MOVE_SHARE
+#else
+#define TH08_PSP_FEATURE_ME_BULLET_MOVE 0
+#endif
+#if defined(TH08_PSP_BGM_CATCHUP) && TH08_PSP_BGM_CATCHUP
+#define TH08_PSP_FEATURE_BGM_CATCHUP 1
+#else
+#define TH08_PSP_FEATURE_BGM_CATCHUP 0
+#endif
+#if defined(TH08_PSP_GUI_BORDER_NATIVE) && TH08_PSP_GUI_BORDER_NATIVE
+#define TH08_PSP_FEATURE_GUI_BORDER_NATIVE 1
+#else
+#define TH08_PSP_FEATURE_GUI_BORDER_NATIVE 0
+#endif
+#if defined(TH08_PSP_RADIAL_TRAIL_FAST_TRIG) && TH08_PSP_RADIAL_TRAIL_FAST_TRIG
+#define TH08_PSP_FEATURE_RADIAL_TRAIL_FAST_TRIG 1
+#else
+#define TH08_PSP_FEATURE_RADIAL_TRAIL_FAST_TRIG 0
+#endif
+#if defined(TH08_PSP_ME_BG_ADOPT) && TH08_PSP_ME_BG_ADOPT
+#define TH08_PSP_FEATURE_ME_BG_ADOPT 1
+#else
+#define TH08_PSP_FEATURE_ME_BG_ADOPT 0
+#endif
+#if defined(TH08_PSP_ME_BG_ADOPT_AUDIT) && TH08_PSP_ME_BG_ADOPT_AUDIT
+#define TH08_PSP_FEATURE_ME_BG_ADOPT_AUDIT 1
+#else
+#define TH08_PSP_FEATURE_ME_BG_ADOPT_AUDIT 0
+#endif
 #if defined(TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT) && \
     TH08_PSP_EFFECT_SPRITE_PAIR_AUDIT
 #define TH08_PSP_FEATURE_EFFECT_SPRITE_PAIR_AUDIT 1
@@ -659,13 +792,24 @@ extern "C" void th08_psp_boot_checkpoint(const char *phase,
         static_cast<unsigned long>(kernel.edramBytes));
     // Do not batch startup breadcrumbs: a PSP hard fault loses userspace and
     // the in-memory 4 KiB boot-log buffer immediately.
-    th08::psp::FlushBootLog();
+    th08::psp::FlushBootLogHard();
 }
+
+// Main thread priority at boot, for threads that must preempt it (BGM refill).
+static int g_PspMainThreadPriority = 32;
+extern "C" int th08_psp_main_thread_priority(void) { return g_PspMainThreadPriority; }
 
 int main(int argc, char **argv)
 {
+#if !TH08_PSP_LOGGING
+    // PSP SDL's default sink appends SDL_Log.txt. Disable it before any SDL
+    // subsystem can initialize; null is checked before message formatting.
+    SDL_LogSetOutputFunction(nullptr, nullptr);
+#endif
+    g_PspMainThreadPriority = sceKernelGetThreadCurrentPriority();
     th08::psp::PlatformInitialize();
     th08::psp::FileIoInitialize(argc > 0 ? argv[0] : nullptr);
+    th08::psp::PlatformLogSafety();
 #if TH08_PSP_FEATURE_GO_IO_LAMP
     th08::psp::IoActivityLampInitialize();
 #endif
@@ -678,13 +822,25 @@ int main(int argc, char **argv)
     // synchronously flushed breadcrumbs plus the orderly-failure screen.
     th08::psp::BootLog(
         "EXCEPTION_HANDLER installed=0 reason=user_module_kernel_import_forbidden\n");
-    th08::psp::FlushBootLog();
+    th08::psp::FlushBootLogHard();
     TH08_PSP_BOOT_CHECKPOINT("memory_telemetry", "before_initialize", 0);
     th08::psp::MemoryTelemetryInitialize(th08::psp::GameDirectory());
     TH08_PSP_BOOT_CHECKPOINT("memory_telemetry", "after_initialize", 0);
+#if defined(TH08_PSP_STAGE_POOL_LOW) && TH08_PSP_STAGE_POOL_LOW
+    // The Media Engine cannot address the extra 32 MiB: reserve the stage
+    // pool (bullets, enemies, items) before any other large allocation.
+    TH08_PSP_BOOT_CHECKPOINT("stage_pool_early", "before", 0);
+    const bool stagePoolEarly = th08::psp::StagePoolArenaReserveEarly();
+    TH08_PSP_BOOT_CHECKPOINT("stage_pool_early", "after", stagePoolEarly ? 1 : 0);
+#endif
     TH08_PSP_BOOT_CHECKPOINT("ge4_prepare", "before", 0);
     const bool ge4Prepared = th08_psp_ge4_prepare() != 0;
     TH08_PSP_BOOT_CHECKPOINT("ge4_prepare", "after", ge4Prepared ? 1 : 0);
+#if TH08_PSP_ME_CORE_ENABLED
+    TH08_PSP_BOOT_CHECKPOINT("me_core", "before", 0);
+    const int meCoreReady = th08_me_core_init();
+    TH08_PSP_BOOT_CHECKPOINT("me_core", "after", meCoreReady);
+#endif
     TH08_PSP_BOOT_CHECKPOINT("anm_scratch", "before_initialize", 0);
     const bool anmScratchReady = th08::psp::AnmScratchInitialize();
     TH08_PSP_BOOT_CHECKPOINT("anm_scratch", "after_initialize",
@@ -707,7 +863,7 @@ int main(int argc, char **argv)
     th08::psp::BootLog("SOURCE th07_ge4_bridge=%s\n", TH07_GE4_BRIDGE_COMMIT);
     std::set_terminate(&TerminateHandler);
     th08::psp::BootLog(
-        "FEATURE SC_ONLY=1 ME=DISABLED MIST=DISABLED engine=LINKED "
+        "FEATURE SC_ONLY=1 ME=%s MIST=DISABLED engine=LINKED "
         "audio=SC_LINKED GE4_PREPARED=%d GE4_SLIMPLUS=%d "
         "TH07_BOOT_PARITY=%d "
         "SELECT_CADENCE=60_30_20 RENDER_CADENCE_INITIAL_MODE=%u "
@@ -737,7 +893,7 @@ int main(int argc, char **argv)
         "RENDER_VFPU=%d X87_TRIG_CACHE=%d ANTITAMPER_SWAR=%d "
         "RADIAL_TRAIL_TRIG_REUSE=%d "
         "FANTASY_SEAL_WORK_BOUNDS=%d "
-        "EFFECT_OCCUPANCY_FASTPATH=%d EFFECT_OCCUPANCY_AUDIT=%d EFFECT_SPRITE_PAIR_AUDIT=%d "
+        "EFFECT_OCCUPANCY_FASTPATH=%d EFFECT_OCCUPANCY_AUDIT=%d EFFECT_EARLY_CULL=%d EFFECT_EARLY_CULL_AUDIT=%d ME_EFFECT_ADOPT=%d ME_EFFECT_ADOPT_AUDIT=%d ME_BULLET_ADOPT=%d ME_BULLET_ADOPT_AUDIT=%d QUAD_BATCH=%d GE_KICK=%d GE_2D_DIRECT=%d PSPGL_STREAM_LIST=%d GE4_HOT_TEXTURES=%d ME_BG_ADOPT=%d ME_BG_ADOPT_AUDIT=%d RADIAL_TRAIL_FAST_TRIG=%d GUI_BORDER_NATIVE=%d BGM_CATCHUP=%d ME_BULLET_MOVE=%d STAGE_POOL_LOW=%d ME_POPUP=%d AUTO_CADENCE=%d CANCEL_TRIG_CACHE=%d EFFECT_SPRITE_PAIR_AUDIT=%d "
         "EFFECT_SPRITE_PAIR_FASTPATH=%d "
         "EFFECT_INDEXED_QUADS=%d "
         "PREPARE_STATE_CACHE=%d "
@@ -759,9 +915,10 @@ int main(int argc, char **argv)
         "ITEM_TIME_INLINE_DRAW_AUDIT=%d ITEM_TIME_INLINE_DRAW_FASTPATH=%d "
         "ASCII_POPUP_OCCUPANCY=%d ASCII_POPUP_BATCH=%d "
         "ASCII_POPUP_DIRECT_PAIR=%d "
-        "SCORE_POPUP_NATIVE_GE=%d "
+        "SCORE_POPUP_NATIVE_GE=%d QUAD_VFPU=%d QUAD_VFPU_AUDIT=%d BULLET_UPDATE_SUBPROFILE=%d LASER_TRIG_CACHE=%d LASER_TRIG_AUDIT=%d REPLAY_SURFACE_RECOVERY=%d REPLAY_SURFACE_FAILS=%d HUD_TEXT_NATIVE=%d HUD_TEXT_BATCH=%d SUBMIT_SUBPROFILE=%d GUI_FRONT_NATIVE=%d "
         "STAGE_RELATIVE_PERF_SAMPLING=%d "
         "LOCAL_FONT_SUBSET=%d FONT_GLYPH_CACHE_RETAIN=%d\n",
+        th08_me_core_feature_string(),
         ge4Prepared ? 1 : 0, TH08_PSP_FEATURE_SLIMPLUS_GE4,
         TH08_PSP_TH07_BOOT_PARITY,
         static_cast<unsigned int>(
@@ -813,6 +970,27 @@ int main(int argc, char **argv)
         TH08_PSP_FEATURE_FANTASY_SEAL_WORK_BOUNDS,
         TH08_PSP_FEATURE_EFFECT_OCCUPANCY_FASTPATH,
         TH08_PSP_FEATURE_EFFECT_OCCUPANCY_AUDIT,
+        TH08_PSP_FEATURE_EFFECT_EARLY_CULL,
+        TH08_PSP_FEATURE_EFFECT_EARLY_CULL_AUDIT,
+        TH08_PSP_FEATURE_ME_EFFECT_ADOPT,
+        TH08_PSP_FEATURE_ME_EFFECT_ADOPT_AUDIT,
+        TH08_PSP_FEATURE_ME_BULLET_ADOPT,
+        TH08_PSP_FEATURE_ME_BULLET_ADOPT_AUDIT,
+        TH08_PSP_FEATURE_QUAD_BATCH,
+        TH08_PSP_FEATURE_GE_KICK,
+        TH08_PSP_FEATURE_GE_2D_DIRECT,
+        TH08_PSP_FEATURE_PSPGL_STREAM_LIST,
+        TH08_PSP_FEATURE_GE4_HOT_TEXTURES,
+        TH08_PSP_FEATURE_ME_BG_ADOPT,
+        TH08_PSP_FEATURE_ME_BG_ADOPT_AUDIT,
+        TH08_PSP_FEATURE_RADIAL_TRAIL_FAST_TRIG,
+        TH08_PSP_FEATURE_GUI_BORDER_NATIVE,
+        TH08_PSP_FEATURE_BGM_CATCHUP,
+        TH08_PSP_FEATURE_ME_BULLET_MOVE,
+        TH08_PSP_FEATURE_STAGE_POOL_LOW,
+        TH08_PSP_FEATURE_ME_POPUP,
+        TH08_PSP_FEATURE_AUTO_CADENCE,
+        TH08_PSP_FEATURE_CANCEL_TRIG_CACHE,
         TH08_PSP_FEATURE_EFFECT_SPRITE_PAIR_AUDIT,
         TH08_PSP_FEATURE_EFFECT_SPRITE_PAIR_FASTPATH,
         TH08_PSP_FEATURE_EFFECT_INDEXED_QUADS,
@@ -850,6 +1028,13 @@ int main(int argc, char **argv)
         TH08_PSP_FEATURE_ASCII_POPUP_BATCH,
         TH08_PSP_FEATURE_ASCII_POPUP_DIRECT_PAIR,
         TH08_PSP_FEATURE_SCORE_POPUP_NATIVE_GE,
+        TH08_PSP_QUAD_VFPU, TH08_PSP_QUAD_VFPU_AUDIT, TH08_PSP_BULLET_UPDATE_SUBPROFILE,
+        TH08_PSP_LASER_TRIG_CACHE, TH08_PSP_LASER_TRIG_AUDIT,
+        TH08_PSP_REPLAY_SURFACE_RECOVERY, TH08_PSP_REPLAY_SURFACE_FAILS,
+        TH08_PSP_FEATURE_HUD_TEXT_NATIVE,
+        TH08_PSP_FEATURE_HUD_TEXT_BATCH,
+        TH08_PSP_FEATURE_SUBMIT_SUBPROFILE,
+        TH08_PSP_FEATURE_GUI_FRONT_NATIVE,
         TH08_PSP_FEATURE_STAGE_RELATIVE_PERF_SAMPLING,
         TH08_PSP_FEATURE_LOCAL_FONT_SUBSET,
         TH08_PSP_FEATURE_FONT_GLYPH_CACHE_RETAIN);
@@ -890,13 +1075,16 @@ int main(int argc, char **argv)
         {
             th08::psp::BootLog("PHASE engine_handoff\n");
             th08::psp::MemoryTelemetryMarkPhase("engine_handoff");
-            th08::psp::FlushBootLog();
+            th08::psp::FlushBootLogHard();
 
             TH08_PSP_BOOT_CHECKPOINT("engine", "before_entry", 0);
             const int engineResult = th08_psp_run_engine(argc, argv);
             TH08_PSP_BOOT_CHECKPOINT("engine", "after_return", engineResult);
             // WinMain has released the D3D device, SDL/PSPGL context, and every
             // upper texture owner before returning here.
+            // The ME holds a power lock of its own: release it before the GE4
+            // bridge unlocks (its unlock must be the last one).
+            th08_me_core_shutdown();
             th08_psp_ge4_shutdown();
             th08::psp::MemoryTelemetryMarkPhase("engine_exit");
             th08::psp::BootLog("PHASE engine_exit result=%d\n", engineResult);
@@ -914,12 +1102,13 @@ int main(int argc, char **argv)
                         gLastBootPhase, gLastBootState, engineResult,
                         th08::psp::CaptureMemorySnapshot());
                 }
-                th08::psp::FlushBootLog();
+                th08::psp::FlushBootLogHard();
                 WaitForDiagnosticExit();
                 th08::psp::VideoShutdown();
             }
             th08::psp::MemoryTelemetryShutdown();
             FinalizeBootLogWithRetries();
+            th08::psp::PlatformArmExitWatchdog();
             sceKernelExitGame();
             return engineResult;
         }
@@ -938,7 +1127,7 @@ int main(int argc, char **argv)
         th08::psp::RenderBootstrapStatus(data, startupMemory, postProbeMemory);
     }
     th08::psp::BootLog("PHASE diagnostic_fallback_ready\n");
-    th08::psp::FlushBootLog();
+    th08::psp::FlushBootLogHard();
 
     WaitForDiagnosticExit();
 
@@ -946,9 +1135,11 @@ int main(int argc, char **argv)
     th08::psp::MemoryTelemetryMarkPhase("diagnostic_exit");
     LogMemory("exit", th08::psp::CaptureMemorySnapshot());
     th08::psp::VideoShutdown();
+    th08_me_core_shutdown();
     th08_psp_ge4_shutdown();
     th08::psp::MemoryTelemetryShutdown();
     FinalizeBootLogWithRetries();
+    th08::psp::PlatformArmExitWatchdog();
     sceKernelExitGame();
     return 0;
 }

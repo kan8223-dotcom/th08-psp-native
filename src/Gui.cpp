@@ -115,14 +115,92 @@ ChainCallbackResult Gui::OnUpdate(Gui *gui)
 }
 
 // FUNCTION: th08 0x433927
+#if defined(PSP) && defined(TH08_PSP_DRAW_PRIORITY_SUBPROFILE) && TH08_PSP_DRAW_PRIORITY_SUBPROFILE
+extern "C" unsigned int sceKernelGetSystemTimeLow(void);
+namespace
+{
+struct PspGuiSubStats
+{
+    unsigned long calls, clearUs, dialogueUs, stageUs, sceneUs, asciiUs;
+} g_PspGuiSub;
+struct PspGuiSceneSubStats
+{
+    unsigned long calls, viewportUs, frontUs, borderTextUs, powerUs, textFmtUs;
+} g_PspGuiSceneSub;
+// "%.Nd" / "%d" without vsprintf: newlib's formatter costs tens of
+// microseconds per call on the PSP and the HUD formats ten numbers a frame.
+int PspFormatDecimal(char *buf, int value, int minDigits)
+{
+    char digits[16];
+    int n = 0;
+    unsigned int mag = value < 0 ? 0U - static_cast<unsigned int>(value) : static_cast<unsigned int>(value);
+    do
+    {
+        digits[n++] = static_cast<char>('0' + mag % 10U);
+        mag /= 10U;
+    } while (mag != 0U);
+    int len = 0;
+    if (value < 0)
+        buf[len++] = '-';
+    for (int pad = n; pad < minDigits; ++pad)
+        buf[len++] = '0';
+    while (n > 0)
+        buf[len++] = digits[--n];
+    buf[len] = '\0';
+    return len;
+}
+int PspAddDecimal(Float3 *pos, int value, int minDigits)
+{
+    char buf[24];
+    const int len = PspFormatDecimal(buf, value, minDigits);
+    g_AsciiManager.AddString(pos, buf);
+    return len;
+}
+} // namespace
+#define TH08_PSP_GUI_SUB_ENABLED 1
+#else
+#define TH08_PSP_GUI_SUB_ENABLED 0
+#endif
+
 ChainCallbackResult Gui::OnDraw(Gui *gui)
 {
+#if TH08_PSP_GUI_SUB_ENABLED
+    // Where the GUI callback spends its time (PSP only, per 600 calls).
+    unsigned int pspT0 = sceKernelGetSystemTimeLow();
+#endif
     if (gui->impl->stageClearScreenState != 0)
         gui->DrawStageClearScreen();
+#if TH08_PSP_GUI_SUB_ENABLED
+    unsigned int pspT1 = sceKernelGetSystemTimeLow();
+    g_PspGuiSub.clearUs += pspT1 - pspT0;
+#endif
     gui->impl->DrawDialogue();
+#if TH08_PSP_GUI_SUB_ENABLED
+    pspT0 = sceKernelGetSystemTimeLow();
+    g_PspGuiSub.dialogueUs += pspT0 - pspT1;
+#endif
     gui->DrawStageElements();
+#if TH08_PSP_GUI_SUB_ENABLED
+    pspT1 = sceKernelGetSystemTimeLow();
+    g_PspGuiSub.stageUs += pspT1 - pspT0;
+#endif
     gui->DrawGameScene();
+#if TH08_PSP_GUI_SUB_ENABLED
+    pspT0 = sceKernelGetSystemTimeLow();
+    g_PspGuiSub.sceneUs += pspT0 - pspT1;
+#endif
     gui->DrawAsciiText();
+#if TH08_PSP_GUI_SUB_ENABLED
+    pspT1 = sceKernelGetSystemTimeLow();
+    g_PspGuiSub.asciiUs += pspT1 - pspT0;
+    if ((++g_PspGuiSub.calls % 600UL) == 0UL)
+    {
+        th08::psp::BootLog("GUI_SUB stats calls=%lu clear_us=%lu dialogue_us=%lu stage_us=%lu scene_us=%lu ascii_us=%lu\n",
+                           g_PspGuiSub.calls, g_PspGuiSub.clearUs, g_PspGuiSub.dialogueUs, g_PspGuiSub.stageUs,
+                           g_PspGuiSub.sceneUs, g_PspGuiSub.asciiUs);
+        th08::psp::FlushBootLog();
+    }
+#endif
     return CHAIN_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -1166,6 +1244,9 @@ void Gui::UpdateStageElements()
 #pragma var_order(yPos, xPos, idx, vm)
 void Gui::DrawGameScene()
 {
+#if TH08_PSP_GUI_SUB_ENABLED
+    unsigned int pspSceneT0 = sceKernelGetSystemTimeLow();
+#endif
     AnmVm *vm;
     i32 idx;
     f32 xPos;
@@ -1177,6 +1258,10 @@ void Gui::DrawGameScene()
     g_Supervisor.viewport.Width = 640;
     g_Supervisor.viewport.Height = 480;
     g_Supervisor.d3dDevice->SetViewport(&g_Supervisor.viewport);
+#if TH08_PSP_GUI_SUB_ENABLED
+    unsigned int pspSceneT1 = sceKernelGetSystemTimeLow();
+    g_PspGuiSceneSub.viewportUs += pspSceneT1 - pspSceneT0;
+#endif
 
     if (!g_Supervisor.IsMinimumGraphicsMode())
     {
@@ -1220,8 +1305,14 @@ void Gui::DrawGameScene()
         g_AnmManager->DrawNoRotation(vm);
     }
 
+#if TH08_PSP_GUI_SUB_ENABLED
+    pspSceneT0 = sceKernelGetSystemTimeLow();
+    g_PspGuiSceneSub.frontUs += pspSceneT0 - pspSceneT1;
+#endif
     vm = &this->impl->frontVms[13];
-    if (g_Supervisor.IsHUDRedrawEnabled() || vm->currentInstruction != NULL || g_GuiFullPowerModeFrames != 0)
+    const bool pspHudRedraw =
+        g_Supervisor.IsHUDRedrawEnabled() || vm->currentInstruction != NULL || g_GuiFullPowerModeFrames != 0;
+    if (pspHudRedraw)
     {
 #if TH08_PSP_GUI_BORDER_STATS_ENABLED
         // The 123 border tiles: canonical loops live in psp/gui_border_replay.cpp
@@ -1251,6 +1342,92 @@ void Gui::DrawGameScene()
             g_AnmManager->DrawNoRotation(vm);
         }
 #endif
+    }
+#if TH08_PSP_GUI_FRONT_NATIVE_ENABLED
+    // Front sprites as one recorded run (psp/gui_border_replay.cpp): the flag
+    // refresh below does not depend on the draws, so it runs first and the run
+    // key sees the same counts the canonical loops would.
+    if (pspHudRedraw)
+    {
+        this->flags.lifeDisplayUpdateFrames = 2;
+        this->flags.bombDisplayUpdateFrames = 2;
+        this->flags.grazeDisplayUpdateFrames = 2;
+        this->flags.pointDisplayUpdateFrames = 2;
+        this->flags.powerDisplayUpdateFrames = 2;
+        this->flags.timeDisplayUpdateFrames = 2;
+    }
+    {
+        const bool pspNullify = (this->flags.bombDisplayUpdateFrames || this->flags.lifeDisplayUpdateFrames) &&
+                                (((*reinterpret_cast<u32 *>(&g_GameManager.flags) >> 7) & 3) == 1) && g_Spellcard.IsActive();
+        const unsigned int pspLives =
+            this->flags.lifeDisplayUpdateFrames ? static_cast<unsigned int>(g_GameManager.GetLives()) : 0U;
+        const unsigned int pspBombs =
+            this->flags.bombDisplayUpdateFrames ? static_cast<unsigned int>(g_GameManager.GetBombsRemaining()) : 0U;
+        AnmVm *const pspRunVms[15] = {&this->impl->frontVms[0], &this->impl->frontVms[1], &this->impl->frontVms[2],
+                                      &this->impl->frontVms[3], &this->impl->frontVms[4], &this->impl->frontVms[5],
+                                      &this->impl->frontVms[6], &this->impl->frontVms[7], &this->impl->frontVms[8],
+                                      &this->impl->frontVms[9], &this->impl->difficultyVm, &this->impl->frontVms[10],
+                                      &this->impl->frontVms[11], &this->impl->spellNullifyVm, &this->impl->frontVms[14]};
+        th08::psp::GuiSpriteRunKey pspRunKey;
+        for (int k = 0; k < 15; ++k)
+            th08::psp::GuiSpriteKeyFill(&pspRunKey.vm[k], pspRunVms[k]);
+        const unsigned int pspSprites = (pspHudRedraw ? 11U : 0U) + pspLives + pspBombs + (pspNullify ? 1U : 0U) + 3U;
+        th08::psp::GuiSpriteRunKeyFinish(&pspRunKey, 15U, pspSprites,
+                                         (pspHudRedraw ? 1U : 0U) | (pspNullify ? 2U : 0U) | (pspLives << 8) | (pspBombs << 16));
+        const bool pspReplayed = th08::psp::GuiSpriteRunTryReplay(&pspRunKey);
+        if (!pspReplayed)
+        {
+            th08::psp::GuiSpriteRunBegin();
+            if (pspHudRedraw)
+            {
+            th08::psp::GuiSpriteRunDraw(&this->impl->frontVms[0]);
+            th08::psp::GuiSpriteRunDraw2D(&this->impl->frontVms[1]);
+            th08::psp::GuiSpriteRunDraw(&this->impl->frontVms[2]);
+            th08::psp::GuiSpriteRunDraw(&this->impl->frontVms[3]);
+            th08::psp::GuiSpriteRunDraw(&this->impl->frontVms[4]);
+            th08::psp::GuiSpriteRunDraw(&this->impl->frontVms[5]);
+            th08::psp::GuiSpriteRunDraw(&this->impl->frontVms[6]);
+            th08::psp::GuiSpriteRunDraw(&this->impl->frontVms[7]);
+            th08::psp::GuiSpriteRunDraw(&this->impl->frontVms[8]);
+            th08::psp::GuiSpriteRunDraw(&this->impl->frontVms[9]);
+            th08::psp::GuiSpriteRunDraw(&this->impl->difficultyVm);
+            }
+        if (this->flags.lifeDisplayUpdateFrames)
+        {
+            vm = &this->impl->frontVms[10];
+            for (idx = 0, xPos = 488.0f; idx < g_GameManager.GetLives(); idx++, xPos += 16.0f)
+            {
+                vm->pos = Float3(xPos, 88.0f, 0.46f);
+                th08::psp::GuiSpriteRunDraw(vm);
+            }
+        }
+        if (this->flags.bombDisplayUpdateFrames)
+        {
+            vm = &this->impl->frontVms[11];
+            for (idx = 0, xPos = 488.0f; idx < g_GameManager.GetBombsRemaining(); idx++, xPos += 16.0f)
+            {
+                vm->pos = Float3(xPos, 104.0f, 0.46f);
+                th08::psp::GuiSpriteRunDraw(vm);
+            }
+        }
+        if ((this->flags.bombDisplayUpdateFrames || this->flags.lifeDisplayUpdateFrames) &&
+            (((*reinterpret_cast<u32 *>(&g_GameManager.flags) >> 7) & 3) == 1) && g_Spellcard.IsActive())
+        {
+            th08::psp::GuiSpriteRunDraw(&this->impl->spellNullifyVm);
+        }
+
+        vm = &this->impl->frontVms[14];
+        for (xPos = 32.0f; xPos < 368.0f; xPos += 128.0f)
+        {
+            vm->pos = Float3(xPos, 464.0f, 0.49f);
+            th08::psp::GuiSpriteRunDraw(vm);
+        }
+            th08::psp::GuiSpriteRunEnd(&pspRunKey);
+        }
+    }
+#else
+    if (pspHudRedraw)
+    {
         g_AnmManager->DrawNoRotation(&this->impl->frontVms[0]);
         g_AnmManager->Draw2D(&this->impl->frontVms[1]);
         g_AnmManager->DrawNoRotation(&this->impl->frontVms[2]);
@@ -1300,55 +1477,64 @@ void Gui::DrawGameScene()
         vm->pos = Float3(xPos, 464.0f, 0.49f);
         g_AnmManager->DrawNoRotation(vm);
     }
+#endif
 
+#if TH08_PSP_GUI_SUB_ENABLED
+    const unsigned int pspTextT0 = sceKernelGetSystemTimeLow();
+#endif
     {
         Float3 elemPos(488.0f, 56.0f, 0.0f);
-        g_AsciiManager.AddFormatText(&elemPos, "%.9d", g_GameManager.globals->displayScore);
+        PspAddDecimal(&elemPos, g_GameManager.globals->displayScore, 9);
         elemPos.x += 117.0f;
-        g_AsciiManager.AddFormatText(&elemPos, "%1d",
-                                     g_GameManager.globals->numRetries > 9 ? 9 : g_GameManager.globals->numRetries);
+        PspAddDecimal(&elemPos, g_GameManager.globals->numRetries > 9 ? 9 : g_GameManager.globals->numRetries, 1);
         g_AsciiManager.SetScale(1.0f, 1.0f);
 
         elemPos = Float3(488.0f, 40.0f, 0.0f);
-        g_AsciiManager.AddFormatText(&elemPos, "%.9d", g_GameManager.globals->displayedHighScore);
+        PspAddDecimal(&elemPos, g_GameManager.globals->displayedHighScore, 9);
         elemPos.x += 117.0f;
-        g_AsciiManager.AddFormatText(
-            &elemPos, "%1d", g_GameManager.globals->continuesUsedInHighScore > 9
+        PspAddDecimal(&elemPos, g_GameManager.globals->continuesUsedInHighScore > 9
                                  ? 9
-                                 : g_GameManager.globals->continuesUsedInHighScore);
+                                 : g_GameManager.globals->continuesUsedInHighScore, 1);
         g_AsciiManager.SetScale(1.0f, 1.0f);
 
         if (this->flags.grazeDisplayUpdateFrames || g_Supervisor.IsMinimumGraphicsMode())
         {
             elemPos = Float3(488.0f, 152.0f, 0.0f);
-            g_AsciiManager.AddFormatText(&elemPos, "%d", g_GameManager.globals->graze);
+            PspAddDecimal(&elemPos, g_GameManager.globals->graze, 1);
         }
         if (this->flags.pointDisplayUpdateFrames || g_Supervisor.IsMinimumGraphicsMode())
         {
             elemPos = Float3(488.0f, 168.0f, 0.0f);
-            elemPos.x += g_AsciiManager.AddFormatText2(&elemPos, "%d", g_GameManager.globals->pointItemsCollected) * 13;
+            elemPos.x += PspAddDecimal(&elemPos, g_GameManager.globals->pointItemsCollected, 1) * 13;
             g_AsciiManager.SetScale(0.5f, 1.0f);
-            g_AsciiManager.AddFormatText(&elemPos, "/");
+            g_AsciiManager.AddString(&elemPos, "/");
             g_AsciiManager.SetScale(1.0f, 1.0f);
             elemPos.x += 6.0f;
-            g_AsciiManager.AddFormatText(&elemPos, "%d", g_GameManager.globals->nextPointItemExtendThreshold);
+            PspAddDecimal(&elemPos, g_GameManager.globals->nextPointItemExtendThreshold, 1);
         }
         if (this->flags.timeDisplayUpdateFrames || g_Supervisor.IsMinimumGraphicsMode())
         {
             if (g_GameManager.GetTimeOrbs() >= g_GameManager.GetLastSpellTimeOrbThreshold())
                 g_AsciiManager.SetColor(0xfffff0c0);
             elemPos = Float3(488.0f, 184.0f, 0.0f);
-            elemPos.x += g_AsciiManager.AddFormatText2(&elemPos, "%d", g_GameManager.GetTimeOrbs()) * 13;
+            elemPos.x += PspAddDecimal(&elemPos, g_GameManager.GetTimeOrbs(), 1) * 13;
             g_AsciiManager.SetScale(0.5f, 1.0f);
-            g_AsciiManager.AddFormatText(&elemPos, "/");
+            g_AsciiManager.AddString(&elemPos, "/");
             g_AsciiManager.SetScale(1.0f, 1.0f);
             elemPos.x += 6.0f;
-            g_AsciiManager.AddFormatText(&elemPos, "%d", g_GameManager.GetLastSpellTimeOrbThreshold());
+            PspAddDecimal(&elemPos, g_GameManager.GetLastSpellTimeOrbThreshold(), 1);
             g_AsciiManager.SetColor(0xffffffff);
         }
     }
 
+#if TH08_PSP_GUI_SUB_ENABLED
+    g_PspGuiSceneSub.textFmtUs += sceKernelGetSystemTimeLow() - pspTextT0;
+#endif
     g_AnmManager->FlushVertexBuffer();
+#if TH08_PSP_GUI_SUB_ENABLED
+    pspSceneT1 = sceKernelGetSystemTimeLow();
+    g_PspGuiSceneSub.borderTextUs += pspSceneT1 - pspSceneT0;
+#endif
     if (this->flags.powerDisplayUpdateFrames || g_Supervisor.IsMinimumGraphicsMode())
     {
         VertexDiffuseXyzrhw vertices[4];
@@ -1407,6 +1593,15 @@ void Gui::DrawGameScene()
         this->flags.pointDisplayUpdateFrames--;
     if (this->flags.timeDisplayUpdateFrames)
         this->flags.timeDisplayUpdateFrames--;
+#if TH08_PSP_GUI_SUB_ENABLED
+    pspSceneT0 = sceKernelGetSystemTimeLow();
+    g_PspGuiSceneSub.powerUs += pspSceneT0 - pspSceneT1;
+    if ((++g_PspGuiSceneSub.calls % 600UL) == 0UL)
+        th08::psp::BootLog("GUI_SCENE_SUB stats calls=%lu viewport_us=%lu front_us=%lu border_text_us=%lu power_us=%lu "
+                           "text_fmt_us=%lu\n",
+                           g_PspGuiSceneSub.calls, g_PspGuiSceneSub.viewportUs, g_PspGuiSceneSub.frontUs,
+                           g_PspGuiSceneSub.borderTextUs, g_PspGuiSceneSub.powerUs, g_PspGuiSceneSub.textFmtUs);
+#endif
 }
 
 // FUNCTION: th08 0x43741d

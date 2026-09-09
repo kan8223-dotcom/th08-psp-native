@@ -25,6 +25,12 @@
 
 #if defined(TH08_PSP_STAGE_POOL_ARENA)
 #include "stage_pool_arena.hpp"
+#if defined(PSP)
+#include "fileio.hpp"
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+extern "C" unsigned long g_PspRngTraceFrame;
+#endif
+#endif
 #endif
 
 #ifdef TH08_MODERN_LINUX
@@ -257,6 +263,12 @@ EnemyEclInterpolationSlot::EnemyEclInterpolationSlot() {}
 void Enemy::ReleaseAttachedEffects()
 {
     i32 i;
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+    if (g_GameManager.flags.isReplay && this->attachedEffectCount > 0)
+        th08::psp::BootLog("RELEASE_ATTACHED st=%d f=%lu enemy=%d count=%d life=%ld ra=%08lx\n", (int)g_GameManager.currentStage,
+                           (unsigned long)g_GameManager.stageActiveFrames, (int)this->enemyIndex, (int)this->attachedEffectCount,
+                           (long)this->life, (unsigned long)(uintptr_t)__builtin_return_address(0));
+#endif
 
     for (i = 0; i < this->attachedEffectCount; i++)
     {
@@ -950,6 +962,18 @@ void Enemy::UpdateYoukaiAlignment()
         if (((this->flags2 >> ENEMY_FLAG2_FORM_EFFECT_SHIFT) & 1) != 0 &&
             this->bossTimer.IsPeriodic(2))
         {
+#if defined(PSP) && defined(TH08_PSP_DEBUG_START_STAGE) && TH08_PSP_DEBUG_START_STAGE
+            if (g_PspRngTraceFrame != 0)
+            {
+                union { f32 f; u32 u; } fx, fy;
+                fx.f = this->worldPosition.x; fy.f = this->worldPosition.y;
+                th08::psp::BootLog("FAMILIAR_FORM f=%lu enemy=%d bt=%ld/%ld timer=%ld life=%ld flags1=%08lx flags2=%08lx x=%08lx y=%08lx\n",
+                                   g_PspRngTraceFrame, (int)this->enemyIndex, (long)this->bossTimer.current,
+                                   (long)this->bossTimer.previous, (long)this->movementTimer.current, (long)this->life,
+                                   (unsigned long)this->flags1, (unsigned long)this->flags2, (unsigned long)fx.u,
+                                   (unsigned long)fy.u);
+            }
+#endif
             g_EffectManager.SpawnEffect(38, reinterpret_cast<D3DXVECTOR3 *>(&this->worldPosition), 1, -1);
         }
     }
@@ -1057,8 +1081,29 @@ ChainCallbackResult EnemyManager::OnDrawHighPrio(EnemyManager *enemyManager)
 
 // FUNCTION: th08 0x42e140
 #pragma var_order(savedScaleY, savedScaleX, i, savedColor, vm, k, enemy, halfWidth, halfCenter, vertexCount, sinAngle, uv, previousAngle, vertices, uvStep, angle, cosAngle, uvSpan, this, drawGroup)
+#if defined(PSP)
+extern "C" unsigned int sceKernelGetSystemTimeLow(void);
+namespace
+{
+// Where the enemy draw callbacks spend their time (PSP only, per 600 calls):
+// trail quads drawn one Draw2D each, trail strips, head sprites, extra VMs.
+struct PspEnemySubStats
+{
+    unsigned long calls, us, maxUs, enemies, trailQuads, maxTrailQuads, strips, heads, extras;
+    unsigned long frameTrailQuads;
+} g_PspEnemySub;
+} // namespace
+#define TH08_PSP_ENEMY_SUB_ENABLED 1
+#else
+#define TH08_PSP_ENEMY_SUB_ENABLED 0
+#endif
+
 ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chainPriority)
 {
+#if TH08_PSP_ENEMY_SUB_ENABLED
+    const unsigned int pspT0 = sceKernelGetSystemTimeLow();
+    g_PspEnemySub.frameTrailQuads = 0UL;
+#endif
     f32 savedScaleY;
     f32 savedScaleX;
     i32 i;
@@ -1086,6 +1131,9 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
         enemy = this->drawGroupHeads[i];
         while (enemy != NULL)
         {
+#if TH08_PSP_ENEMY_SUB_ENABLED
+            ++g_PspEnemySub.enemies;
+#endif
             vm = &enemy->secondaryVms[0];
             for (k = 0; k < 1; ++k, ++vm)
             {
@@ -1164,6 +1212,10 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
                             enemy->vm.pos.z = 0.3f;
                             enemy->vm.pos.x += g_GameManager.arcadeRegionTopLeftPos.x;
                             enemy->vm.pos.y += g_GameManager.arcadeRegionTopLeftPos.y;
+#if TH08_PSP_ENEMY_SUB_ENABLED
+                        ++g_PspEnemySub.trailQuads;
+                        ++g_PspEnemySub.frameTrailQuads;
+#endif
                         g_AnmManager->Draw2D(&enemy->vm);
                     }
                 }
@@ -1294,9 +1346,14 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
                             // retains this pointer after return. Enemy draw
                             // callbacks are serial and non-reentrant, so this
                             // manager scratch can then be reused safely.
+                        {
+#if TH08_PSP_ENEMY_SUB_ENABLED
+                            ++g_PspEnemySub.strips;
+#endif
                             g_AnmManager->DrawVertices(
                                 &enemy->vm,
                                 this->sharedTrailVertices, vertexCount);
+                        }
 #else
                             g_AnmManager->DrawVertices(
                                 &enemy->vm,
@@ -1322,7 +1379,12 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
                     modern::AuditEnemyPrimaryDraw(enemy);
                 else
 #endif
-                g_AnmManager->Draw2D(&enemy->vm);
+                {
+#if TH08_PSP_ENEMY_SUB_ENABLED
+                    ++g_PspEnemySub.heads;
+#endif
+                    g_AnmManager->Draw2D(&enemy->vm);
+                }
             }
 
             for (k = 1; k < 2; ++k, ++vm)
@@ -1342,6 +1404,9 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
                     vm->pos.z = 0.3f;
                     vm->pos.x += g_GameManager.arcadeRegionTopLeftPos.x;
                     vm->pos.y += g_GameManager.arcadeRegionTopLeftPos.y;
+#if TH08_PSP_ENEMY_SUB_ENABLED
+                    ++g_PspEnemySub.extras;
+#endif
                     g_AnmManager->Draw2D(vm);
                 }
             }
@@ -1350,6 +1415,27 @@ ChainCallbackResult __fastcall EnemyManager::OnDrawImpl(i32 drawGroup, i32 chain
         }
     }
 
+#if TH08_PSP_ENEMY_SUB_ENABLED
+    {
+        const unsigned int dt = sceKernelGetSystemTimeLow() - pspT0;
+        g_PspEnemySub.us += dt;
+        if (dt > g_PspEnemySub.maxUs)
+            g_PspEnemySub.maxUs = dt;
+        if (g_PspEnemySub.frameTrailQuads > g_PspEnemySub.maxTrailQuads)
+            g_PspEnemySub.maxTrailQuads = g_PspEnemySub.frameTrailQuads;
+        if ((++g_PspEnemySub.calls % 600UL) == 0UL)
+        {
+            th08::psp::BootLog("ENEMY_SUB stats calls=%lu us=%lu max_us=%lu enemies=%lu trail_quads=%lu "
+                               "max_trail_quads=%lu strips=%lu heads=%lu extras=%lu\n",
+                               g_PspEnemySub.calls, g_PspEnemySub.us, g_PspEnemySub.maxUs, g_PspEnemySub.enemies,
+                               g_PspEnemySub.trailQuads, g_PspEnemySub.maxTrailQuads, g_PspEnemySub.strips,
+                               g_PspEnemySub.heads, g_PspEnemySub.extras);
+            g_PspEnemySub.maxUs = 0UL;
+            g_PspEnemySub.maxTrailQuads = 0UL;
+            th08::psp::FlushBootLog();
+        }
+    }
+#endif
     return CHAIN_CALLBACK_RESULT_CONTINUE;
 }
 

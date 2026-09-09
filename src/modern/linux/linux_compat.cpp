@@ -158,6 +158,10 @@ struct GdiBitmap : GdiObject
     std::vector<BYTE> pixels;
 };
 
+#ifndef TH08_PSP_TEXT_MASK_REUSE
+#define TH08_PSP_TEXT_MASK_REUSE 0
+#endif
+
 struct GdiFont : GdiObject
 {
 #if defined(PSP)
@@ -171,11 +175,27 @@ struct GdiFont : GdiObject
     {
         kind = FONT;
     }
-    ~GdiFont() {}
+    ~GdiFont()
+    {
+#if TH08_PSP_TEXT_MASK_REUSE
+        SDL_FreeSurface(textMask);
+#endif
+    }
     TTF_Font *font;
     int pointSize;
     int style;
     bool sharedRuntime;
+#if TH08_PSP_TEXT_MASK_REUSE
+    // TextHelper issues four outline passes and one foreground pass using
+    // the same descriptor. Retain only their white coverage, never color or
+    // destination pixels; DeleteObject releases it at the end of the row.
+    SDL_Surface *textMask = NULL;
+    TTF_Font *textMaskFace = NULL;
+    int textMaskPointSize = 0;
+    int textMaskStyle = 0;
+    int textMaskLength = 0;
+    char textMaskKey[128];
+#endif
 #else
     GdiFont() : font(NULL) { kind = FONT; }
     explicit GdiFont(TTF_Font *font_) : font(font_) { kind = FONT; }
@@ -1828,17 +1848,50 @@ BOOL TextOutA(HDC dcRaw, int x, int y, LPCSTR text, int length)
 #if defined(PSP)
     if (!ConfigurePspGdiFont(dc->font)) return FALSE;
 #endif
-    bool conversionValid = true;
-    std::string utf8 = ConvertCp932ToUtf8(
-        text, static_cast<size_t>(length), &conversionValid);
-    if (!conversionValid)
-        return FALSE;
-    SDL_Color white = {255, 255, 255, 255};
-    SDL_Surface *rendered = TTF_RenderUTF8_Blended(dc->font->font, utf8.c_str(), white);
-    if (rendered == NULL) return FALSE;
-    SDL_Surface *glyph = SDL_ConvertSurfaceFormat(rendered, SDL_PIXELFORMAT_RGBA32, 0);
-    SDL_FreeSurface(rendered);
-    if (glyph == NULL) return FALSE;
+    SDL_Surface *glyph = NULL;
+#if defined(PSP) && TH08_PSP_TEXT_MASK_REUSE
+    GdiFont *font = dc->font;
+    const bool cacheableText = static_cast<size_t>(length) <= sizeof(font->textMaskKey);
+    if (cacheableText && font->textMask != NULL && font->textMaskFace == font->font &&
+        font->textMaskPointSize == font->pointSize && font->textMaskStyle == font->style &&
+        font->textMaskLength == length && memcmp(font->textMaskKey, text, length) == 0)
+    {
+        glyph = font->textMask;
+    }
+    else
+    {
+        // Drop the old mask before allocating its replacement: no two-row peak.
+        SDL_FreeSurface(font->textMask);
+        font->textMask = NULL;
+    }
+#endif
+    if (glyph == NULL)
+    {
+        bool conversionValid = true;
+        std::string utf8 = ConvertCp932ToUtf8(
+            text, static_cast<size_t>(length), &conversionValid);
+        if (!conversionValid)
+            return FALSE;
+        SDL_Color white = {255, 255, 255, 255};
+        SDL_Surface *rendered = TTF_RenderUTF8_Blended(dc->font->font, utf8.c_str(), white);
+        if (rendered == NULL) return FALSE;
+        glyph = SDL_ConvertSurfaceFormat(rendered, SDL_PIXELFORMAT_RGBA32, 0);
+        SDL_FreeSurface(rendered);
+        if (glyph == NULL) return FALSE;
+#if defined(PSP) && TH08_PSP_TEXT_MASK_REUSE
+        // Unusually large strings/surfaces retain the original immediate-free path.
+        if (cacheableText && glyph->h > 0 && glyph->pitch > 0 &&
+            glyph->pitch <= (128 * 1024) / glyph->h)
+        {
+            font->textMask = glyph;
+            font->textMaskFace = font->font;
+            font->textMaskPointSize = font->pointSize;
+            font->textMaskStyle = font->style;
+            font->textMaskLength = length;
+            memcpy(font->textMaskKey, text, length);
+        }
+#endif
+    }
     if (SDL_MUSTLOCK(glyph)) SDL_LockSurface(glyph);
     for (int row = 0; row < glyph->h; ++row)
     {
@@ -1847,7 +1900,10 @@ BOOL TextOutA(HDC dcRaw, int x, int y, LPCSTR text, int length)
             PutGdiTextPixel(dc->bitmap, x + column, y + row, dc->color, source[column * 4 + 3]);
     }
     if (SDL_MUSTLOCK(glyph)) SDL_UnlockSurface(glyph);
-    SDL_FreeSurface(glyph);
+#if defined(PSP) && TH08_PSP_TEXT_MASK_REUSE
+    if (glyph != font->textMask)
+#endif
+        SDL_FreeSurface(glyph);
     return TRUE;
 }
 HRESULT CoInitialize(LPVOID) { return S_OK; }
@@ -1945,7 +2001,7 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
   public:
     explicit LinuxSoundBuffer(const DSBUFFERDESC *desc)
         : refs(1), playing(false), looping(false), position(0), cursorFrame(0.0), volume(0), pan(0),
-          hasFormat(false), locked(false)
+          hasFormat(false), locked(false), laps(0)
     {
         memset(&format, 0, sizeof(format));
         if (desc != NULL)
@@ -1957,7 +2013,8 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
     }
     LinuxSoundBuffer(const LinuxSoundBuffer &other)
         : refs(1), bytes(other.bytes), playing(false), looping(false), position(0), cursorFrame(0.0),
-          volume(other.volume), pan(other.pan), format(other.format), hasFormat(other.hasFormat), locked(false)
+          volume(other.volume), pan(other.pan), format(other.format), hasFormat(other.hasFormat), locked(false),
+          laps(0)
     { LockAudio(); g_soundBuffers.push_back(this); UnlockAudio(); }
     ~LinuxSoundBuffer()
     {
@@ -1973,6 +2030,14 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
         LockAudio();
         if (play) *play = position;
         if (write) *write = position;
+        UnlockAudio();
+        return S_OK;
+    }
+    HRESULT GetPspPlayedTotal(unsigned long long *total)
+    {
+        if (total == NULL) return E_INVALIDARG;
+        LockAudio();
+        *total = static_cast<unsigned long long>(laps) * bytes.size() + position;
         UnlockAudio();
         return S_OK;
     }
@@ -2002,6 +2067,7 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
         LockAudio();
         position = bytes.empty() ? 0 : value % bytes.size();
         cursorFrame = FrameBytes() != 0 ? static_cast<double>(position / FrameBytes()) : 0.0;
+        laps = 0;
         UnlockAudio();
         return S_OK;
     }
@@ -2147,6 +2213,10 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
             else { cursorFrame = sourceFrames; playing = false; }
         }
         position = static_cast<DWORD>(cursorFrame) * frameBytes;
+        // Lap count for the streaming catch-up: any backwards move of the
+        // cursor while looping is a wrap (both cursor implementations).
+        if (looping && position < oldPosition)
+            ++laps;
         for (size_t index = 0; index < notifications.size(); ++index)
         {
             const DWORD offset = notifications[index].dwOffset;
@@ -2172,6 +2242,7 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
     WAVEFORMATEX format;
     bool hasFormat, locked;
     std::vector<DSBPOSITIONNOTIFY> notifications;
+    DWORD laps; // ring wraps since the last SetCurrentPosition
 };
 
 HRESULT LinuxSoundNotify::SetNotificationPositions(DWORD count, const DSBPOSITIONNOTIFY *positions)

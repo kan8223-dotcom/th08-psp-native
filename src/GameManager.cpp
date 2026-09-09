@@ -1,4 +1,7 @@
 #include "th_pch.h"
+#if defined(PSP)
+#include "fileio.hpp"
+#endif
 
 #if defined(PSP)
 #if defined(TH08_PSP_ANTITAMPER_SWAR) && TH08_PSP_ANTITAMPER_SWAR
@@ -388,6 +391,11 @@ ChainCallbackResult GameManager::OnUpdate(GameManager *gameManager)
                         break;
                     }
                 }
+#if defined(PSP)
+                th08::psp::BootLog("REPLAY_STAGE_END stage=%d frame=%lu next=%d lives=%d\n", (int)g_GameManager.currentStage,
+                                   (unsigned long)g_GameManager.stageActiveFrames, stage,
+                                   (int)g_GameManager.globals->livesRemaining);
+#endif
                 if (stage == 0)
                     g_Supervisor.curState = SupervisorState_FinishReplay;
                 else
