@@ -1,6 +1,7 @@
 #include "platform.hpp"
 #include "fileio.hpp"
 #include "me_core.hpp"
+#include "me_audio.hpp"
 #include "wait_probe.hpp"
 
 #include <pspctrl.h>
@@ -50,6 +51,10 @@ int ExitWatchdogThread(SceSize, void *)
             gExitAttempts.fetch_add(1U, std::memory_order_relaxed);
             gExitAttemptState.store(1U, std::memory_order_release);
             th08_me_core_request_stop();
+#if TH08_PSP_ME_AUDIO_ENABLED
+            if (!MeAudioCanExit())
+            { sceKernelDelayThread(50000U); continue; }
+#endif
             sceKernelExitGame();
             // Normally non-returning. Preserve evidence and stay alive if the
             // firmware unexpectedly returns; do not report success or spin.

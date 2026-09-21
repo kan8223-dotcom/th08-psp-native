@@ -725,7 +725,10 @@ loop:
             }
             else
             {
+#if !defined(PSP)
                 this->bgmThreadHandle = NULL;
+#endif
+                // PSP retains the completed handle for step 3's CloseHandle.
             }
         }
         else if (commandCursor->step == 3)

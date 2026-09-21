@@ -18,7 +18,7 @@ void meLibOnPreProcess() {
 
 __attribute__((section("_me_section"), used))
 void meLibHandler() { // must remain below the context block at handler+0x110
-#if defined(TH07_PSP_MECC_AUDIO_4M)
+#if defined(TH07_PSP_MECC_AUDIO_4M) || defined(TH08_ME_MAIN_RAM_STACK)
   // This must remain the first generated handler operation.  In particular,
   // do not let the compiler touch MECC's reset-time local-eDRAM stack before
   // switching to the guarded Main-RAM stack.
@@ -53,7 +53,7 @@ void meLibHandler() { // must remain below the context block at handler+0x110
     "mtc0           $k0, $12         \n"
     "sync                            \n"
 
-#if !defined(TH07_PSP_MECC_AUDIO_4M)
+#if !defined(TH07_PSP_MECC_AUDIO_4M) && !defined(TH08_ME_MAIN_RAM_STACK)
     "li             $k0, 0x279c637c  \n"
     "lw             $k1, 0x88300018  \n"
     "beq            $k0, $k1, 1f     \n"

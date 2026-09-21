@@ -170,7 +170,11 @@ void RenderEngineFailureStatus(const char *phase, const char *state, int result,
                          ToKiB(memory.largestFreeBlockBytes));
     pspDebugScreenPrintf("GE eDRAM visible: %lu KiB\n",
                          ToKiB(memory.edramBytes));
-    pspDebugScreenPrintf("\nSee TH08PSP-BOOT.LOG for the flushed trace.\n");
+#if TH08_PSP_LOGGING
+    pspDebugScreenPrintf("\nSee TH08PSP_BOOT.LOG for the flushed trace.\n");
+#else
+    pspDebugScreenPrintf("\nLogging disabled. Report this screen and build ID.\n");
+#endif
     pspDebugScreenPrintf("Press CIRCLE or START to exit. HOME is supported.\n");
 }
 

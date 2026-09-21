@@ -23,7 +23,8 @@ extern "C"
 // src: vertices in the 640x480 pre-transformed space (x,y already +0.5,
 // z = 1 - 2*z').  dst: cached RAM the GE may read until the present fence
 // (may alias src).  Returns 1 when submitted, 0 when the caller must use the
-// PSPGL path (no context, CLUT texture, display-list compile).
+// PSPGL path (no context, display-list compile, or a CLUT texture without
+// GE_DRAW_DIRECT's palette handling).
 int th08_ge2d_direct_submit(const Th08Ge2dVertex *src, unsigned vertexCount, Th08Ge2dVertex *dst,
                             const unsigned short *indices, unsigned indexCount, float fitLeft,
                             float fitScaleX, float scaleY);

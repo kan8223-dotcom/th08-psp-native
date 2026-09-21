@@ -1,7 +1,7 @@
 #include "me-lib.h"
 
 
-#define PRX_FILE "./kcall.prx"
+#define PRX_FILE "./th08_audio_kcall.prx"
 extern unsigned char embedded_kcall[];
 extern unsigned int embedded_kcall_len;
 
@@ -13,7 +13,7 @@ int meLibPrxLoadResult;
 #endif
 
 static int writePrx(void* start, int size) {
-  SceUID fd = sceIoOpen(PRX_FILE, PSP_O_WRONLY | PSP_O_CREAT, 0777);
+  SceUID fd = sceIoOpen(PRX_FILE, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
   if (fd < 0) {
     return -1;
   }

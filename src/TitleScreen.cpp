@@ -4212,7 +4212,9 @@ void TitleScreen::TitleSetupThread(TitleScreen *titleScreen)
     g_TitleScreen->currentHelpTextVm = &g_TitleScreen->helpTextVms[0];
     g_TitleScreen->state = TitleScreenState_Ready;
     g_Supervisor.HideLoadingVms();
+#if !defined(PSP)
     g_Supervisor.runningSubthreadHandle = NULL;
+#endif
     g_Supervisor.subthreadCloseRequestActive = FALSE;
     g_Supervisor.subthreadActive = 0;
 }

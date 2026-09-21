@@ -9,6 +9,7 @@
 #include "io_activity_lamp.hpp"
 #endif
 #include "me_core.hpp"
+#include "me_audio.hpp"
 #include "stage_pool_arena.hpp"
 #include "memory_telemetry.hpp"
 #include "newlib_heap_geometry.hpp"
@@ -36,6 +37,9 @@ static void TerminateHandler()
 {
     th08::psp::BootLog("TERMINATE uncaught_failure=1\n");
     th08::psp::FlushBootLogHard();
+#if TH08_PSP_ME_AUDIO_ENABLED
+    th08::psp::MeAudioShutdown();
+#endif
     sceKernelExitGame();
     for (;;)
         sceKernelDelayThread(1000000);
@@ -836,7 +840,7 @@ int main(int argc, char **argv)
     TH08_PSP_BOOT_CHECKPOINT("ge4_prepare", "before", 0);
     const bool ge4Prepared = th08_psp_ge4_prepare() != 0;
     TH08_PSP_BOOT_CHECKPOINT("ge4_prepare", "after", ge4Prepared ? 1 : 0);
-#if TH08_PSP_ME_CORE_ENABLED
+#if TH08_PSP_ME_CORE_ENABLED || TH08_PSP_ME_AUDIO_ENABLED
     TH08_PSP_BOOT_CHECKPOINT("me_core", "before", 0);
     const int meCoreReady = th08_me_core_init();
     TH08_PSP_BOOT_CHECKPOINT("me_core", "after", meCoreReady);

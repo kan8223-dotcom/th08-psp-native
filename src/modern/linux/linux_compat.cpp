@@ -7,12 +7,18 @@
 #include <dsound.h>
 
 #if defined(PSP)
+#include <atomic>
+#include <exception>
 #include <kubridge.h>
 #include <pspctrl.h>
 
 #include "Th08FontCoverage.hpp"
 #include "audio_telemetry.hpp"
 #include "audio_cursor_audit.hpp"
+#include "me_audio.hpp"
+#if TH08_PSP_ME_AUDIO_ENABLED
+extern "C" unsigned int sceKernelGetSystemTimeLow(void);
+#endif
 #include "boot_checkpoint.hpp"
 #include "cp932_compact.generated.hpp"
 #include "fileio.hpp"
@@ -26,6 +32,7 @@
 #include "render_resource_arena.hpp"
 #endif
 #include "newlib_heap_geometry.hpp"
+#include "platform.hpp"
 #else
 #include <dlfcn.h>
 #include <fontconfig/fontconfig.h>
@@ -98,10 +105,18 @@ struct ThreadHandle : LinuxHandle
 {
     ThreadHandle() : LinuxHandle(HANDLE_THREAD), finished(false), joined(false), result(0), id(0) {}
     pthread_t thread;
+#if defined(PSP)
+    std::atomic<bool> finished;
+#else
     volatile bool finished;
+#endif
     bool joined;
     DWORD result;
+#if defined(PSP)
+    std::atomic<DWORD> id;
+#else
     DWORD id;
+#endif
     LPTHREAD_START_ROUTINE start;
     LPVOID parameter;
 };
@@ -706,6 +721,12 @@ TTF_Font *OpenCoverageCheckedPspFont(const PspFontCandidate &candidate)
 DWORD g_lastError;
 WNDPROC g_windowProcedure;
 SDL_Window *g_window;
+#if defined(PSP) && defined(TH08_PSP_NATIVE_GE) && TH08_PSP_NATIVE_GE
+static unsigned char gNativeWindowTag;
+#define TH08_NATIVE_WINDOW 1
+#else
+#define TH08_NATIVE_WINDOW 0
+#endif
 std::map<DWORD, std::vector<MSG> > g_threadMessages;
 pthread_mutex_t g_messageMutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1177,13 +1198,13 @@ bool FillFindData(FindHandle *handle, WIN32_FIND_DATAA *data)
 void PumpSdlEvents(MSG *message, bool *hasMessage)
 {
     *hasMessage = false;
-    if (SDL_WasInit(SDL_INIT_VIDEO) == 0)
+    if (SDL_WasInit(TH08_NATIVE_WINDOW ? SDL_INIT_EVENTS : SDL_INIT_VIDEO) == 0)
         return;
     SDL_Event event;
     if (!SDL_PollEvent(&event))
         return;
     memset(message, 0, sizeof(*message));
-    message->hwnd = reinterpret_cast<HWND>(g_window);
+    message->hwnd = GetForegroundWindow();
     if (event.type == SDL_QUIT)
         message->message = WM_CLOSE;
     else if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
@@ -1303,6 +1324,15 @@ extern "C" BOOL th08_psp_gdi_text_initialize()
 extern "C" void th08_psp_gdi_text_shutdown()
 {
     ShutdownPspGdiText();
+}
+
+extern "C" void th08_psp_gdi_text_trim_cache()
+{
+    // TH07's prewarm lifecycle: the final rows now own their pixels. Release
+    // temporary FreeType glyphs before gameplay without closing the face.
+    if (g_pspGdiText.liveDescriptors == 0 && g_pspGdiText.face != NULL &&
+        g_pspGdiText.currentPointSize > 0)
+        TTF_SetFontSize(g_pspGdiText.face, g_pspGdiText.currentPointSize);
 }
 #endif
 
@@ -1449,7 +1479,35 @@ BOOL CloseHandle(HANDLE raw)
     {
         ThreadHandle *thread = static_cast<ThreadHandle *>(handle);
         if (!thread->finished) return TRUE;
-        if (!thread->joined) pthread_join(thread->thread, NULL);
+        if (!thread->joined)
+        {
+#if defined(PSP)
+            // The routine has returned, but its pthread ID cannot be reused
+            // until join. Discard old WM_QUIT messages before that reuse.
+            pthread_mutex_lock(&g_messageMutex);
+            g_threadMessages.erase(thread->id.load());
+            pthread_mutex_unlock(&g_messageMutex);
+#endif
+            const int error = pthread_join(thread->thread, NULL);
+            if (error != 0)
+            {
+#if defined(PSP)
+                th08::psp::BootLog("PSP_THREAD join_failed id=%lu error=%d\n",
+                                  static_cast<unsigned long>(thread->id.load()), error);
+                // Callers must not continue and discard the only owner after
+                // a failed reap. Preserve the error and take the fatal exit.
+                th08::psp::PlatformArmExitWatchdog();
+                th08::psp::FlushBootLog();
+                std::terminate();
+#endif
+                return FALSE;
+            }
+            thread->joined = true;
+#if defined(PSP)
+            th08::psp::BootLog("PSP_THREAD reaped id=%lu\n",
+                              static_cast<unsigned long>(thread->id.load()));
+#endif
+        }
     }
     delete handle;
     return TRUE;
@@ -1544,9 +1602,20 @@ DWORD GetCurrentThreadId(void) { return CurrentThreadIdImpl(); }
 HANDLE CreateThread(LPVOID, size_t, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD, LPDWORD id)
 {
     ThreadHandle *handle = new ThreadHandle(); handle->start = start; handle->parameter = parameter;
-    if (pthread_create(&handle->thread, NULL, ThreadTrampoline, handle) != 0) { delete handle; return NULL; }
+    const int error = pthread_create(&handle->thread, NULL, ThreadTrampoline, handle);
+    if (error != 0)
+    {
+#if defined(PSP)
+        th08::psp::BootLog("PSP_THREAD create_failed error=%d\n", error);
+#endif
+        delete handle;
+        return NULL;
+    }
     while (handle->id == 0) sched_yield();
     if (id != NULL) *id = handle->id;
+#if defined(PSP)
+    th08::psp::BootLog("PSP_THREAD created id=%lu\n", static_cast<unsigned long>(handle->id.load()));
+#endif
     return handle;
 }
 
@@ -1669,6 +1738,12 @@ BOOL RegisterClassA(const WNDCLASSA *value) { g_windowProcedure = value->lpfnWnd
 
 HWND CreateWindowExA(DWORD, LPCSTR, LPCSTR title, DWORD style, int, int, int width, int height, HWND, HANDLE, HINSTANCE, LPVOID)
 {
+#if TH08_NATIVE_WINDOW
+    (void)title; (void)style; (void)width; (void)height;
+    const int result = SDL_Init(SDL_INIT_TIMER | SDL_INIT_EVENTS);
+    TH08_PSP_BOOT_CHECKPOINT("native_sdl_events", "init", result);
+    return result == 0 ? reinterpret_cast<HWND>(&gNativeWindowTag) : nullptr;
+#else
     TH08_PSP_BOOT_CHECKPOINT("sdl_init", "before", 0);
     const int sdlInitResult =
         SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER);
@@ -1713,6 +1788,7 @@ HWND CreateWindowExA(DWORD, LPCSTR, LPCSTR title, DWORD style, int, int, int wid
     }
     else SetApplicationIcon(g_window);
     return reinterpret_cast<HWND>(g_window);
+#endif
 }
 
 BOOL DestroyWindow(HWND) { if (g_window != NULL) SDL_DestroyWindow(g_window); g_window = NULL; SDL_Quit(); return TRUE; }
@@ -1724,7 +1800,14 @@ HCURSOR LoadCursorA(HINSTANCE, LPCSTR) { return reinterpret_cast<HCURSOR>(1); }
 HGDIOBJ GetStockObject(int) { return NULL; }
 int GetSystemMetrics(int metric) { return metric == SM_CYCAPTION ? 24 : 4; }
 BOOL SystemParametersInfoA(UINT, UINT, PVOID value, UINT) { if (value != NULL) *static_cast<BOOL *>(value) = FALSE; return TRUE; }
-HWND GetForegroundWindow(void) { return reinterpret_cast<HWND>(g_window); }
+HWND GetForegroundWindow(void)
+{
+#if TH08_NATIVE_WINDOW
+    return reinterpret_cast<HWND>(&gNativeWindowTag);
+#else
+    return reinterpret_cast<HWND>(g_window);
+#endif
+}
 DWORD GetWindowThreadProcessId(HWND, LPDWORD process) { if (process != NULL) *process = getpid(); return GetCurrentThreadId(); }
 BOOL AttachThreadInput(DWORD, DWORD, BOOL) { return TRUE; }
 HWND SetActiveWindow(HWND window) { if (g_window != NULL) SDL_RaiseWindow(g_window); return window; }
@@ -2207,6 +2290,12 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
                 th08::psp::AudioFixedCursorToDouble(fixedCursor, fixedShift), playing);
 #endif
 
+#if TH08_PSP_ME_AUDIO_ENABLED
+        FinishMix(oldPosition, wrapped, sourceFrames, frameBytes);
+    }
+    void FinishMix(DWORD oldPosition, bool wrapped, DWORD sourceFrames, DWORD frameBytes)
+    {
+#endif
         if (cursorFrame >= sourceFrames)
         {
             if (looping) { cursorFrame = fmod(cursorFrame, static_cast<double>(sourceFrames)); wrapped = true; }
@@ -2230,6 +2319,44 @@ class LinuxSoundBuffer : public IDirectSoundBuffer
             }
         }
     }
+#if TH08_PSP_ME_AUDIO_ENABLED
+    bool ExportMeVoice(th08::psp::MeAudioVoice &voice)
+    {
+        const DWORD frameBytes = FrameBytes();
+        if (!playing || !hasFormat || bytes.empty() || !frameBytes ||
+            format.wFormatTag != WAVE_FORMAT_PCM ||
+            (format.wBitsPerSample != 8 && format.wBitsPerSample != 16) ||
+            (format.nChannels != 1 && format.nChannels != 2) ||
+            frameBytes != format.nChannels * (format.wBitsPerSample / 8)) return false;
+        voice = {};
+        voice.sourceFrames = static_cast<DWORD>(bytes.size() / frameBytes);
+        unsigned int shift = 0;
+        if (!voice.sourceFrames ||
+            !th08::psp::AudioFixedCursorEligible(format.nSamplesPerSec, &shift) ||
+            !th08::psp::AudioFixedCursorFromDouble(cursorFrame, shift, &voice.cursor)) return false;
+        voice.shift = shift;
+        voice.frameBytes = frameBytes;
+        voice.channels = format.nChannels;
+        voice.bits = format.wBitsPerSample;
+        voice.looping = looping;
+        const float gain = volume <= DSBVOLUME_MIN ? 0.0f : powf(10.0f, static_cast<float>(volume) / 2000.0f);
+        const float panValue = pan < -10000 ? -1.0f : pan > 10000 ? 1.0f : static_cast<float>(pan) / 10000.0f;
+        voice.leftGain = gain * (panValue > 0.0f ? 1.0f - panValue : 1.0f);
+        voice.rightGain = gain * (panValue < 0.0f ? 1.0f + panValue : 1.0f);
+        return true;
+    }
+    const BYTE *MeVoicePcm() const { return bytes.data(); }
+    void CommitMeVoice(const th08::psp::MeAudioVoice &voice)
+    {
+        const DWORD oldPosition = position;
+        playing = voice.playing != 0;
+        cursorFrame = th08::psp::AudioFixedCursorToDouble(voice.cursor, voice.shift);
+        FinishMix(oldPosition, voice.wrapped != 0, voice.sourceFrames, voice.frameBytes);
+#if TH08_PSP_AUDIO_FIXED_CURSOR_ENABLED
+        th08::psp::AudioCursorProductNoteMix(format.nSamplesPerSec, true);
+#endif
+    }
+#endif
   private:
     DWORD FrameBytes() const
     { return hasFormat && format.nBlockAlign != 0 ? format.nBlockAlign : 0; }
@@ -2256,14 +2383,51 @@ void AudioCallback(void *, Uint8 *stream, int length)
 #if defined(PSP) && TH08_PSP_RUNTIME_TELEMETRY
     std::uint32_t activeVoices = 0;
 #endif
+#if TH08_PSP_ME_AUDIO_ENABLED
+#if TH08_PSP_RUNTIME_TELEMETRY
+    for (auto *buffer : g_soundBuffers)
+        if (buffer->IsPlayingForTelemetry()) ++activeVoices;
+#endif
+    bool mixedOnMe = false;
+    th08::psp::MeAudioJob *job = th08::psp::MeAudioPrepare(frames > 0 ? unsigned(frames) : 0);
+    if (job)
+    {
+        LinuxSoundBuffer *owners[th08::psp::MeAudioMaxVoices];
+        unsigned count = 0;
+        bool eligible = true;
+        // Preserve voice order and per-voice clipping: never split ME/SC lists.
+        for (auto *buffer : g_soundBuffers)
+        {
+            if (!buffer->IsPlayingForTelemetry()) continue;
+            th08::psp::MeAudioVoice voice;
+            if (count == th08::psp::MeAudioMaxVoices || !buffer->ExportMeVoice(voice) ||
+                !th08::psp::MeAudioAdd(job, voice, buffer->MeVoicePcm()))
+            { eligible = false; break; }
+            owners[count++] = buffer;
+        }
+        if (eligible && count && th08::psp::MeAudioRun(job, output))
+        {
+            for (unsigned i = 0; i < count; ++i) owners[i]->CommitMeVoice(job->voices[i]);
+            mixedOnMe = true;
+        }
+        th08::psp::MeAudioRelease();
+    }
+    const unsigned scStart = sceKernelGetSystemTimeLow();
+    if (!mixedOnMe)
+    {
+#endif
     for (size_t index = 0; index < g_soundBuffers.size(); ++index)
     {
-#if defined(PSP) && TH08_PSP_RUNTIME_TELEMETRY
+#if defined(PSP) && TH08_PSP_RUNTIME_TELEMETRY && !TH08_PSP_ME_AUDIO_ENABLED
         if (g_soundBuffers[index]->IsPlayingForTelemetry())
             ++activeVoices;
 #endif
         g_soundBuffers[index]->Mix(output, frames);
     }
+#if TH08_PSP_ME_AUDIO_ENABLED
+        th08::psp::MeAudioNoteSc(sceKernelGetSystemTimeLow() - scStart);
+    }
+#endif
 
 #if defined(PSP) && TH08_PSP_RUNTIME_TELEMETRY
     std::uint32_t nonzeroSamples = 0;

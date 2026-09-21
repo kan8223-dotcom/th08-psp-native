@@ -43,6 +43,11 @@ bool th08_linux_capture_direct_to_texture(IDirect3DSurface8 *destination, const 
                                           D3DCOLOR colorKey);
 #endif
 void th08_linux_surface_changed(IDirect3DSurface8 *surface);
+#if defined(PSP) && defined(TH08_PSP_NATIVE_GE) && TH08_PSP_NATIVE_GE
+// Publish an already modified CPU atlas band without dirtying the whole image.
+// False leaves the caller responsible for the canonical full-upload fallback.
+bool th08_native_surface_changed_rect(IDirect3DSurface8 *surface, const RECT &rect);
+#endif
 void th08_linux_texture_mark_static(IDirect3DTexture8 *texture);
 #if defined(PSP)
 // The Bullet renderer brackets only its six enemy-bullet buckets with this

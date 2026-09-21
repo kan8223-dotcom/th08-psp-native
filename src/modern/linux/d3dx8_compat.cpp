@@ -5,6 +5,9 @@ extern "C" void th08_linux_note_surface_op(const char *op);
 #define TH08_NOTE_SURFACE_OP(x) ((void)0)
 #endif
 #include "d3d8_internal.hpp"
+#if defined(PSP) && defined(TH08_PSP_NATIVE_GE) && TH08_PSP_NATIVE_GE
+#include "text_area_average.hpp"
+#endif
 
 #include <SDL.h>
 #include <SDL_image.h>
@@ -328,6 +331,25 @@ HRESULT CopyMemoryAreaAverage(IDirect3DSurface8 *destinationRaw,
     // TH07's PSP text path preserves thin glyph strokes by averaging every
     // source texel covered by one destination texel.  Do the same directly in
     // the existing packed surfaces: no temporary row/surface or heap traffic.
+#if defined(TH08_PSP_NATIVE_GE) && TH08_PSP_NATIVE_GE
+    if (!colorKey && source.format == D3DFMT_A1R5G5B5 && sourceWidth == destinationWidth * 2 &&
+        (destination.format == D3DFMT_A1R5G5B5 || destination.format == D3DFMT_A4R4G4B4))
+    {
+        const BYTE *src = source.pixels + sourceRect.top * source.pitch + sourceRect.left * 2;
+        BYTE *dst = destination.pixels + destinationRect.top * destination.pitch + destinationRect.left * 2;
+        const bool copied = destination.format == D3DFMT_A4R4G4B4 ?
+            th08::psp::AverageText5551_2x<true>(src, source.pitch, sourceHeight,
+                dst, destination.pitch, destinationWidth, destinationHeight) :
+            th08::psp::AverageText5551_2x<false>(src, source.pitch, sourceHeight,
+                dst, destination.pitch, destinationWidth, destinationHeight);
+        if (copied)
+        {
+            if (!th08_native_surface_changed_rect(destinationRaw, destinationRect))
+                th08_linux_surface_changed(destinationRaw);
+            return S_OK;
+        }
+    }
+#endif
     for (UINT y = 0; y < destinationHeight; ++y)
     {
         const UINT sourceY0 = static_cast<UINT>(sourceRect.top) +
@@ -389,6 +411,9 @@ HRESULT CopyMemoryAreaAverage(IDirect3DSurface8 *destinationRaw,
                         destination.format, averaged);
         }
     }
+#if defined(TH08_PSP_NATIVE_GE) && TH08_PSP_NATIVE_GE
+    if (th08_native_surface_changed_rect(destinationRaw, destinationRect)) return S_OK;
+#endif
     th08_linux_surface_changed(destinationRaw);
     return S_OK;
 }

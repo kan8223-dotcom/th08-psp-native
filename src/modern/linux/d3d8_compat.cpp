@@ -1,6 +1,7 @@
 #include "d3d8_internal.hpp"
 #include "psp/me_bullet_adopt.hpp"
 #include "psp/ge2d_direct.hpp"
+#include "psp/ge_draw_direct.hpp"
 #include "Gui.hpp"
 
 #include <SDL.h>
@@ -321,6 +322,18 @@ extern "C" int __pspgl_th08_draw_native_indexed_triangles(
     const void *vertices, unsigned vertexBytes,
     const unsigned short *indices, unsigned indexBytes,
     unsigned indexCount);
+
+static int PspSubmitNativeTriangles(const void *vertices, unsigned vertexBytes,
+                                    const unsigned short *indices, unsigned indexBytes,
+                                    unsigned indexCount)
+{
+#if TH08_PSP_GE_DRAW_DIRECT_ENABLED
+    if (th08_ge_draw_direct_triangles(vertices, vertexBytes, indices, indexBytes, indexCount))
+        return 1;
+#endif
+    return __pspgl_th08_draw_native_indexed_triangles(
+        vertices, vertexBytes, indices, indexBytes, indexCount);
+}
 #endif
 
 #if TH08_PSP_BULLET_MIXED_QUADS_FASTPATH_ENABLED || \
@@ -2655,6 +2668,14 @@ class LinuxDevice : public IDirect3DDevice8
                                ge2dVertices);
         }
 #endif
+#if TH08_PSP_GE_DRAW_DIRECT_ENABLED
+        {
+            unsigned long submits, fallbacks, palettes, states;
+            th08_ge_draw_direct_stats(&submits, &fallbacks, &palettes, &states);
+            th08::psp::BootLog("GE_DIRECT stats submits=%lu fallbacks=%lu palettes=%lu states=%lu\n",
+                               submits, fallbacks, palettes, states);
+        }
+#endif
 #if TH08_PSP_QUAD_BATCH_ENABLED
         th08::psp::BootLog("QUAD_BATCH stats quads=%lu flushes=%lu singles=%lu fallbacks=%lu rejected=%lu "
                            "why=draw:%lu rs:%lu tex:%lu tss:%lu vp:%lu xform:%lu scene:%lu texupd:%lu cap:%lu\n",
@@ -3535,7 +3556,7 @@ class LinuxDevice : public IDirect3DDevice8
         const unsigned int prepared = sample ? sceKernelGetSystemTimeLow() : 0U;
 #endif
         const UINT indexCount = quadCount * 6U;
-        const int submitted = __pspgl_th08_draw_native_indexed_triangles(
+        const int submitted = PspSubmitNativeTriangles(
             vertices, quadCount * 4U * sizeof(PspClientVertex), indices,
             indexCount * sizeof(unsigned short), indexCount);
 #if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
@@ -3673,7 +3694,7 @@ class LinuxDevice : public IDirect3DDevice8
         std::uint64_t submitStart = 0U;
         const bool submitOn = th08::psp::DrawPrioritySubprofileBeginSlot(th08::psp::kDrawPrioritySlotSubmit, submitStart);
 #endif
-        const int submitted = __pspgl_th08_draw_native_indexed_triangles(
+        const int submitted = PspSubmitNativeTriangles(
             vertices, quads * 4U * sizeof(PspClientVertex), gPspNativeQuadIndices,
             indexCount * sizeof(unsigned short), indexCount);
 #if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED
@@ -4860,11 +4881,42 @@ class LinuxDevice : public IDirect3DDevice8
         ApplyPspCachedMatrixMode(&pspPrepareStateCache, GL_MODELVIEW,
                                  &pspStateEmitted);
 
-        const bool blendEnabled =
-            renderStates[D3DRS_ALPHABLENDENABLE] != 0;
 #if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
         const unsigned int sampleMatrices = pspSubmitPrepareSample ? sceKernelGetSystemTimeLow() : 0U;
 #endif
+#if TH08_PSP_GE_DRAW_DIRECT_ENABLED
+        Th08GeDrawState directState{};
+        directState.blend = renderStates[D3DRS_ALPHABLENDENABLE];
+        directState.blendSource = BlendFunction(renderStates[D3DRS_SRCBLEND]);
+        directState.blendDestination = BlendFunction(renderStates[D3DRS_DESTBLEND]);
+        directState.alpha = renderStates[D3DRS_ALPHATESTENABLE];
+        directState.alphaFunction = CompareFunction(renderStates[D3DRS_ALPHAFUNC]);
+        directState.alphaReference = renderStates[D3DRS_ALPHAREF];
+        directState.depth = renderStates[D3DRS_ZENABLE];
+        directState.depthFunction = CompareFunction(renderStates[D3DRS_ZFUNC]);
+        directState.depthWrite = renderStates[D3DRS_ZWRITEENABLE];
+        directState.fogColor = renderStates[D3DRS_FOGCOLOR];
+        memcpy(&directState.fogStart, &renderStates[D3DRS_FOGSTART], sizeof(float));
+        memcpy(&directState.fogEnd, &renderStates[D3DRS_FOGEND], sizeof(float));
+        directState.fog = !transformed && renderStates[D3DRS_FOGENABLE] &&
+                         renderStates[D3DRS_FOGVERTEXMODE] == D3DFOG_LINEAR &&
+                         directState.fogEnd > directState.fogStart;
+        if (th08_ge_draw_direct_state(&directState))
+        {
+            // A later unsupported state must re-enter the GL path freshly;
+            // texture/sampler and matrix cache entries remain authoritative.
+            pspPrepareStateCache.blendEnableValid = pspPrepareStateCache.blendFunctionValid = false;
+            pspPrepareStateCache.alphaEnableValid = pspPrepareStateCache.alphaFunctionValid = false;
+            pspPrepareStateCache.depthEnableValid = pspPrepareStateCache.depthFunctionValid = false;
+            pspPrepareStateCache.depthMaskValid = pspPrepareStateCache.fogEnableValid = false;
+            pspPrepareStateCache.fogModeValid = pspPrepareStateCache.fogColorValid = false;
+            pspPrepareStateCache.fogStartValid = pspPrepareStateCache.fogEndValid = false;
+        }
+        else
+        {
+#endif
+        const bool blendEnabled =
+            renderStates[D3DRS_ALPHABLENDENABLE] != 0;
         ApplyPspCachedCapability(GL_BLEND, blendEnabled,
                                  &pspPrepareStateCache.blendEnableValid,
                                  &pspPrepareStateCache.blendEnabled,
@@ -4993,6 +5045,9 @@ class LinuxDevice : public IDirect3DDevice8
             }
         }
 
+#if TH08_PSP_GE_DRAW_DIRECT_ENABLED
+        }
+#endif
 #if defined(TH08_PSP_SUBMIT_SUBPROFILE) && TH08_PSP_SUBMIT_SUBPROFILE
         const unsigned int sampleRender = pspSubmitPrepareSample ? sceKernelGetSystemTimeLow() : 0U;
 #endif
@@ -5830,7 +5885,7 @@ class LinuxDevice : public IDirect3DDevice8
                             }
 
                             const int submitted =
-                                __pspgl_th08_draw_native_indexed_triangles(
+                                PspSubmitNativeTriangles(
                                     directVertices,
                                     directVertexCount *
                                         sizeof(PspClientVertex),
@@ -5911,7 +5966,7 @@ class LinuxDevice : public IDirect3DDevice8
 #endif
 
                     const int submitted =
-                        __pspgl_th08_draw_native_indexed_triangles(
+                        PspSubmitNativeTriangles(
                             directVertices,
                             directVertexCount * sizeof(PspClientVertex),
                             directIndices,
@@ -6558,7 +6613,7 @@ class LinuxDevice : public IDirect3DDevice8
         const UINT authoritativeIndexCount = authoritativeQuads * 6U;
         const bool nativeEligible = ownerValid && stateValid && indexValid;
         const int nativeSubmitted = nativeEligible
-            ? __pspgl_th08_draw_native_indexed_triangles(
+            ? PspSubmitNativeTriangles(
                   vertices, vertexCount * sizeof(PspClientVertex),
                   indices, authoritativeIndexCount * sizeof(unsigned short),
                   authoritativeIndexCount)
@@ -7590,7 +7645,7 @@ class LinuxDevice : public IDirect3DDevice8
         std::uint64_t submitStart = 0U;
         const bool submitOn = th08::psp::DrawPrioritySubprofileBeginSlot(th08::psp::kDrawPrioritySlotSubmit, submitStart);
 #endif
-        const int submitted = __pspgl_th08_draw_native_indexed_triangles(
+        const int submitted = PspSubmitNativeTriangles(
             destination, count * sizeof(PspClientVertex), indices,
             indexCount * sizeof(unsigned short), indexCount);
 #if TH08_PSP_DRAW_PRIORITY_SUBPROFILE_ENABLED

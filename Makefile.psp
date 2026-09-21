@@ -2,6 +2,17 @@ export PATH := /usr/local/pspdev/bin:$(PATH)
 export PSPDEV := /usr/local/pspdev
 
 TARGET := TH08PSP
+TH08_PSP_NATIVE_GE ?= 0
+TH08_PSP_NATIVE_VERTEX_DIRECT ?= 1
+TH08_PSP_NATIVE_FIXED_INDICES ?= 0
+TH08_PSP_NATIVE_PREPARE_CACHE ?= 0
+TH08_PSP_DIALOGUE_TEXT_CACHE ?= 1
+ifneq ($(filter-out 0 1,$(TH08_PSP_NATIVE_VERTEX_DIRECT) $(TH08_PSP_NATIVE_FIXED_INDICES) $(TH08_PSP_NATIVE_PREPARE_CACHE) $(TH08_PSP_DIALOGUE_TEXT_CACHE)),)
+$(error Native renderer/cache switches must be 0 or 1)
+endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_NATIVE_GE)),)
+$(error TH08_PSP_NATIVE_GE must be 0 or 1)
+endif
 
 # Keep the existing diagnostic output by default. The no-log comparison only
 # removes log sinks; game data, saves, replay writes and exit rescue stay intact.
@@ -70,6 +81,8 @@ TH08_PSP_AUDIO_FIXED_CURSOR ?= 0
 # Mutually exclusive, default OFF; the PC oracle build never sees them.
 TH08_PSP_TRIG_DF_FASTPATH_AUDIT ?= 0
 TH08_PSP_TRIG_DF_FASTPATH ?= 0
+# Node-table evaluation for the trig DF fast path (psp/item_sincos_fastpath_math.hpp).
+TH08_PSP_TRIG_DF_TABLE ?= 0
 
 # Execution-environment record per PERF_ATTR window (R-038): effective CPU/bus
 # clock at window start/end, a fresh timer calibration, main-thread kernel run
@@ -163,6 +176,15 @@ ifneq ($(filter-out 0 1,$(TH08_PSP_BG_FAST_PROJECT)),)
 $(error TH08_PSP_BG_FAST_PROJECT must be 0 or 1)
 endif
 TH08_PSP_ME_CORE ?= 0
+TH08_PSP_ME_AUDIO_MIX ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_ME_AUDIO_MIX)),)
+$(error TH08_PSP_ME_AUDIO_MIX must be 0 or 1)
+endif
+ifeq ($(TH08_PSP_ME_AUDIO_MIX),1)
+ifneq ($(TH08_PSP_ME_CORE),0)
+$(error Audio-only ME must not enable the general ME core)
+endif
+endif
 ifneq ($(filter-out 0 1,$(TH08_PSP_ME_CORE)),)
 $(error TH08_PSP_ME_CORE must be 0 or 1)
 endif
@@ -199,6 +221,10 @@ TH08_PSP_GE_KICK_DRAWS ?= 6
 TH08_PSP_GE_2D_DIRECT ?= 0
 ifneq ($(filter-out 0 1,$(TH08_PSP_GE_2D_DIRECT)),)
 $(error TH08_PSP_GE_2D_DIRECT must be 0 or 1)
+endif
+TH08_PSP_GE_DRAW_DIRECT ?= 0
+ifneq ($(filter-out 0 1,$(TH08_PSP_GE_DRAW_DIRECT)),)
+$(error TH08_PSP_GE_DRAW_DIRECT must be 0 or 1)
 endif
 # Keep dialogue faces / loading / title textures out of the upper VRAM so the
 # per-frame hot set (bullets, effects, stage, player, HUD) is resident.
@@ -436,6 +462,9 @@ endif
 ifneq ($(filter-out 0 1,$(TH08_PSP_TRIG_DF_FASTPATH)),)
 $(error TH08_PSP_TRIG_DF_FASTPATH must be 0 or 1)
 endif
+ifneq ($(filter-out 0 1,$(TH08_PSP_TRIG_DF_TABLE)),)
+$(error TH08_PSP_TRIG_DF_TABLE must be 0 or 1)
+endif
 ifeq ($(TH08_PSP_TRIG_DF_FASTPATH_AUDIT)$(TH08_PSP_TRIG_DF_FASTPATH),11)
 $(error TH08_PSP_TRIG_DF_FASTPATH_AUDIT and TH08_PSP_TRIG_DF_FASTPATH are mutually exclusive)
 endif
@@ -648,6 +677,7 @@ PSP_HOST_SRCS := \
 	psp/backbuffer_shadow.cpp \
 	psp/usage_meter.cpp \
 	psp/me_worker.cpp \
+	psp/me_audio.cpp \
 	psp/me_effect_shadow.cpp \
 	psp/me_effect_adopt.cpp \
 	psp/me_bullet_adopt.cpp \
@@ -655,11 +685,17 @@ PSP_HOST_SRCS := \
 	psp/me_bullet_move.cpp \
 	psp/me_popup.cpp \
 	psp/ge2d_direct.cpp \
+	psp/ge_draw_direct.cpp \
 	psp/sdl_renderer_disabled.cpp \
 	psp/video.cpp \
 	psp/runtime_support.cpp
 
 SRCS := $(PSP_HOST_SRCS) $(TH08_GAME_SRCS) $(TH08_PORTABLE_SRCS)
+ifeq ($(TH08_PSP_NATIVE_GE),1)
+SRCS := $(filter-out src/modern/linux/d3d8_compat.cpp psp/ge2d_direct.cpp psp/ge_draw_direct.cpp,$(SRCS)) \
+	src/modern/linux/d3d8_psp_native.cpp psp/native_ge.cpp psp/sdl_native_video.cpp \
+	psp/dialogue_text_cache.cpp
+endif
 OBJS := $(patsubst %.cpp,%.o,$(SRCS))
 
 PSP_EBOOT_TITLE := Touhou 8 PSP SC Engine Bring-up
@@ -1061,6 +1097,10 @@ TH08_PSP_FONT_GLYPH_CACHE_RETAIN ?= 0
 TH08_PSP_TEXT_MASK_REUSE ?= 0
 
 GENERATED_DIR := build/psp-generated
+NATIVE_GE_CONFIG_STAMPS := $(GENERATED_DIR)/native-ge-0.stamp $(GENERATED_DIR)/native-ge-1.stamp
+NATIVE_GE_CONFIG_STAMP := $(GENERATED_DIR)/native-ge-$(TH08_PSP_NATIVE_GE).stamp
+ME_AUDIO_CONFIG_STAMPS := $(GENERATED_DIR)/audio-me-0.stamp $(GENERATED_DIR)/audio-me-1.stamp
+ME_AUDIO_CONFIG_STAMP := $(GENERATED_DIR)/audio-me-$(TH08_PSP_ME_AUDIO_MIX).stamp
 GENERATED_I18N := $(GENERATED_DIR)/i18n.hpp
 GE4_MODEL_GATE_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/ge4-slimplus-0.stamp \
@@ -1152,6 +1192,8 @@ GE_2D_DIRECT_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/ge-2d-direct-0.stamp \
 	$(GENERATED_DIR)/ge-2d-direct-1.stamp
 GE_2D_DIRECT_CONFIG_STAMP := $(GENERATED_DIR)/ge-2d-direct-$(TH08_PSP_GE_2D_DIRECT).stamp
+GE_DRAW_DIRECT_CONFIG_STAMPS := $(GENERATED_DIR)/ge-draw-direct-0.stamp $(GENERATED_DIR)/ge-draw-direct-1.stamp
+GE_DRAW_DIRECT_CONFIG_STAMP := $(GENERATED_DIR)/ge-draw-direct-$(TH08_PSP_GE_DRAW_DIRECT).stamp
 GE4_HOT_TEXTURES_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/ge4-hot-textures-0.stamp \
 	$(GENERATED_DIR)/ge4-hot-textures-1.stamp
@@ -1402,6 +1444,10 @@ TRIG_DF_FASTPATH_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/trig-df-fastpath-0.stamp \
 	$(GENERATED_DIR)/trig-df-fastpath-1.stamp
 TRIG_DF_FASTPATH_CONFIG_STAMP := $(GENERATED_DIR)/trig-df-fastpath-$(TH08_PSP_TRIG_DF_FASTPATH).stamp
+TRIG_DF_TABLE_CONFIG_STAMPS := \
+	$(GENERATED_DIR)/trig-df-table-0.stamp \
+	$(GENERATED_DIR)/trig-df-table-1.stamp
+TRIG_DF_TABLE_CONFIG_STAMP := $(GENERATED_DIR)/trig-df-table-$(TH08_PSP_TRIG_DF_TABLE).stamp
 PERF_ENV_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/perf-env-0.stamp \
 	$(GENERATED_DIR)/perf-env-1.stamp
@@ -1482,6 +1528,8 @@ DIALOGUE_LIVE_BACKGROUND_CONFIG_STAMPS := \
 	$(GENERATED_DIR)/dialogue-live-background-1.stamp
 DIALOGUE_LIVE_BACKGROUND_CONFIG_STAMP := $(GENERATED_DIR)/dialogue-live-background-$(TH08_PSP_DIALOGUE_LIVE_BACKGROUND).stamp
 EXTRA_CLEAN += $(GE4_MODEL_GATE_CONFIG_STAMPS) \
+	$(ME_AUDIO_CONFIG_STAMPS) \
+	$(NATIVE_GE_CONFIG_STAMPS) build/psp-native-ge-link.ok build/psp-native-ge-symbols.txt \
 	$(BULLET_VM_CONFIG_STAMPS) $(REPLAY_AUDIT_CONFIG_STAMPS) \
 	$(RENDER_VFPU_CONFIG_STAMPS) $(BULLET_FASTPATH_CONFIG_STAMPS) \
 	$(X87_TRIG_CACHE_CONFIG_STAMPS) \
@@ -1501,6 +1549,7 @@ EXTRA_CLEAN += $(GE4_MODEL_GATE_CONFIG_STAMPS) \
 	$(QUAD_BATCH_CONFIG_STAMPS) \
 	$(GE_KICK_CONFIG_STAMPS) \
 	$(GE_2D_DIRECT_CONFIG_STAMPS) \
+	$(GE_DRAW_DIRECT_CONFIG_STAMPS) \
 	$(GE4_HOT_TEXTURES_CONFIG_STAMPS) \
 	$(PORTRAIT_LOWER_CONFIG_STAMPS) \
 	$(EFFECT_OCCUPANCY_AUDIT_CONFIG_STAMPS) \
@@ -1562,6 +1611,7 @@ EXTRA_CLEAN += $(GE4_MODEL_GATE_CONFIG_STAMPS) \
 	$(AUDIO_FIXED_CURSOR_CONFIG_STAMPS) \
 	$(TRIG_DF_FASTPATH_AUDIT_CONFIG_STAMPS) \
 	$(TRIG_DF_FASTPATH_CONFIG_STAMPS) \
+	$(TRIG_DF_TABLE_CONFIG_STAMPS) \
 	$(PERF_ENV_CONFIG_STAMPS) \
 	$(SWAP_NOWAIT_CONFIG_STAMPS) \
 	$(SWAP_ASYNC_CONFIG_STAMPS) \
@@ -1641,6 +1691,9 @@ endif
 ifeq ($(TH08_PSP_TRIG_DF_FASTPATH),1)
 CXXFLAGS += -DTH08_PSP_TRIG_DF_FASTPATH=1
 endif
+ifeq ($(TH08_PSP_TRIG_DF_TABLE),1)
+CXXFLAGS += -DTH08_PSP_TRIG_DF_TABLE=1
+endif
 ifeq ($(TH08_PSP_PERF_ENV),1)
 CXXFLAGS += -DTH08_PSP_PERF_ENV=1
 endif
@@ -1707,6 +1760,9 @@ endif
 ifeq ($(TH08_PSP_ME_CORE),1)
 CXXFLAGS += -DTH08_PSP_ME_CORE=1 -I$(MECC_DIR)
 endif
+ifeq ($(TH08_PSP_ME_AUDIO_MIX),1)
+CXXFLAGS += -DTH08_PSP_ME_AUDIO_MIX=1 -I$(MECC_DIR)
+endif
 ifeq ($(TH08_PSP_ME_EFFECT_SHADOW),1)
 CXXFLAGS += -DTH08_PSP_ME_EFFECT_SHADOW=1
 endif
@@ -1736,6 +1792,12 @@ CXXFLAGS += -DTH08_PSP_GE_KICK=1 -DTH08_PSP_GE_KICK_DRAWS=$(TH08_PSP_GE_KICK_DRA
 endif
 ifeq ($(TH08_PSP_GE_2D_DIRECT),1)
 CXXFLAGS += -DTH08_PSP_GE_2D_DIRECT=1
+endif
+ifeq ($(TH08_PSP_GE_DRAW_DIRECT),1)
+ifneq ($(TH08_PSP_GE_2D_DIRECT)$(TH08_PSP_PREPARE_STATE_CACHE)$(TH08_PSP_DRAW_NATIVE_PRIMS),111)
+$(error GE_DRAW_DIRECT requires GE_2D_DIRECT, PREPARE_STATE_CACHE and DRAW_NATIVE_PRIMS)
+endif
+CXXFLAGS += -DTH08_PSP_GE_DRAW_DIRECT=1
 endif
 ifeq ($(TH08_PSP_GE4_HOT_TEXTURES),1)
 CXXFLAGS += -DTH08_PSP_GE4_HOT_TEXTURES=1
@@ -1767,6 +1829,7 @@ endif
 psp/swap_async.o: CXXFLAGS += -Ideps/pspgl-ge4/include
 psp/swap_triple.o: CXXFLAGS += -Ideps/pspgl-ge4/include
 psp/ge2d_direct.o: CXXFLAGS += -Ideps/pspgl-ge4/include
+psp/ge_draw_direct.o: CXXFLAGS += -Ideps/pspgl-ge4/include
 # The double-float atan2 and sin/cos rely on exact IEEE binary32 add/mul
 # rounding.  Allegrex has no fused multiply-add, but pin the contract on the
 # objects that instantiate the headers so a toolchain change cannot silently fuse.
@@ -2437,10 +2500,33 @@ PSPGL_GE4_SELECTED_ARCHIVE_STAMP := $(PSPGL_GE4_STREAM_LIST_ARCHIVE_STAMP)
 CXXFLAGS += -DTH08_PSP_PSPGL_STREAM_LIST=1
 endif
 
-# SC-only is an intentional link contract for the first playable target.  Do
-# not add me-core, MIST, ME task/audio, or any Media Engine support here.
+# Native rendering stays SC-only. The separate audio service never makes the
+# general ME core ready, and owns no renderer state or local-eDRAM storage.
+ifeq ($(TH08_PSP_NATIVE_GE),1)
+ifneq ($(filter 1,$(TH08_PSP_SWAP_NOWAIT) $(TH08_PSP_SWAP_ASYNC) $(TH08_PSP_SWAP_TRIPLE) $(TH08_PSP_PSPGL_STREAM_ARENA) $(TH08_PSP_PSPGL_STREAM_LIST) $(TH08_PSP_GE_DRAW_DIRECT) $(TH08_PSP_GE_2D_DIRECT) $(TH08_PSP_ME_CORE)),)
+$(error Native GE owns the renderer; disable legacy PSPGL/swap and ME-core flags, or use the native Go recipe)
+endif
+CXXFLAGS += -DTH08_PSP_NATIVE_GE=1
+CXXFLAGS += -DTH08_PSP_NATIVE_VERTEX_DIRECT=$(TH08_PSP_NATIVE_VERTEX_DIRECT) \
+ -DTH08_PSP_NATIVE_FIXED_INDICES=$(TH08_PSP_NATIVE_FIXED_INDICES) \
+ -DTH08_PSP_NATIVE_PREPARE_CACHE=$(TH08_PSP_NATIVE_PREPARE_CACHE) \
+ -DTH08_PSP_DIALOGUE_TEXT_CACHE=$(TH08_PSP_DIALOGUE_TEXT_CACHE)
+ifneq ($(MAKECMDGOALS),clean)
+ifneq ($(TH08_PSP_QUAD_BATCH)$(TH08_PSP_PREPARE_STATE_CACHE)$(TH08_PSP_GE_KICK)$(TH08_PSP_GE4_HOT_TEXTURES)$(TH08_PSP_DIALOGUE_LIVE_BACKGROUND),11111)
+$(error Native GE currently supports the Go quad/cache/kick/hot-texture/live-dialogue profile only)
+endif
+ifneq ($(TH08_PSP_GE_KICK_DRAWS),12)
+$(error Native GE currently uses the Go 12-draw list kick profile)
+endif
+endif
+PSPGL_GE4_SELECTED_ARCHIVE :=
+PSPGL_GE4_SELECTED_ARCHIVE_STAMP :=
+RENDERER_LINK_STAMP := build/psp-native-ge-link.ok
+else
+RENDERER_LINK_STAMP := $(PSPGL_GE4_LINK_STAMP)
+endif
 LIBS := -lSDL2_image -lSDL2_ttf -lSDL2main -lSDL2 $(PSPGL_GE4_SELECTED_ARCHIVE) \
-	$(if $(filter 1,$(TH08_PSP_ME_CORE)),-L$(MECC_BUILD_DIR) -lme-core,) \
+	$(if $(filter 1,$(TH08_PSP_ME_CORE) $(TH08_PSP_ME_AUDIO_MIX)),$(MECC_LIB),) \
 	-lharfbuzz -lfreetype -lbz2 -lpng16 -ljpeg -lz \
 	-lpspvram -lpspaudio -lpspvfpu -lpspgum_vfpu -lpspmath \
 	-lpspdisplay -lpspgu -lpspge -lpsphprm -lpspctrl -lpsppower \
@@ -2825,6 +2911,11 @@ $(GE_2D_DIRECT_CONFIG_STAMP):
 	@rm -f $(filter-out $@,$(GE_2D_DIRECT_CONFIG_STAMPS))
 	@touch $@
 
+$(GE_DRAW_DIRECT_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(GE_DRAW_DIRECT_CONFIG_STAMPS))
+	@touch $@
+
 $(GE4_HOT_TEXTURES_CONFIG_STAMP):
 	@mkdir -p $(dir $@)
 	@rm -f $(filter-out $@,$(GE4_HOT_TEXTURES_CONFIG_STAMPS))
@@ -3145,6 +3236,11 @@ $(TRIG_DF_FASTPATH_CONFIG_STAMP):
 	@rm -f $(filter-out $@,$(TRIG_DF_FASTPATH_CONFIG_STAMPS))
 	@touch $@
 
+$(TRIG_DF_TABLE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(TRIG_DF_TABLE_CONFIG_STAMPS))
+	@touch $@
+
 $(PERF_ENV_CONFIG_STAMP):
 	@mkdir -p $(dir $@)
 	@rm -f $(filter-out $@,$(PERF_ENV_CONFIG_STAMPS))
@@ -3255,10 +3351,21 @@ $(NEWLIB_HEAP_ABI_STAMP): $(TARGET).elf scripts/check_psp_newlib_heap_abi.py
 		--nm $(PSPDEV)/bin/psp-nm --objdump $(PSPDEV)/bin/psp-objdump
 	@touch $@
 
-EBOOT.PBP: $(NEWLIB_HEAP_ABI_STAMP) $(PSPGL_GE4_LINK_STAMP) \
+EBOOT.PBP: $(NEWLIB_HEAP_ABI_STAMP) $(RENDERER_LINK_STAMP) \
 	$(GE4_PROVEN_PRX)
 
+build/psp-native-ge-link.ok: $(TARGET).elf
+	@mkdir -p $(dir $@)
+	@$(PSPDEV)/bin/psp-nm -g $(TARGET).elf > build/psp-native-ge-symbols.txt
+	@if grep -Eq '[[:space:]](__pspgl|pspgl|egl[A-Z]|gl[A-Z])' build/psp-native-ge-symbols.txt; then \
+		echo 'ERROR: native GE executable still contains GL/EGL/PSPGL'; exit 1; fi
+	@if grep -Eq 'libGL[^ ]*\.a\(' TH08PSP.map; then \
+		echo 'ERROR: native GE executable still links a GL archive'; exit 1; fi
+	@touch $@
+
 $(OBJS): $(GENERATED_I18N) $(GE4_MODEL_GATE_CONFIG_STAMP) \
+	$(ME_AUDIO_CONFIG_STAMP) \
+	$(NATIVE_GE_CONFIG_STAMP) \
 	$(LOGGING_CONFIG_STAMP) \
 	$(BULLET_VM_CONFIG_STAMP) \
 	$(REPLAY_AUDIT_CONFIG_STAMP) $(RENDER_VFPU_CONFIG_STAMP) \
@@ -3266,6 +3373,27 @@ $(OBJS): $(GENERATED_I18N) $(GE4_MODEL_GATE_CONFIG_STAMP) \
 	$(X87_TRIG_CACHE_CONFIG_STAMP) \
 	$(BULLET_FASTPATH_CONFIG_STAMP) $(BULLET_UNIFIED_QUADS_CONFIG_STAMP) \
 	$(BULLET_DIRECT_GE_CONFIG_STAMP) $(ITEM_DIRECT_GE_CONFIG_STAMP)
+
+$(NATIVE_GE_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(filter-out $@,$(NATIVE_GE_CONFIG_STAMPS))
+	@touch $@
+
+$(ME_AUDIO_CONFIG_STAMP):
+	@mkdir -p $(dir $@)
+	@touch $@
+	@rm -f $(filter-out $@,$(ME_AUDIO_CONFIG_STAMPS))
+
+psp/native_ge.o src/modern/linux/d3d8_psp_native.o: psp/native_ge.hpp
+NATIVE_OPTIONS_STAMP := build/psp-native-options-$(TH08_PSP_NATIVE_VERTEX_DIRECT)$(TH08_PSP_NATIVE_FIXED_INDICES)$(TH08_PSP_NATIVE_PREPARE_CACHE)$(TH08_PSP_DIALOGUE_TEXT_CACHE).stamp
+$(NATIVE_OPTIONS_STAMP):
+	@mkdir -p build
+	@rm -f $(filter-out $(NATIVE_OPTIONS_STAMP),$(wildcard build/psp-native-options-*.stamp))
+	@touch $@
+psp/native_ge.o src/modern/linux/d3d8_psp_native.o psp/dialogue_text_cache.o: $(NATIVE_OPTIONS_STAMP)
+psp/dialogue_text_cache.o src/Gui.o src/GameManager.o src/TextHelper.o src/modern/linux/d3d8_psp_native.o: psp/dialogue_text_cache.hpp
+psp/dialogue_text_cache.o: psp/text_row_codec.hpp
+src/modern/linux/d3d8_psp_native.o: $(DEBUG_START_STAGE_CONFIG_STAMP)
 
 # The diagnostic exists in exactly these call-site owners.  Its source and
 # linker wrappers are absent in OFF builds; the stamp prevents stale ON/OFF
@@ -3312,6 +3440,10 @@ src/modern/linux/linux_compat.o psp/audio_cursor_audit.o psp/perf_attribution.o 
 # includes, plus the observer, the parent window owner, and the boot identity.
 $(filter src/%.o,$(OBJS)) psp/trig_df_fastpath.o psp/perf_attribution.o psp/main.o: \
 	$(TRIG_DF_FASTPATH_AUDIT_CONFIG_STAMP) $(TRIG_DF_FASTPATH_CONFIG_STAMP)
+
+# The DF node table is reached through item_sincos_fastpath_math.hpp.
+$(filter src/%.o,$(OBJS)) psp/trig_df_fastpath.o psp/item_sincos_audit.o psp/perf_attribution.o psp/me_bullet_move.o: \
+	$(TRIG_DF_TABLE_CONFIG_STAMP)
 
 # The environment record spans its observer, the attribution scopes and
 # wrappers, the draw-priority GE-wait bins, and the boot identity.
@@ -3435,6 +3567,7 @@ src/BulletManager.o src/AnmManager.o src/main.o src/modern/linux/d3d8_compat.o p
 src/Background.o src/AnmManager.o src/main.o psp/me_bg_adopt.o psp/me_worker.o psp/main.o: $(ME_BG_ADOPT_CONFIG_STAMP)
 src/modern/linux/d3d8_compat.o psp/main.o: $(QUAD_BATCH_CONFIG_STAMP) $(GE_KICK_CONFIG_STAMP)
 src/modern/linux/d3d8_compat.o psp/ge2d_direct.o psp/main.o: $(GE_2D_DIRECT_CONFIG_STAMP)
+src/modern/linux/d3d8_compat.o psp/ge2d_direct.o psp/ge_draw_direct.o psp/main.o: $(GE_DRAW_DIRECT_CONFIG_STAMP)
 src/modern/linux/d3d8_compat.o psp/main.o: $(GE4_HOT_TEXTURES_CONFIG_STAMP)
 src/modern/linux/d3d8_compat.o: $(PORTRAIT_LOWER_CONFIG_STAMP)
 src/EffectManager.o psp/effect_occupancy_audit.o psp/perf_attribution.o psp/main.o: \
@@ -3702,7 +3835,7 @@ test-psp-font-glyph-cache-retain: \
 
 -include $(OBJS:.o=.d)
 
-ifeq ($(TH08_PSP_ME_CORE),1)
+ifneq ($(filter 1,$(TH08_PSP_ME_CORE) $(TH08_PSP_ME_AUDIO_MIX)),)
 $(MECC_LIB): $(MECC_INPUTS)
 	cmake -S $(MECC_DIR) -B $(MECC_BUILD_DIR) -DCMAKE_BUILD_TYPE=Release
 	cmake --build $(MECC_BUILD_DIR) --target me-core

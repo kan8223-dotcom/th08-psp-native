@@ -8,6 +8,7 @@
 #include "modern/linux/d3d8_internal.hpp"
 #include "render_perf_telemetry.hpp"
 #include "render_resource_arena.hpp"
+#include "dialogue_text_cache.hpp"
 #endif
 
 namespace th08
@@ -408,6 +409,9 @@ bool TextHelper::IsTextBufferReady()
 
 void TextHelper::ReleaseTextBuffer()
 {
+#if TH08_PSP_DIALOGUE_TEXT_CACHE_ENABLED
+    psp::ReleaseDialogueTextCache();
+#endif
 #if defined(PSP)
     // No dynamic GdiFont may remain selected here. Release the DC/bitmap
     // consumer first, then close the shared face and finally its SDL_ttf
@@ -431,6 +435,12 @@ void TextHelper::RenderTextToTextureBold(i32 xPos, i32 yPos, i32 spriteWidth, i3
     D3DSURFACE_DESC textSurfaceDesc;
     HFONT font;
     HDC hdc;
+
+#if TH08_PSP_DIALOGUE_TEXT_CACHE_ENABLED
+    const psp::TextRowKey rowKey = {xPos, yPos, spriteWidth, spriteHeight, fontHeight,
+                                     fontWidth, textColor, outlineType, 1};
+    if (psp::DrawCachedText(rowKey, string, outTexture)) return;
+#endif
 
     font =
         CreateFontA(fontHeight * 2 - 2, 0, 0, 0, FW_SEMIBOLD, false, false, false, SHIFTJIS_CHARSET, OUT_DEFAULT_PRECIS,
@@ -520,6 +530,11 @@ void TextHelper::RenderTextToTextureBold(i32 xPos, i32 yPos, i32 spriteWidth, i3
     {
         srcRect.right = 1024;
     }
+#if TH08_PSP_DIALOGUE_TEXT_CACHE_ENABLED
+    if (psp::StorePrewarmedText(rowKey, string, outTexture, textHelper.GetBuffer(),
+            textHelper.GetWidth(), textHelper.GetHeight(), textHelper.GetImageWidthInBytes(),
+            textHelper.GetFormat(), srcRect)) return;
+#endif
     outTexture->GetSurfaceLevel(0, &destSurface);
 #if defined(PSP)
     th08::psp::RenderPerfNoteTextBytes(
@@ -550,6 +565,12 @@ void TextHelper::RenderTextToTexture(i32 xPos, i32 yPos, i32 spriteWidth, i32 sp
     D3DSURFACE_DESC textSurfaceDesc;
     HFONT font;
     HDC hdc;
+
+#if TH08_PSP_DIALOGUE_TEXT_CACHE_ENABLED
+    const psp::TextRowKey rowKey = {xPos, yPos, spriteWidth, spriteHeight, fontHeight,
+                                     fontWidth, textColor, outlineType, 0};
+    if (psp::DrawCachedText(rowKey, string, outTexture)) return;
+#endif
 
     font = CreateFontA(fontHeight * 2, 0, 0, 0, FW_NORMAL, false, false, false, SHIFTJIS_CHARSET, OUT_DEFAULT_PRECIS,
                        CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_ROMAN | FIXED_PITCH, TH_FONT_NAME);
@@ -638,6 +659,11 @@ void TextHelper::RenderTextToTexture(i32 xPos, i32 yPos, i32 spriteWidth, i32 sp
     {
         srcRect.right = 1024;
     }
+#if TH08_PSP_DIALOGUE_TEXT_CACHE_ENABLED
+    if (psp::StorePrewarmedText(rowKey, string, outTexture, textHelper.GetBuffer(),
+            textHelper.GetWidth(), textHelper.GetHeight(), textHelper.GetImageWidthInBytes(),
+            textHelper.GetFormat(), srcRect)) return;
+#endif
     outTexture->GetSurfaceLevel(0, &destSurface);
 #if defined(PSP)
     th08::psp::RenderPerfNoteTextBytes(

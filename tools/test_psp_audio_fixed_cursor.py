@@ -163,7 +163,8 @@ class PspAudioFixedCursorTests(unittest.TestCase):
         # Sample math is untouched: the gain/mix/clamp lines remain exactly once.
         self.assertEqual(mix.count("int mixedLeft = output[frame * 2] + static_cast<int>(left * leftGain);"), 1)
         self.assertEqual(mix.count("if (mixedLeft < -32768) mixedLeft = -32768; else if (mixedLeft > 32767) mixedLeft = 32767;"), 1)
-        macros = ("TH08_PSP_AUDIO_FIXED_CURSOR_ENABLED", "TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT_ENABLED")
+        macros = ("TH08_PSP_AUDIO_FIXED_CURSOR_ENABLED", "TH08_PSP_AUDIO_FIXED_CURSOR_AUDIT_ENABLED",
+                  "TH08_PSP_ME_AUDIO_ENABLED")  # dedicated audio transport also uses the exact cursor
         for needle in ("fixedEligible", "fixedCursor", "fixedShift", "AudioCursorAudit", "AudioCursorProduct", "AudioFixedCursor"):
             self.assertEqual(unguarded_lines(self.mixer, needle, macros), [], needle)
         for hook in ("AudioCursorStatsResetWindow(gWindowActive);", "AudioCursorStatsEmitWindow(gStage, gBaselineStageFrame, stageFrame);", "AudioCursorStatsCancelWindow();"):

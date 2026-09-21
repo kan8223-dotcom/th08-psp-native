@@ -1,4 +1,5 @@
 #include "me_core.hpp"
+#include "me_audio.hpp"
 
 #include "fileio.hpp"
 #include "usage_meter.hpp"
@@ -611,11 +612,25 @@ extern "C" void th08_me_core_shutdown(void)
 extern "C" const char *th08_me_core_feature_string(void) { return gFeature; }
 extern "C" int th08_me_core_ready(void) { return gReady ? 1 : 0; }
 #else
+#if TH08_PSP_ME_AUDIO_ENABLED
+// Audio has a private service. NEVER expose it as a ready general ME core:
+// existing Bullet/Effect producer code must continue through the SC stubs.
+extern "C" int th08_me_core_init(void) { return th08::psp::MeAudioInit(); }
+extern "C" void th08_me_core_shutdown(void) { th08::psp::MeAudioShutdown(); }
+extern "C" void th08_me_core_request_stop(void) { th08::psp::MeAudioRequestStop(); }
+extern "C" const char *th08_me_core_feature_string(void) { return th08::psp::MeAudioFeature(); }
+#else
 extern "C" int th08_me_core_init(void) { return 0; }
-extern "C" void th08_me_core_frame(void) {}
 extern "C" void th08_me_core_shutdown(void) {}
 extern "C" void th08_me_core_request_stop(void) {}
 extern "C" const char *th08_me_core_feature_string(void) { return "DISABLED"; }
+#endif
+extern "C" void th08_me_core_frame(void) {}
 extern "C" int th08_me_core_submit_job_kind(const void *, unsigned int) { return 0; }
+extern "C" int th08_me_core_wait_idle(unsigned int) { return 1; }
+extern "C" int th08_me_core_submit_job(const void *) { return 0; }
+// Nothing is ever submitted without a core, so no job can be pending: report
+// done so an adopt module's wait loop can never spin on the stub.
+extern "C" int th08_me_core_job_done(const void *) { return 1; }
 extern "C" int th08_me_core_ready(void) { return 0; }
 #endif

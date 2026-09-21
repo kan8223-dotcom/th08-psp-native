@@ -4,6 +4,18 @@
 
 #include <cstdint>
 
+// TH08_PSP_TRIG_DF_TABLE=1: sin/cos of the reduced argument come from a node
+// table (a = k/256) plus a short series in h = r - a instead of the degree
+// 15/16 Taylor series.  Same reduction, quadrant handling, products and
+// acceptance rule, so accepted results are unchanged; only the evaluation
+// cost drops (about 10 DfMul + 6 DfAdd instead of 19 DfMul + 19 DfAdd).
+#if defined(TH08_PSP_TRIG_DF_TABLE) && TH08_PSP_TRIG_DF_TABLE
+#define TH08_PSP_TRIG_DF_TABLE_ENABLED 1
+#include "trig_df_table_data.hpp"
+#else
+#define TH08_PSP_TRIG_DF_TABLE_ENABLED 0
+#endif
+
 // Bit-exact float-result sin/cos-multiply fast path for the Item autocollect
 // velocity.  The canonical values are
 //   x = (f32)(cos((f64)angle) * (f64)magnitude)
@@ -93,6 +105,61 @@ inline void DfSinCosReduced(DoubleFloat r, DoubleFloat *sine,
     c = DfAdd(DfMul(c, w), DfNeg(kInvFact2));
     *cosine = DfAdd(DfMul(c, w), {1.0f, 0.0f});
 }
+#if TH08_PSP_TRIG_DF_TABLE_ENABLED
+constexpr float kTrigDfNodeScale = 256.0f;
+constexpr float kTrigDfNodeStep = 0.00390625f; // 2^-8
+
+inline DoubleFloat DfAddF(DoubleFloat x, float y)
+{
+    DoubleFloat s = TwoSum(x.hi, y);
+    s.lo += x.lo;
+    return QuickTwoSum(s.hi, s.lo);
+}
+
+// sin(r), cos(r) for |r| <= 0.86 as r = a + h, a = k/256 the nearest node
+// (|h| <= 2^-9 + 2^-24): sin(a+h) = sin a cos h + cos a sin h.
+// Series truncation: sin h to h^5 (next term h^7/5040, below 2^-60 relative),
+// cos h to h^4 (next term h^6/720, below 2^-63).  The double-float arithmetic
+// keeps the result within about 2^-44 relative, inside the 2^-38 acceptance
+// bound.  Returns false when r lies outside the table (never for |r| <= 0.86).
+inline bool DfSinCosReducedTable(DoubleFloat r, DoubleFloat *sine,
+                                 DoubleFloat *cosine)
+{
+    const float kf = r.hi * kTrigDfNodeScale;
+    const int k = static_cast<int>(kf + (kf >= 0.0f ? 0.5f : -0.5f));
+    const int index = k < 0 ? -k : k;
+    if (index > kTrigDfNodeMax)
+        return false;
+    const float a = static_cast<float>(k) * kTrigDfNodeStep; // exact
+    const DoubleFloat h = DfAddF(r, -a);                     // r.hi - a is exact
+    const DoubleFloat w = DfMul(h, h);                       // |w| <= 2^-18 (+ a little)
+    // w^2 <= 2^-36: the w^2 terms are below 2^-40 of the result, so one binary32
+    // product carries them with error below 2^-64.
+    const float w2 = w.hi * w.hi;
+    // sin h = h * (1 - w/6 + w^2/120)
+    DoubleFloat sp = DfNeg(DfMul(w, kInvFact3));
+    sp.lo += w2 * kInvFact5.hi;
+    sp = DfAddF(sp, 1.0f);
+    const DoubleFloat sh = DfMul(h, sp);
+    // cos h - 1 = -w/2 + w^2/24: the halving is exact.
+    DoubleFloat cm = {-0.5f * w.hi, -0.5f * w.lo};
+    cm.lo += w2 * kInvFact4.hi;
+    const DoubleFloat ch = DfAddF(cm, 1.0f);
+    const TrigDfNode &node = kTrigDfNodes[index];
+    DoubleFloat sa = {node.sinHi, node.sinLo};
+    if (k < 0)
+        sa = DfNeg(sa);
+    const DoubleFloat ca = {node.cosHi, node.cosLo};
+    *sine = DfAdd(DfMul(sa, ch), DfMul(ca, sh));
+    // cos(a + h) = ca - sa*sh + ca*(ch - 1).  |ca*(ch - 1)| <= 2^-19 while
+    // cos r >= 0.65, so that term needs only binary32: cm.hi + cm.lo keeps the
+    // w^2/24 part (2^-21 of cm.hi) and the product error stays below 2^-43.
+    DoubleFloat c = DfAdd(ca, DfNeg(DfMul(sa, sh)));
+    c = QuickTwoSum(c.hi, c.lo + ca.hi * (cm.hi + cm.lo));
+    *cosine = c;
+    return true;
+}
+#endif
 } // namespace sincos_detail
 
 // Evaluates cos(angle)*magnitude and sin(angle)*magnitude as double-floats
@@ -128,15 +195,25 @@ inline ItemSinCosFastpathReason ItemSinCosFastpathEvaluate(float angle,
     const float kFloat = static_cast<float>(k);
     // k * part is exact for |k| <= 2 (a power of two or zero).
     DoubleFloat r = TwoSum(angle, -(kFloat * kHalfPiHi));
+#if TH08_PSP_TRIG_DF_TABLE_ENABLED
+    r = DfAddF(r, -(kFloat * kHalfPiMid)); // same value as DfAdd with a {x, 0} operand
+    r = DfAddF(r, -(kFloat * kHalfPiLo));
+#else
     r = DfAdd(r, {-(kFloat * kHalfPiMid), 0.0f});
     r = DfAdd(r, {-(kFloat * kHalfPiLo), 0.0f});
+#endif
     const float absR = BitsFloat(FloatBits(r.hi) & 0x7fffffffU);
     if (absR < kMinReduced)
         return ItemSinCosFastpathReason::TinyReduced;
 
     DoubleFloat s;
     DoubleFloat c;
+#if TH08_PSP_TRIG_DF_TABLE_ENABLED
+    if (!DfSinCosReducedTable(r, &s, &c))
+        return ItemSinCosFastpathReason::MagnitudeRange;
+#else
     DfSinCosReduced(r, &s, &c);
+#endif
     DoubleFloat sine;
     DoubleFloat cosine;
     switch (k & 3)

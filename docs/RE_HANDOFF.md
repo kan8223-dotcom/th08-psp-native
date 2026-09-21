@@ -1,5 +1,18 @@
 # Current reconstruction handoff
 
+## Public PSP Go r249 checkpoint (2026-09-22)
+
+Current public source is the Go native-renderer/audio-MECC branch, not the
+older r238 non-audio-ME/PSPGL configuration described by historical records.
+Build `tools/build_go_r249_release_20260922.sh`: DEBUG0, loggingOFF,
+CPU graphOFF, generalMEcoreOFF, independent audioMEON, MainRAM-only worker.
+ME boot validation/whole-callback fallback/timeout quarantine/STOP ACK and
+firmware callback restoration remain active. MECC copyright/license preserved.
+See `docs/releases/r249_20260922.md` for evidence limits and current release.
+No original data, private fonts, saves/replays or hardware logs are distributed.
+This clean publication worktree does not replace the dirty development lanes.
+
+
 This file records only the current durable state. Historical investigations
 belong in focused notes such as `RUNECL_FUNCTION_EXACT_NOTES.md`; live counts
 come from the ledgers, not this prose.

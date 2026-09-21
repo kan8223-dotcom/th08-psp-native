@@ -17,9 +17,10 @@ project(me-core C ASM)
 add_subdirectory(kernel)
 
 add_custom_command(
-  OUTPUT kcall.S
-  COMMAND psp-build-exports -s ${CMAKE_SOURCE_DIR}/kernel/exports.exp > kcall.S
-  DEPENDS kcall_prx
+  OUTPUT th08audio_kcall.S
+  # -s writes <export-library>.S itself; stdout is empty.
+  COMMAND psp-build-exports -s ${CMAKE_SOURCE_DIR}/kernel/exports.exp
+  DEPENDS kcall_prx ${CMAKE_SOURCE_DIR}/kernel/exports.exp
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
   COMMENT "Generating kcall imports"
 )
@@ -33,7 +34,7 @@ add_custom_command(
   COMMENT "Embedding kcall.prx into C file"
 )
 
-add_custom_target(kcall_files DEPENDS kcall.S)
+add_custom_target(kcall_files DEPENDS th08audio_kcall.S)
 
 add_library(me-core STATIC
   me-lib.c
@@ -41,7 +42,7 @@ add_library(me-core STATIC
   me-core-mapping.c
   context.S
   embedded.c
-  ${CMAKE_CURRENT_BINARY_DIR}/kcall.S
+  ${CMAKE_CURRENT_BINARY_DIR}/th08audio_kcall.S
 )
 
 add_dependencies(me-core kcall_files)

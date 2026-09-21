@@ -86,6 +86,16 @@ ZunBool Supervisor::IsHUDRedrawEnabled()
 
 ChainCallbackResult Supervisor::OnUpdate(Supervisor *s)
 {
+#if defined(PSP)
+    // The owner, never the worker, retires a completed setup handle. This
+    // also restores the handle==NULL meaning used by IsSubthreadRunning.
+    if (s->runningSubthreadHandle != NULL &&
+        WaitForSingleObject(s->runningSubthreadHandle, 0) == WAIT_OBJECT_0)
+    {
+        CloseHandle(s->runningSubthreadHandle);
+        s->runningSubthreadHandle = NULL;
+    }
+#endif
     if (s->flags.receivedCloseMsg && !s->IsSubthreadRunning())
     {
         return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
@@ -923,7 +933,9 @@ void Supervisor::StartupThread(Supervisor *s)
         }
     }
 
+#if !defined(PSP)
     g_Supervisor.runningSubthreadHandle = NULL;
+#endif
     g_Supervisor.subthreadCloseRequestActive = FALSE;
     g_Supervisor.subthreadActive = 0;
     g_Supervisor.startupThreadState = SupervisorStartupThreadState_Idle;
@@ -932,7 +944,9 @@ void Supervisor::StartupThread(Supervisor *s)
     return;
 
 err:
+#if !defined(PSP)
     g_Supervisor.runningSubthreadHandle = NULL;
+#endif
     g_Supervisor.subthreadCloseRequestActive = FALSE;
     g_Supervisor.subthreadActive = 0;
     g_Supervisor.startupThreadState = SupervisorStartupThreadState_Failed;
@@ -1990,9 +2004,22 @@ ZunResult Supervisor::ThreadStart(LPTHREAD_START_ROUTINE startFunction, void *st
 
     utils::GuiDebugPrint("info : Sub Thread Start Request\n");
 
+#if defined(PSP)
+    // Publish active before the worker can finish; never overwrite its
+    // completion with TRUE after CreateThread returns.
+    this->subthreadActive = TRUE;
+#endif
     this->runningSubthreadHandle = CreateThread(NULL, 0, startFunction, startParam, 0, &this->runningSubthreadID);
 
+#if defined(PSP)
+    if (this->runningSubthreadHandle == NULL)
+    {
+        this->subthreadActive = FALSE;
+        this->flags.receivedCloseMsg = true;
+    }
+#else
     this->subthreadActive = TRUE;
+#endif
 
     return (this->runningSubthreadHandle != NULL) ? ZUN_SUCCESS : ZUN_ERROR;
 }

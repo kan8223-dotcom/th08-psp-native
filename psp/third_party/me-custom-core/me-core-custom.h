@@ -4,7 +4,7 @@
 #include "me-core-mapper.h"
 #include "me-lib.h"
 
-#if defined(TH07_PSP_MECC_AUDIO_4M)
+#if defined(TH07_PSP_MECC_AUDIO_4M) || defined(TH08_ME_MAIN_RAM_STACK)
 // The full-local-eDRAM audio profile cannot leave MECC's default descending
 // stack in either half of the 0x00000000..0x003fffff audio store.  The first
 // and last cache lines are guards; the handler installs the cached ME alias of

@@ -19,6 +19,7 @@
 #if defined(PSP)
 #include "fileio.hpp"
 #include "gui_border_replay.hpp"
+#include "dialogue_text_cache.hpp"
 #ifndef TH08_PSP_GUI_BORDER_STATS_ENABLED
 #define TH08_PSP_GUI_BORDER_STATS_ENABLED 0
 #endif
@@ -2476,8 +2477,14 @@ ZunBool AnmVm::IsStopped()
 ZunResult Gui::LoadMsg(const char *path)
 {
     this->FreeMsgFile();
+#if TH08_PSP_DIALOGUE_TEXT_CACHE_ENABLED
+    u32 messageBytes = 0;
+    this->impl->message.msgFile =
+        reinterpret_cast<GuiMessageFile *>(FileSystem::OpenFile(path, &messageBytes, 0));
+#else
     this->impl->message.msgFile =
         reinterpret_cast<GuiMessageFile *>(FileSystem::OpenFile(path, NULL, 0));
+#endif
     if (this->impl->message.msgFile == NULL)
     {
         g_GameErrorContext.Log("\x65\x72\x72\x6f\x72\x20\x3a\x20\x83\x81\x83\x62\x83\x5a\x81\x5b\x83\x57\x83\x74\x83\x40\x83\x43\x83\x8b\x20\x25\x73\x20\x82\xaa\x93\xc7\x82\xdd\x8d\x9e\x82\xdf\x82\xdc\x82\xb9\x82\xf1\x82\xc5\x82\xb5\x82\xbd\x0d\x0a", path);
@@ -2491,12 +2498,19 @@ ZunResult Gui::LoadMsg(const char *path)
         ((i32 *)this->impl->message.msgFile)[i + 1] += (i32)this->impl->message.msgFile;
     }
 #endif
+#if TH08_PSP_DIALOGUE_TEXT_CACHE_ENABLED
+    psp::DialogueTextSource(this->impl->message.msgFile, messageBytes,
+        g_GuiMessageTextColors[g_GameManager.shotType].colors);
+#endif
     return ZUN_SUCCESS;
 }
 
 // FUNCTION: th08 0x4397d5
 void Gui::FreeMsgFile(void)
 {
+#if TH08_PSP_DIALOGUE_TEXT_CACHE_ENABLED
+    psp::ReleaseDialogueTextCache();
+#endif
     if (this->impl->message.msgFile != NULL)
     {
         ZUN_FREE(this->impl->message.msgFile);

@@ -1,4 +1,5 @@
 #include "ge2d_direct.hpp"
+#include "ge_draw_direct.hpp"
 
 #if TH08_PSP_GE_2D_DIRECT_ENABLED
 #include <GLES/egl.h>
@@ -43,7 +44,8 @@ extern "C" int th08_ge2d_direct_submit(const Th08Ge2dVertex *src, unsigned verte
     if ((c->hw.ge_reg[CMD_ENA_TEXTURE] & 1u) != 0u)
     {
         struct pspgl_texobj *tobj = c->texture.bound;
-        if (tobj == NULL || tobj->images[0] == NULL || __pspgl_texobj_cmap(tobj) != NULL)
+        if (tobj == NULL || tobj->images[0] == NULL ||
+            (!TH08_PSP_GE_DRAW_DIRECT_ENABLED && __pspgl_texobj_cmap(tobj) != NULL))
         {
             ++gFallbacks;
             return 0;
@@ -71,7 +73,11 @@ extern "C" int th08_ge2d_direct_submit(const Th08Ge2dVertex *src, unsigned verte
     sceKernelDcacheWritebackRange(indices, indexCount * sizeof(unsigned short));
     // Everything the compat layer changed through gl* (blend, alpha, depth,
     // scissor, texture regs) is still pending in PSPGL's shadow: emit it.
+#if TH08_PSP_GE_DRAW_DIRECT_ENABLED
+    th08_ge_draw_direct_flush_state();
+#else
     __pspgl_context_flush_pending_state_changes(c, 0, 255);
+#endif
     const std::uint32_t vtype = GE_TEXTURE_32BITF | GE_COLOR_8888 | GE_VERTEX_32BITF | GE_TRANSFORM_2D | GE_VINDEX_16BIT;
     __pspgl_context_writereg_uncached(c, CMD_VERTEXTYPE, vtype);
     __pspgl_context_writereg_uncached(c, CMD_BASE, (reinterpret_cast<unsigned>(dst) >> 8) & 0x000f0000u);
@@ -106,7 +112,8 @@ extern "C" int th08_ge2d_direct_params(Th08Ge2dParams *params)
     if ((c->hw.ge_reg[CMD_ENA_TEXTURE] & 1u) != 0u)
     {
         struct pspgl_texobj *tobj = c->texture.bound;
-        if (tobj == NULL || tobj->images[0] == NULL || __pspgl_texobj_cmap(tobj) != NULL)
+        if (tobj == NULL || tobj->images[0] == NULL ||
+            (!TH08_PSP_GE_DRAW_DIRECT_ENABLED && __pspgl_texobj_cmap(tobj) != NULL))
         {
             ++gFallbacks;
             return 0;
@@ -132,7 +139,11 @@ extern "C" int th08_ge2d_direct_submit_prepared(const Th08Ge2dVertex *dst, unsig
     }
     sceKernelDcacheWritebackRange(dst, vertexCount * sizeof(Th08Ge2dVertex));
     sceKernelDcacheWritebackRange(indices, indexCount * sizeof(unsigned short));
+#if TH08_PSP_GE_DRAW_DIRECT_ENABLED
+    th08_ge_draw_direct_flush_state();
+#else
     __pspgl_context_flush_pending_state_changes(c, 0, 255);
+#endif
     const std::uint32_t vtype = GE_TEXTURE_32BITF | GE_COLOR_8888 | GE_VERTEX_32BITF | GE_TRANSFORM_2D | GE_VINDEX_16BIT;
     __pspgl_context_writereg_uncached(c, CMD_VERTEXTYPE, vtype);
     __pspgl_context_writereg_uncached(c, CMD_BASE, (reinterpret_cast<unsigned>(dst) >> 8) & 0x000f0000u);

@@ -273,7 +273,7 @@ static int eventHandler(int eventId) {
 }
 
 int meLibDefaultInit() {
-  meLibLoadPrx(); // PLUGINS.TXT方式で既にロード済みの場合、失敗しても続行
+  if (meLibLoadPrx() < 0) return -4;
   if(kinit((void*)eventHandler) < 0) {
     return -3;
   };

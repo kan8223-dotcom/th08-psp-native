@@ -8,6 +8,7 @@
 #include "antitamper_checksum.hpp"
 #endif
 #include "memory_telemetry.hpp"
+#include "dialogue_text_cache.hpp"
 #include "modern/linux/d3d8_internal.hpp"
 #if defined(TH08_PSP_STAGE_POOL_ARENA)
 #include "stage_pool_arena.hpp"
@@ -465,6 +466,11 @@ ChainCallbackResult GameManager::OnUpdate(GameManager *gameManager)
 
     if (gameManager->stageStartupMode != 0)
     {
+#if TH08_PSP_DIALOGUE_TEXT_CACHE_ENABLED
+        // Main/render thread, after setup completes and before PlayMusic.
+        // Never rasterize on the asynchronous asset-loading worker.
+        psp::PrewarmDialogueText();
+#endif
         Gui::CopyCurrentStageEnemyNameTexture();
         g_AnmManager->ReleaseSurface(8);
         g_Supervisor.loadingVmsHaveBeenSetup = 0;
@@ -1461,7 +1467,9 @@ void __fastcall GameManager::GameplaySetupThread(void *unused)
 #if defined(TH08_PSP_STAGE_POOL_ARENA)
     __sync_synchronize();
 #endif
+#if !defined(PSP)
     g_Supervisor.runningSubthreadHandle = NULL;
+#endif
     goto thread_done;
 
 #if defined(TH08_PSP_STAGE_POOL_ARENA)
@@ -1493,7 +1501,9 @@ setup_error:
 #if defined(TH08_PSP_STAGE_POOL_ARENA)
     __sync_synchronize();
 #endif
+#if !defined(PSP)
     g_Supervisor.runningSubthreadHandle = NULL;
+#endif
 
 thread_done:
 #if defined(PSP)
